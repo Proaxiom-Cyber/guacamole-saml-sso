@@ -47,9 +47,11 @@ runtime_compose() {
 }
 
 wait_for_guacamole() {
-  local port status deadline
+  local port status deadline next_report
   port="$(env_get HTTPS_PORT)"; port="${port:-443}"
   deadline=$((SECONDS + 120))
+  next_report=$((SECONDS + 10))
+  note "Checking https://$GUAC_HOSTNAME:$port/guacamole/ through local nginx (up to 120 seconds)."
   while [ "$SECONDS" -lt "$deadline" ]; do
     # Probe nginx on this host with the configured hostname. The local
     # certificate can be self-signed when Cloudflare provides public TLS.
@@ -60,6 +62,10 @@ wait_for_guacamole() {
     case "$status" in
       200|302|303|307|308) return 0 ;;
     esac
+    if [ "$SECONDS" -ge "$next_report" ]; then
+      note "Still waiting for Guacamole through nginx (HTTP ${status:-000}; 000 means no HTTP response)."
+      next_report=$((SECONDS + 10))
+    fi
     sleep 2
   done
   return 1

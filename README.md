@@ -43,8 +43,8 @@ Have these ready before you run `setup.sh`.
   install missing tools with the distribution's package manager. On Rocky Linux,
   it installs Docker from the RHEL repository, then enables and starts the Docker
   service. This follows [Rocky's Docker installation guide][rocky-docker].
-  Other distributions use `get.docker.com` for Docker. Run setup with `sudo` rights
-  the first time.
+  Other distributions use `get.docker.com` for Docker. Run setup as root on every
+  run, or use `sudo ./setup.sh`. Setup stops before making changes if run without root.
 - Outbound internet access. With Cloudflare, no inbound port is needed at all.
 
 [rocky-docker]: https://docs.rockylinux.org/gemstones/containers/docker/
@@ -84,7 +84,7 @@ also a certificate for that name that your clients trust, and a firewall rule fo
 
 1. Keep the database password in your secret store. For an existing database, use its
    current password. For a new database, create a password in the store first.
-2. Run `./setup.sh` from the Git checkout. It installs or updates the live deployment
+2. As root, run `./setup.sh` from the Git checkout. It installs or updates the live deployment
    in `/opt/guacamole`, then continues from there. On the first run it asks for the
    public hostname and whether to publish through Cloudflare. It writes non-secret
    configuration to `/opt/guacamole/.env`.
@@ -175,9 +175,19 @@ application, its signing certificate, the NameID claims policy, and the two grou
 they do not exist, and assigns the groups to the application. Run it again at any
 time; each step finds what exists before it creates anything.
 
+New registrations are named `Guacamole (<hostname>)`. Each application has its own
+NameID policy. Setup reuses an older registration named `Guacamole` only if its
+entity ID matches this hostname. An existing metadata URL remains unchanged.
+
+If Cloudflare setup fails, run setup again. When the Access identity provider still
+needs to be created, setup requests an Entra sign-in even if the SAML metadata URL
+is already saved. You do not need to clear that URL.
+
 If the device code flow is not available (Conditional Access blocks it, or the run is
 unattended), set `GRAPH_TOKEN_CMD` to a command that prints a Graph access token, and
-the script uses that instead. Two examples:
+the script uses that instead. Run these examples in a root session. Commands and
+session secrets must be available in that session; `sudo` does not normally retain
+them. Two examples:
 
 ```bash
 # An administrator signed in with the Azure CLI on this machine.
@@ -331,8 +341,26 @@ Compose checks guacd's listening port every five seconds. This overrides the
 five-minute health-check interval in the guacd 1.6.0 image, which exceeds setup's
 three-minute wait limit. Guacamole starts after guacd and the database are healthy.
 
+After the containers start, setup checks the HTTPS page through local nginx for up
+to two minutes. It shows progress during this check. HTTP `000` means that the
+request received no HTTP response.
+
+An older installer created `/opt/guacamole/nginx/templates` without copying
+`guacamole.conf.template`. This left nginx without the HTTPS configuration. From the
+Git checkout on an affected host, copy the template and restart nginx:
+
+```bash
+sudo install -m 644 nginx/templates/guacamole.conf.template /opt/guacamole/nginx/templates/
+docker restart guacamole-saml-sso-nginx-1
+```
+
+The restart loads the template into the existing nginx container. If setup already
+stopped, run `/opt/guacamole/setup.sh` again with the same database password.
+
 For a failed fresh installation with no connections or session history to preserve,
 update the source, install it, then remove the failed database:
+
+Run the following commands in a root session:
 
 ```bash
 cd /path/to/guacamole-saml-sso &&

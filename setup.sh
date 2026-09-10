@@ -6,6 +6,10 @@ set +a
 set -euo pipefail
 SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_DIR=/opt/guacamole
+if [ "$(id -u)" != 0 ]; then
+  printf 'Run setup as root, for example: sudo ./setup.sh\n' >&2
+  exit 1
+fi
 INSTALL_ONLY=false
 if [ "${1:-}" = --install-only ]; then
   INSTALL_ONLY=true
@@ -15,14 +19,7 @@ fi
 # The repository is the update source. Install the live deployment under /opt,
 # then continue there. Program files are replaced; local configuration is kept.
 if [ "$SOURCE_DIR" != "$INSTALL_DIR" ]; then
-  if [ "$(id -u)" = 0 ]; then
-    INSTALL_AS=()
-  elif command -v sudo >/dev/null 2>&1; then
-    INSTALL_AS=(sudo)
-  else
-    printf 'setup needs root or sudo to install in %s\n' "$INSTALL_DIR" >&2
-    exit 1
-  fi
+  INSTALL_AS=()
 
   "${INSTALL_AS[@]}" mkdir -p \
     "$INSTALL_DIR/lib" "$INSTALL_DIR/init" "$INSTALL_DIR/nginx/templates"
@@ -34,6 +31,8 @@ if [ "$SOURCE_DIR" != "$INSTALL_DIR" ]; then
     "$SOURCE_DIR/README.md" "$SOURCE_DIR/LICENSE" "$INSTALL_DIR/"
   "${INSTALL_AS[@]}" install -m 644 "$SOURCE_DIR"/lib/*.sh "$INSTALL_DIR/lib/"
   "${INSTALL_AS[@]}" install -m 644 "$SOURCE_DIR/init/002-groups.sh" "$INSTALL_DIR/init/"
+  "${INSTALL_AS[@]}" install -m 644 "$SOURCE_DIR/nginx/templates/guacamole.conf.template" \
+    "$INSTALL_DIR/nginx/templates/"
 
   # Carry the existing non-secret configuration into the installed deployment.
   # Never replace configuration that already exists in /opt.
@@ -41,8 +40,8 @@ if [ "$SOURCE_DIR" != "$INSTALL_DIR" ]; then
     "${INSTALL_AS[@]}" install -m 600 "$SOURCE_DIR/.env" "$INSTALL_DIR/.env"
   fi
 
-  # The person who invoked setup must be able to create runtime directories and
-  # replace .env. Do not recursively change ownership of an existing database.
+  # Keep installation directories owned by root. Do not recursively change
+  # ownership of an existing database.
   "${INSTALL_AS[@]}" chown "$(id -u):$(id -g)" \
     "$INSTALL_DIR" "$INSTALL_DIR/init" "$INSTALL_DIR/nginx"
   if [ -f "$INSTALL_DIR/.env" ]; then
@@ -196,15 +195,11 @@ else
 fi
 
 # ---- Entra ID -----------------------------------------------------------------
-# Registers the SAML application and fills in SAML_IDP_METADATA_URL. Runs only
-# while that value is empty, so Okta and Keycloak users skip it by setting the
-# URL themselves. Safe to run again: every step finds before it creates.
-if [ -z "$(env_get SAML_IDP_METADATA_URL)" ]; then
-  step "Entra ID"
-  ADMIN_GROUP="$(env_get GUAC_ADMIN_GROUP)"
-  OPERATOR_GROUP="$(env_get GUAC_OPERATOR_GROUP)"
-  NAMEID_ATTR="$(env_get ENTRA_NAMEID_ATTRIBUTE)"; NAMEID_ATTR="${NAMEID_ATTR:-mailnickname}"
-  ENTITY_ID="https://${GUAC_HOSTNAME}/guacamole"
+# Sign in only when SAML registration or Cloudflare identity setup needs Graph.
+GRAPH_SESSION_READY=false
+ensure_graph_session() {
+  [ "${GRAPH_SESSION_READY:-false}" = false ] || return 0
+  step "Entra ID sign-in"
 
   # Device code sign-in as the "Microsoft Graph Command Line Tools" public
   # client, the same one Connect-MgGraph uses. An administrator must sign in.
@@ -266,23 +261,49 @@ DelegatedPermissionGrant.ReadWrite.All"
 
   TENANT="$(graph GET /organization | jq -r '.value[0].id')"
   note "tenant $TENANT"
+  GRAPH_SESSION_READY=true
+}
+
+# Register SAML only while its metadata URL is empty.
+if [ -z "$(env_get SAML_IDP_METADATA_URL)" ]; then
+  ensure_graph_session
+  ADMIN_GROUP="$(env_get GUAC_ADMIN_GROUP)"
+  OPERATOR_GROUP="$(env_get GUAC_OPERATOR_GROUP)"
+  NAMEID_ATTR="$(env_get ENTRA_NAMEID_ATTRIBUTE)"; NAMEID_ATTR="${NAMEID_ATTR:-mailnickname}"
+  ENTITY_ID="https://${GUAC_HOSTNAME}/guacamole"
+  APP_NAME="Guacamole ($GUAC_HOSTNAME)"
 
   # Application and service principal, from the "non-gallery" template. That is
   # what the portal's "Create your own application" does.
-  APP="$(graph GET "/applications?\$filter=$(urlenc "displayName eq 'Guacamole'")" | jq -c '.value[0]')"
+  APP="$(graph GET "/applications?\$filter=$(urlenc "displayName eq '$APP_NAME'")" | jq -c '
+    if (.value | length) > 1 then error("Multiple matching Guacamole applications")
+    else .value[0] end')"
+  if [ "$APP" = null ]; then
+    # Reuse a legacy registration only when it belongs to this hostname.
+    APP="$(graph GET "/applications?\$filter=$(urlenc "displayName eq 'Guacamole'")" |
+      jq -c --arg uri "$ENTITY_ID" '
+        [.value[] | select((.identifierUris // []) | index($uri))] |
+        if length > 1 then error("Multiple legacy applications use this entity ID")
+        else .[0] end')"
+  fi
+  if [ "$APP" != null ]; then
+    jq -e --arg uri "$ENTITY_ID" '
+      (.identifierUris // []) | ((length == 0) or (. == [$uri]))' <<<"$APP" >/dev/null \
+      || die "The matching Entra application has another entity ID. Refusing to replace it."
+  fi
   if [ "$APP" = null ]; then
     APP="$(graph POST /applicationTemplates/8adf8e6e-67b2-4cf2-a259-e3dc5476c621/instantiate \
-      '{"displayName":"Guacamole"}')"
+      "$(jq -cn --arg n "$APP_NAME" '{displayName:$n}')")"
     APP_OBJ="$(jq -r .application.id <<<"$APP")"
     APP_ID="$(jq -r .application.appId <<<"$APP")"
     SP_ID="$(jq -r .servicePrincipal.id <<<"$APP")"
-    ok "enterprise application \"Guacamole\" created ($APP_ID)"
+    ok "enterprise application \"$APP_NAME\" created ($APP_ID)"
   else
     APP_OBJ="$(jq -r .id <<<"$APP")"
     APP_ID="$(jq -r .appId <<<"$APP")"
     SP_ID="$(graph GET "/servicePrincipals?\$filter=$(urlenc "appId eq '$APP_ID'")" | jq -r '.value[0].id // empty')"
     [ -n "$SP_ID" ] || SP_ID="$(graph POST /servicePrincipals "{\"appId\":\"$APP_ID\"}" | jq -r .id)"
-    ok "enterprise application \"Guacamole\" found ($APP_ID)"
+    ok "enterprise application found ($APP_ID)"
   fi
 
   # Entity ID has no trailing slash (Entra rejects one); the reply URL has one.
@@ -312,16 +333,26 @@ DelegatedPermissionGrant.ReadWrite.All"
 
   # NameID = the account name on the targets, through a claims mapping policy
   # with a direct attribute source. A transformation is rejected by Graph.
-  POLICY="$(jq -cn --arg a "$NAMEID_ATTR" '{displayName: "Guacamole NameID", isOrganizationDefault: false,
+  POLICY_NAME="Guacamole NameID ($APP_ID)"
+  POLICY="$(jq -cn --arg a "$NAMEID_ATTR" --arg n "$POLICY_NAME" '{displayName: $n, isOrganizationDefault: false,
     definition: [({ClaimsMappingPolicy: {Version: 1, IncludeBasicClaimSet: "true", ClaimsSchema: [
       {Source: "user", ID: $a, SamlClaimType: "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier"}
     ]}} | tojson)]}')"
-  POLICY_ID="$(graph GET /policies/claimsMappingPolicies | jq -r '.value[] | select(.displayName == "Guacamole NameID").id')"
+  POLICY_ID="$(graph GET /policies/claimsMappingPolicies | jq -r --arg n "$POLICY_NAME" '
+    [.value[] | select(.displayName == $n)] |
+    if length > 1 then error("Multiple matching NameID policies") else .[0].id // empty end')"
   if [ -n "$POLICY_ID" ]; then
     graph PATCH "/policies/claimsMappingPolicies/$POLICY_ID" "$POLICY" >/dev/null
   else
     POLICY_ID="$(graph POST /policies/claimsMappingPolicies "$POLICY" | jq -r .id)"
   fi
+  # Replace only this application's association; leave shared legacy policies intact.
+  OLD_POLICY_IDS="$(graph GET "/servicePrincipals/$SP_ID/claimsMappingPolicies" |
+    jq -r --arg id "$POLICY_ID" '.value[] | select(.id != $id).id')"
+  while IFS= read -r OLD_POLICY_ID; do
+    [ -n "$OLD_POLICY_ID" ] || continue
+    graph DELETE "/servicePrincipals/$SP_ID/claimsMappingPolicies/$OLD_POLICY_ID/\$ref" >/dev/null
+  done <<<"$OLD_POLICY_IDS"
   graph GET "/servicePrincipals/$SP_ID/claimsMappingPolicies" \
     | jq -e --arg id "$POLICY_ID" '.value[] | select(.id == $id)' >/dev/null \
     || graph POST "/servicePrincipals/$SP_ID/claimsMappingPolicies/\$ref" \
@@ -466,23 +497,34 @@ GUIDE
   if [ -n "$IDP" ]; then
     ok "identity provider \"$IDP_NAME\" found"
   else
-    [ -n "${TOKEN:-}" ] || die "Registering the Access identity provider needs the Entra ID sign-in. Blank SAML_IDP_METADATA_URL in .env and run again."
+    ensure_graph_session
     AA_NAME="Cloudflare Access ($GUAC_HOSTNAME)"
     AA="$(graph GET "/applications?\$filter=$(urlenc "displayName eq '$AA_NAME'")" | jq -c '.value[0]')"
     if [ "$AA" = null ]; then
       AA="$(graph POST /applications "$(jq -cn --arg n "$AA_NAME" --arg cb "https://$TEAM_DOMAIN/cdn-cgi/access/callback" \
         '{displayName: $n, signInAudience: "AzureADMyOrg", web: {redirectUris: [$cb]}}')")"
-      AA_SP="$(graph POST /servicePrincipals "{\"appId\":\"$(jq -r .appId <<<"$AA")\"}" | jq -r .id)"
-      # Admin consent for the sign-in scopes, so users see no consent prompt.
-      GRAPH_SP="$(graph GET "/servicePrincipals?\$filter=$(urlenc "appId eq '00000003-0000-0000-c000-000000000000'")" | jq -r '.value[0].id')"
+      ok "Entra ID app \"$AA_NAME\" created"
+    fi
+    # Resume even if a previous attempt stopped just after creating the app.
+    AA_CLIENT_ID="$(jq -r .appId <<<"$AA")"
+    AA_SP="$(graph GET "/servicePrincipals?\$filter=$(urlenc "appId eq '$AA_CLIENT_ID'")" | jq -r '.value[0].id // empty')"
+    [ -n "$AA_SP" ] || AA_SP="$(graph POST /servicePrincipals "{\"appId\":\"$AA_CLIENT_ID\"}" | jq -r .id)"
+    GRAPH_SP="$(graph GET "/servicePrincipals?\$filter=$(urlenc "appId eq '00000003-0000-0000-c000-000000000000'")" | jq -r '.value[0].id')"
+    GRANT_ID="$(graph GET "/oauth2PermissionGrants?\$filter=$(urlenc "clientId eq '$AA_SP'")" |
+      jq -r --arg r "$GRAPH_SP" '.value[] | select(.resourceId == $r and .consentType == "AllPrincipals") | .id')"
+    if [ -z "$GRANT_ID" ]; then
       (graph POST /oauth2PermissionGrants "{\"clientId\":\"$AA_SP\",\"consentType\":\"AllPrincipals\",\"resourceId\":\"$GRAPH_SP\",\"scope\":\"openid profile email offline_access User.Read\"}" >/dev/null) \
         || warn "could not grant admin consent for the Access app; users will be asked to consent once."
-      ok "Entra ID app \"$AA_NAME\" created, admin consent granted"
     fi
-    IDP="$(cf POST "/accounts/$ACCT/access/identity_providers" "$(jq -cn --arg n "$IDP_NAME" --arg t "$TENANT" \
-      --arg c "$(jq -r .appId <<<"$AA")" \
-      --arg s "$(graph POST "/applications/$(jq -r .id <<<"$AA")/addPassword" '{"passwordCredential":{"displayName":"Cloudflare Access"}}' | jq -r .secretText)" \
-      '{name: $n, type: "azureAD", config: {client_id: $c, client_secret: $s, directory_id: $t, support_groups: false}}')" | jq -r .id)"
+    IDP_PAYLOAD="$(graph POST "/applications/$(jq -r .id <<<"$AA")/addPassword" \
+      '{"passwordCredential":{"displayName":"Cloudflare Access"}}' |
+      jq -ce --arg n "$IDP_NAME" --arg t "$TENANT" --arg c "$(jq -r .appId <<<"$AA")" '
+        if (.secretText | type) != "string" or (.secretText | length) == 0
+        then error("Graph returned no client secret")
+        else {name: $n, type: "azureAD", config: {client_id: $c,
+          client_secret: .secretText, directory_id: $t, support_groups: false}} end')"
+    IDP="$(cf POST "/accounts/$ACCT/access/identity_providers" "$IDP_PAYLOAD" | jq -r .id)"
+    unset IDP_PAYLOAD
     ok "identity provider \"$IDP_NAME\" created"
   fi
 

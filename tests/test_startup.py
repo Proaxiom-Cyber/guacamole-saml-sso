@@ -239,6 +239,19 @@ wait_for_guacamole
 ''')
         self.assertNotEqual(result.returncode, 0)
 
+    def test_web_check_reports_progress_while_nginx_is_unavailable(self):
+        result = self.run_shell('''
+note() { printf '%s\\n' "$1"; }
+curl() { printf '000'; }
+sleep() { SECONDS=$((SECONDS + 30)); }
+wait_for_guacamole
+''')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Checking https://guacamole.example.test:443/guacamole/", result.stdout)
+        self.assertIn("up to 120 seconds", result.stdout)
+        self.assertIn("Still waiting", result.stdout)
+        self.assertIn("HTTP 000", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
