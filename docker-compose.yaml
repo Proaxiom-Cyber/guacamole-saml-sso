@@ -1,5 +1,6 @@
 # Apache Guacamole with SAML single sign-on, behind nginx.
-# Settings come from .env. POSTGRES_PASSWORD must be exported in the shell.
+# Settings come from .env. POSTGRES_PASSWORD, and TUNNEL_TOKEN when the
+# cloudflare profile is on, must be exported in the shell.
 
 networks:
   guacnet:
@@ -49,7 +50,21 @@ services:
       SAML_COMPRESS_RESPONSE: "true"
       SAML_GROUP_ATTRIBUTE: ${SAML_GROUP_ATTRIBUTE:-groups}
       EXTENSION_PRIORITY: "saml,postgresql"
+      # nginx terminates TLS. Without this, Tomcat sees "http://", and the SAML
+      # response fails validation because the callback URL says "https://".
+      REMOTE_IP_VALVE_ENABLED: "true"
     networks: [guacnet]
+    restart: always
+
+  # Started only when COMPOSE_PROFILES in .env contains "cloudflare".
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    environment:
+      # Not ":?" — Compose interpolates every service, even ones outside the active profile.
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+    networks: [guacnet]
+    profiles: [cloudflare]
     restart: always
 
   nginx:

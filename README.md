@@ -32,23 +32,63 @@ Four containers on one Docker network. Only nginx listens on the host.
 
 ## Requirements
 
-- Docker with the Compose plugin, and `openssl`.
-- A SAML identity provider. Entra ID, Okta and Keycloak all work.
-- A DNS name for the service, and a certificate for it.
+Have these ready before you run `setup.sh`.
+
+**A Linux host**
+
+- A recent distribution: Ubuntu, Debian, RHEL, Rocky, Alma, Fedora, SUSE, Alpine or Arch.
+- Docker with the Compose plugin, `curl`, `jq` and `openssl`. `setup.sh` offers to
+  install any that are missing, with the distribution's package manager and Docker with
+  `get.docker.com`. Run it with `sudo` rights the first time.
+- Outbound internet access. With Cloudflare, no inbound port is needed at all.
+
+**An Entra ID tenant** (or another SAML identity provider: Okta and Keycloak work, with
+manual registration)
+
+- An account with the Global Administrator role. `setup.sh` signs in with a device code
+  as the "Microsoft Graph Command Line Tools" client and asks for delegated permissions
+  that need a Global Administrator's consent. You consent to that client, not to this
+  project. You can revoke it in Enterprise applications afterwards.
+- A user attribute that holds the account name on the target hosts: `mailNickname`
+  (default) or `onPremisesSamAccountName` for AD-synced accounts.
+
+**A Cloudflare account** (skip if `COMPOSE_PROFILES` is empty)
+
+- The service's domain added to the account as a zone, with the domain's nameservers
+  pointed at Cloudflare and the zone showing **Active**. On a pending zone the script
+  creates the tunnel and the DNS record, skips Cloudflare Access, and asks you to run it
+  again once the zone is active.
+- Zero Trust enabled for the account (the free plan is enough). If the account has no
+  Zero Trust team yet, set `CLOUDFLARE_TEAM` in `.env` and the script creates one.
+- An **account-owned API token**. See the Cloudflare section for the exact permissions.
+  Creating one needs the Super Administrator role on the account.
+
+**A DNS name** for the service, such as `guacamole.example.com`. With Cloudflare, that
+is all: Cloudflare provides the tunnel and the public certificate. Without Cloudflare,
+also a certificate for that name that your clients trust, and a firewall rule for
+`HTTPS_PORT`.
 
 ## Deploy
 
-1. Copy `.env.example` to `.env`. Set the hostname, the identity provider metadata
-   URL, and the two group names.
-2. Run `./setup.sh`. It creates the folders, generates the database schema, and makes
-   a self-signed certificate.
-3. Replace `nginx/certs/fullchain.pem` and `privkey.pem` with a certificate your
-   clients trust.
-4. Register the application with your identity provider. See below.
-5. Start the stack. The database password is never written to a file:
+1. Run `./setup.sh`. On the first run it asks for the public hostname and whether to
+   publish through Cloudflare, and writes `.env` from `.env.example`. Everything else
+   keeps its default; edit `.env` to change the group names. For Okta or Keycloak, set
+   the identity provider metadata URL in `.env` before running again.
+2. The script then creates the folders, generates the database schema, and makes a
+   self-signed certificate. If the metadata URL is empty, it also registers the
+   application in Entra ID: it shows a device code, you sign in as an administrator,
+   and it writes the metadata URL back to `.env`.
+   With `COMPOSE_PROFILES=cloudflare` (the default), it then asks for a Cloudflare API
+   token and publishes the hostname: a tunnel, a proxied DNS record, and Cloudflare
+   Access with Entra ID sign-in in front. It prints the tunnel token at the end.
+3. Without Cloudflare: replace `nginx/certs/fullchain.pem` and `privkey.pem` with a
+   certificate your clients trust, and open `HTTPS_PORT`.
+4. Okta or Keycloak: register the application yourself. See below.
+5. Start the stack. Neither secret is ever written to a file:
 
    ```bash
    export POSTGRES_PASSWORD="$(openssl rand -base64 24)"   # keep it: every compose command needs it
+   export TUNNEL_TOKEN="..."                                # from setup.sh; only with the cloudflare profile
    docker compose up -d
    docker compose ps
    ```
@@ -67,20 +107,26 @@ All of it lives in `.env`, except the database password.
 | `GUAC_VERSION` | Guacamole image tag. The schema is generated from this version. |
 | `GUAC_HOSTNAME` | Public hostname. It must match the certificate and the SAML entity ID. |
 | `HTTPS_PORT` | Host port for HTTPS. Change it if something else on the host uses 443. |
-| `SAML_IDP_METADATA_URL` | SAML metadata URL of the identity provider. |
+| `SAML_IDP_METADATA_URL` | SAML metadata URL of the identity provider. Empty means `setup.sh` registers the application in Entra ID and fills it in. |
+| `ENTRA_NAMEID_ATTRIBUTE` | Entra ID only. User attribute that becomes the NameID. `mailnickname` (default) or `onpremisessamaccountname`. |
 | `SAML_GROUP_ATTRIBUTE` | Name of the SAML attribute that carries group membership. |
 | `GUAC_ADMIN_GROUP` | Group whose members use the connections. |
 | `GUAC_OPERATOR_GROUP` | Group whose members create and manage the connections. |
 
-`POSTGRES_PASSWORD` is deliberately not in `.env`. Export it in the shell before each
-compose command, and keep it in a password manager or a secret store.
+| `COMPOSE_PROFILES` | `cloudflare` publishes through Cloudflare and starts the `cloudflared` container. Empty skips Cloudflare. |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID, used to link straight to the token page. Asked for if empty. |
+| `CLOUDFLARE_TEAM` | Zero Trust team name, used only if the Cloudflare account has none yet. |
+
+`POSTGRES_PASSWORD` and `TUNNEL_TOKEN` are deliberately not in `.env`. Export them in
+the shell before each compose command, and keep them in a password manager or a secret
+store.
 
 ## Identity provider
 
 Register Guacamole as a SAML application with these values:
 
-- **Entity ID:** `https://<GUAC_HOSTNAME>/guacamole` — no trailing slash.
-- **Reply URL (ACS):** `https://<GUAC_HOSTNAME>/guacamole/` — with a trailing slash.
+- **Entity ID:** `https://<GUAC_HOSTNAME>/guacamole`, no trailing slash.
+- **Reply URL (ACS):** `https://<GUAC_HOSTNAME>/guacamole/`, with a trailing slash.
 - **NameID:** the account name on the target hosts, not the full email address. This
   is required, not cosmetic. `${GUAC_USERNAME}` expands to the NameID, and a Linux
   account cannot be named `jane.doe@example.com`.
@@ -92,7 +138,35 @@ Assign only the two groups to the application.
 
 ### Entra ID
 
-Entra ID needs three things that its default settings do not give you.
+`setup.sh` does all of this for you. It signs in with a device code as the "Microsoft
+Graph Command Line Tools" client, and asks for these delegated permissions:
+`Application.ReadWrite.All`, `Policy.ReadWrite.ApplicationConfiguration`,
+`AppRoleAssignment.ReadWrite.All`, `Group.ReadWrite.All` and `Organization.Read.All`.
+A Global Administrator can consent to them. The script then creates the enterprise
+application, its signing certificate, the NameID claims policy, and the two groups if
+they do not exist, and assigns the groups to the application. Run it again at any
+time; each step finds what exists before it creates anything.
+
+If the device code flow is not available (Conditional Access blocks it, or the run is
+unattended), set `GRAPH_TOKEN_CMD` to a command that prints a Graph access token, and
+the script uses that instead. Two examples:
+
+```bash
+# An administrator signed in with the Azure CLI on this machine.
+GRAPH_TOKEN_CMD="az account get-access-token --resource-type ms-graph --query accessToken -o tsv" ./setup.sh
+
+# A service principal with the same five permissions as application permissions.
+# The client secret comes from a secret store; never put it in a file or the shell history.
+GRAPH_TOKEN_CMD=./graph-token.sh ./setup.sh
+```
+
+where `graph-token.sh` does a client-credentials request against
+`https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token` with scope
+`https://graph.microsoft.com/.default` and prints the `access_token`. The token is used
+in memory only; the script never writes it to a file or a command line.
+
+If you register the application by hand instead, Entra ID needs three things that
+its default settings do not give you.
 
 **Entity ID.** Entra rejects an identifier URI that ends in `/`, with
 `IdentifierUrisEndsWithSlash`. Use no trailing slash, and keep the reply URL's
@@ -114,6 +188,75 @@ error.
 Entra names the group claim with a URI, so leave `SAML_GROUP_ATTRIBUTE` set to
 `http://schemas.microsoft.com/ws/2008/06/identity/claims/groups`. Set it to `groups`
 only if you rename the claim in the application.
+
+## Cloudflare
+
+With `COMPOSE_PROFILES=cloudflare`, `setup.sh` publishes the service without opening a
+port on the host. It needs a Cloudflare API token, taken from `CLOUDFLARE_API_TOKEN`,
+from a command named in `CLOUDFLARE_TOKEN_CMD`, or from a masked prompt. The token is
+used in memory during the run and never written anywhere.
+
+### The API token
+
+Use an **account-owned token**. It belongs to the account, not to a person: it keeps
+working when staff change, it sees that one account only, and the audit log names it
+as its own principal. The script calls account and zone endpoints only, and an account
+token can call all of them.
+
+`setup.sh` prints these steps, with the account's own URL, at the moment it needs the
+token:
+
+1. Sign in to the [Cloudflare dashboard](https://dash.cloudflare.com) with an account
+   that has the **Super Administrator** role on the account that holds the zone.
+2. Open `https://dash.cloudflare.com/<account-id>/api-tokens/create` (or the account →
+   **Manage account → Account API tokens → Create token**). The account ID is on the
+   account's Overview page, right-hand column.
+3. Name the token, for example `guacamole-setup`.
+4. **Policy 1**, scope the account itself. Search the permission groups and tick:
+   - Cloudflare Tunnel **Write**
+   - Access: Apps and Policies **Write**
+   - Access: Organizations, Identity Providers, and Groups **Write**
+5. **Add policy** → **Policy 2**, scope **Specified Domains** → your domain. Tick:
+   - DNS **Write**
+   - Zone **Read**
+6. Token expiration: **7 days**. Setup is a one-off; a later re-run can use a new token.
+   Client IP filtering is optional.
+7. **Review token → Create token**, copy it, and paste it at the prompt. The dashboard
+   shows it once.
+
+| Permission | Scope | Used for |
+|---|---|---|
+| Cloudflare Tunnel Write | account | the tunnel, its route, and its token |
+| Access: Apps and Policies Write | account | the Access application and policy |
+| Access: Organizations, Identity Providers, and Groups Write | account | the Entra ID identity provider, and the team if the account has none |
+| DNS Write | zone | the CNAME for the hostname |
+| Zone Read | zone | finding the zone from the hostname |
+
+Do not use the Global API Key. You cannot scope it, expire it or rotate it on its own. A
+user token (My Profile → API Tokens) also works, but Cloudflare deletes it when that
+user leaves the account.
+
+The token you paste covers setup only. The value the script prints at the end, the
+tunnel token, is a separate credential. `cloudflared` holds that one at runtime, and it
+cannot touch DNS, Access or the API.
+
+The script finds the zone from `GUAC_HOSTNAME`, then creates or updates:
+
+1. A Zero Trust team, if the account has none. The name comes from `CLOUDFLARE_TEAM`.
+2. A tunnel named `guacamole-<hostname>`, configured in Cloudflare to send the hostname
+   to `nginx` on the compose network. Cloudflare holds the public certificate, so the
+   self-signed one in `nginx/certs` is enough.
+3. A proxied CNAME for the hostname to the tunnel.
+4. A second Entra ID app registration, "Cloudflare Access (<hostname>)", and a Cloudflare
+   identity provider that uses it. The client secret passes from Graph to Cloudflare in
+   memory. Admin consent is granted, so users see no consent prompt.
+5. An Access application for the hostname with one policy: anyone who signs in through
+   that identity provider. Authorisation stays with Entra ID, which only issues the SAML
+   assertion to members of the assigned groups, and with Guacamole's group mapping.
+
+At the end it prints the tunnel token. Keep it with the database password and export it
+as `TUNNEL_TOKEN` for every compose command. Every step finds what exists before it
+creates anything, so the script can be run again.
 
 ## Access model
 
