@@ -41,6 +41,8 @@ rule
 env_get() { sed -n "s/^$1=//p" .env | tail -n 1; }
 # shellcheck source=lib/startup.sh
 source lib/startup.sh
+# shellcheck source=lib/schema.sh
+source lib/schema.sh
 
 # First run: write .env from .env.example. Only two answers have no default.
 if [ ! -f .env ]; then
@@ -66,11 +68,37 @@ note "Guacamole $B$GUAC_VERSION$X"
 # Offer to install whatever is missing with the package manager found.
 step "Tools"
 [ "$(id -u)" = 0 ] && SUDO= || SUDO=sudo
+install_docker() {
+  local distro=""
+  if [ -r /etc/os-release ]; then
+    # Read the distribution ID without changing the setup script's variables.
+    # shellcheck source=/dev/null
+    distro="$(. /etc/os-release; printf '%s' "${ID:-}")"
+  fi
+  if [ "$distro" = rocky ]; then
+    # Rocky's installation guide uses Docker's RHEL repository. The Rocky 10
+    # repository selected by get.docker.com is missing the engine packages.
+    note "Installing Docker from the RHEL repository recommended by Rocky Linux."
+    $SUDO dnf -y install dnf-plugins-core || die "Could not install the DNF repository tools."
+    # This replaces docker-ce.repo from a previous failed installation.
+    $SUDO dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo \
+      || die "Could not configure the Docker repository."
+    $SUDO dnf -y --refresh install docker-ce docker-ce-cli containerd.io \
+      docker-buildx-plugin docker-compose-plugin || die "Could not install Docker."
+    $SUDO systemctl enable --now docker || die "Docker is installed, but its service did not start."
+  else
+    curl -fsSL https://get.docker.com | $SUDO sh || die "Could not install Docker."
+  fi
+  ok "docker installed"
+}
 need() {
   command -v "$1" >/dev/null && { ok "$1"; return; }
   read -rp "  $1 is not installed. Install it now? [y/N] " a
   [ "$a" = y ] || die "Install $1 and run again."
-  [ "$1" != docker ] || { curl -fsSL https://get.docker.com | $SUDO sh; ok "docker installed"; return; }
+  if [ "$1" = docker ]; then
+    install_docker
+    return
+  fi
   for pm in apt-get dnf yum zypper apk pacman; do
     command -v "$pm" >/dev/null || continue
     case $pm in
@@ -85,7 +113,15 @@ need() {
   die "No known package manager. Install $1 and run again."
 }
 for t in curl jq openssl docker; do need "$t"; done
+case "$(docker --version 2>/dev/null)" in
+  *[Pp]odman*) warn "The docker command runs Podman. This setup has not been verified with Podman." ;;
+esac
 docker compose version >/dev/null 2>&1 && ok "docker compose" || die "The Docker Compose plugin is missing."
+# A version check does not contact the engine. Use Compose here because Podman's
+# local CLI can work even when its API socket is unavailable to Compose.
+docker compose ls >/dev/null \
+  || die "Compose cannot reach the container engine. Check the connection error above before running setup again."
+ok "Compose can reach the container engine"
 
 step "Database password"
 get_database_password
@@ -96,15 +132,9 @@ step "Host"
 mkdir -p nginx/certs nginx/log data
 ok "folders"
 
-# The schema comes out of the Guacamole image, so it always matches GUAC_VERSION.
-# Delete init/001-initdb.sql after a version change to generate it again.
-if [ -f init/001-initdb.sql ]; then
-  ok "database schema (init/001-initdb.sql exists)"
-else
-  docker run --rm "guacamole/guacamole:${GUAC_VERSION}" \
-    /opt/guacamole/bin/initdb.sh --postgresql > init/001-initdb.sql
-  ok "database schema generated from guacamole/guacamole:${GUAC_VERSION}"
-fi
+# Save the schema only after generation succeeds. Existing databases are not
+# reinitialised or upgraded by generating this file.
+prepare_database_schema
 
 if [ -f nginx/certs/privkey.pem ]; then
   ok "certificate (nginx/certs/privkey.pem exists)"

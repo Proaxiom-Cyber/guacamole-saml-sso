@@ -40,9 +40,19 @@ Have these ready before you run `setup.sh`.
 
 - A recent distribution: Ubuntu, Debian, RHEL, Rocky, Alma, Fedora, SUSE, Alpine or Arch.
 - Docker with the Compose plugin, `curl`, `jq` and `openssl`. `setup.sh` offers to
-  install any that are missing, with the distribution's package manager and Docker with
-  `get.docker.com`. Run it with `sudo` rights the first time.
+  install missing tools with the distribution's package manager. On Rocky Linux,
+  it installs Docker from the RHEL repository, then enables and starts the Docker
+  service. This follows [Rocky's Docker installation guide][rocky-docker].
+  Other distributions use `get.docker.com` for Docker. Run setup with `sudo` rights
+  the first time.
 - Outbound internet access. With Cloudflare, no inbound port is needed at all.
+
+[rocky-docker]: https://docs.rockylinux.org/gemstones/containers/docker/
+
+The `podman-docker` package makes the `docker` command run Podman. Installing the
+Docker Compose plugin does not change that. Setup warns when it detects Podman;
+this project has not been verified with Podman. Before it asks for credentials,
+setup checks that Compose can connect to the container engine.
 
 **An Entra ID tenant** (or another SAML identity provider: Okta and Keycloak work, with
 manual registration)
@@ -88,7 +98,7 @@ also a certificate for that name that your clients trust, and a firewall rule fo
    With `COMPOSE_PROFILES=cloudflare` (the default), it then asks for a Cloudflare API
    token and publishes the hostname: a tunnel, a proxied DNS record, and Cloudflare
    Access with Entra ID sign-in in front. Setup gets the tunnel token without displaying it.
-5. Setup starts the containers and waits for the database and tunnel health checks.
+5. Setup starts the containers and waits for the guacd, database and tunnel health checks.
    It checks the Guacamole page through local nginx, shows container status, then prints
    the service URL. If Cloudflare Access is not ready, setup stops before starting the
    services. Activate the zone and run setup again.
@@ -306,9 +316,28 @@ docker compose logs -f guacd        # session log
 ./destroy.sh                        # remove containers, networks and images
 ```
 
-To reset the database, stop the stack and delete `data/`. The `init/` scripts run
-again on the next start. This also deletes the session history, so do not use it to
-change access. Access changes belong in the identity provider.
+Setup saves the generated schema only after the image command succeeds and the
+output contains the required tables. It regenerates files from older setup runs
+that have no completion marker. This does not change an existing database.
+The database health check requires the Guacamole tables as well as a valid password.
+
+Compose checks guacd's listening port every five seconds. This overrides the
+five-minute health-check interval in the guacd 1.6.0 image, which exceeds setup's
+three-minute wait limit. Guacamole starts after guacd and the database are healthy.
+
+For a failed fresh installation with no connections or session history to preserve,
+update the code, stop the containers, and move the failed database aside:
+
+```bash
+git pull --ff-only &&
+docker compose down &&
+mv data "data.failed-$(date +%Y%m%d-%H%M%S)" &&
+./setup.sh
+```
+
+Keep `.env` and use the same database password. Setup regenerates an incomplete
+schema and initialises a new database. The old database remains in `data.failed-*`.
+Do not use this reset to change access. Access changes belong in the identity provider.
 
 ## Security notes
 

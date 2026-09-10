@@ -1,7 +1,9 @@
 .env
 init/001-initdb.sql
+init/.schema.*
 nginx/certs/
 nginx/log/
 data/
+data.failed-*/
 .DS_Store
 __pycache__/

@@ -12,6 +12,13 @@ services:
     image: guacamole/guacd:${GUAC_VERSION:?}
     networks: [guacnet]
     restart: always
+    healthcheck:
+      # The 1.6.0 image checks every five minutes; setup waits only three.
+      test: ["CMD", "nc", "-z", "127.0.0.1", "4822"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
   postgres:
     image: postgres:18-alpine
@@ -29,8 +36,9 @@ services:
       - ./init:/docker-entrypoint-initdb.d:ro
       - ./data:/var/lib/postgresql/data
     healthcheck:
-      # TCP checks the supplied password, including on an existing database.
-      test: ["CMD-SHELL", "PGPASSWORD=\"$$POSTGRES_PASSWORD\" psql --host=127.0.0.1 --username=\"$$POSTGRES_USER\" --dbname=\"$$POSTGRES_DB\" --no-password --command='SELECT 1' >/dev/null 2>&1"]
+      # TCP checks the password. Query the schema too: PostgreSQL can restart
+      # after an init script fails and accept connections with no Guacamole tables.
+      test: ["CMD-SHELL", "PGPASSWORD=\"$$POSTGRES_PASSWORD\" psql --host=127.0.0.1 --username=\"$$POSTGRES_USER\" --dbname=\"$$POSTGRES_DB\" --no-password --set=ON_ERROR_STOP=1 --command='SELECT entity_id FROM guacamole_entity LIMIT 0; SELECT user_group_id FROM guacamole_user_group LIMIT 0;' >/dev/null 2>&1"]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -40,7 +48,7 @@ services:
     image: guacamole/guacamole:${GUAC_VERSION:?}
     depends_on:
       guacd:
-        condition: service_started
+        condition: service_healthy
       postgres:
         condition: service_healthy
     environment:
