@@ -1,0 +1,66 @@
+# Apache Guacamole with SAML single sign-on, behind nginx.
+# Settings come from .env. POSTGRES_PASSWORD must be exported in the shell.
+
+networks:
+  guacnet:
+    driver: bridge
+
+services:
+
+  guacd:
+    image: guacamole/guacd:${GUAC_VERSION:?}
+    networks: [guacnet]
+    restart: always
+
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      PGDATA: /var/lib/postgresql/data/guacamole
+      POSTGRES_DB: guacamole_db
+      POSTGRES_USER: guacamole_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?export POSTGRES_PASSWORD in the shell first}
+      # Read by init/002-groups.sh on first start only.
+      GUAC_ADMIN_GROUP: ${GUAC_ADMIN_GROUP:?}
+      GUAC_OPERATOR_GROUP: ${GUAC_OPERATOR_GROUP:?}
+    networks: [guacnet]
+    restart: always
+    volumes:
+      - ./init:/docker-entrypoint-initdb.d:ro
+      - ./data:/var/lib/postgresql/data
+
+  guacamole:
+    image: guacamole/guacamole:${GUAC_VERSION:?}
+    depends_on: [guacd, postgres]
+    environment:
+      GUACD_HOSTNAME: guacd
+      POSTGRESQL_HOSTNAME: postgres
+      POSTGRESQL_DATABASE: guacamole_db
+      POSTGRESQL_USERNAME: guacamole_user
+      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD:?}
+      # SAML authenticates. The database only authorises.
+      SAML_IDP_METADATA_URL: ${SAML_IDP_METADATA_URL:?}
+      # Entra ID rejects an entity ID that ends in "/". This must match the
+      # identity provider exactly.
+      SAML_ENTITY_ID: "https://${GUAC_HOSTNAME:?}/guacamole"
+      SAML_CALLBACK_URL: "https://${GUAC_HOSTNAME}/guacamole/"
+      SAML_STRICT: "true"
+      SAML_DEBUG: "false"
+      SAML_COMPRESS_REQUEST: "true"
+      SAML_COMPRESS_RESPONSE: "true"
+      SAML_GROUP_ATTRIBUTE: ${SAML_GROUP_ATTRIBUTE:-groups}
+      EXTENSION_PRIORITY: "saml,postgresql"
+    networks: [guacnet]
+    restart: always
+
+  nginx:
+    image: nginx:1.30-alpine
+    environment:
+      GUAC_HOSTNAME: ${GUAC_HOSTNAME:?}
+    networks: [guacnet]
+    ports:
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - ./nginx/log:/var/log/nginx
+    restart: always

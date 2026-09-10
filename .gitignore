@@ -1,0 +1,6 @@
+.env
+init/001-initdb.sql
+nginx/certs/
+nginx/log/
+data/
+.DS_Store
