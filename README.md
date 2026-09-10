@@ -84,8 +84,10 @@ also a certificate for that name that your clients trust, and a firewall rule fo
 
 1. Keep the database password in your secret store. For an existing database, use its
    current password. For a new database, create a password in the store first.
-2. Run `./setup.sh`. On the first run it asks for the public hostname and whether to
-   publish through Cloudflare, then writes non-secret configuration to `.env`.
+2. Run `./setup.sh` from the Git checkout. It installs or updates the live deployment
+   in `/opt/guacamole`, then continues from there. On the first run it asks for the
+   public hostname and whether to publish through Cloudflare. It writes non-secret
+   configuration to `/opt/guacamole/.env`.
    To change group names or use Okta or Keycloak, copy `.env.example` to `.env` and edit
    it before the first run. Set the identity provider metadata URL for Okta or Keycloak.
 3. Supply the database password at the masked prompt and confirm it. Setup can also
@@ -112,7 +114,8 @@ the first start, or delete `data/` and start again.
 
 ## Configuration
 
-Non-secret configuration lives in `.env`. Passwords and tokens do not belong there.
+Non-secret configuration lives in `/opt/guacamole/.env`. Passwords and tokens do not
+belong there.
 
 | Setting | What it does |
 |---|---|
@@ -129,16 +132,16 @@ Non-secret configuration lives in `.env`. Passwords and tokens do not belong the
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID, used to link straight to the token page. Asked for if empty. |
 | `CLOUDFLARE_TEAM` | Zero Trust team name, used only if the Cloudflare account has none yet. |
 
-Use `./setup.sh` to start or recreate the services. It passes the database password and
-tunnel token to Compose through a pipe. It does not print them or write them to `.env`,
-an override file, or a command argument. Docker supplies them to the containers as
-environment variables.
+Use `/opt/guacamole/setup.sh` to start or recreate the services. It passes the database
+password and tunnel token to Compose through a pipe. It does not print them or write
+them to `.env`, an override file, or a command argument. Docker supplies them to the
+containers as environment variables.
 
 On Linux, inject the database secret into the SSH session from the Mac's Keychain.
 For example, after connecting with `ssh-secret <host> guacamole-postgres`, run:
 
 ```bash
-POSTGRES_PASSWORD_CMD='secret-get guacamole-postgres' ./setup.sh
+POSTGRES_PASSWORD_CMD='secret-get guacamole-postgres' /opt/guacamole/setup.sh
 ```
 
 The command must return the same password on later runs. If the command fails, setup
@@ -306,10 +309,13 @@ Then grant READ on the connection to the administrator group.
 
 ## Operate
 
-Use `./setup.sh` to start or recreate the containers. These commands inspect or stop
-the existing containers without asking you to enter credentials:
+The live program, configuration, certificate, logs and database are under
+`/opt/guacamole`. The Git checkout contains the source used to update that deployment.
+Run operational commands from the installed folder:
 
 ```bash
+cd /opt/guacamole
+./setup.sh                         # start or recreate the services
 docker compose logs -f guacamole    # application and SAML log
 docker compose logs -f guacd        # session log
 ./connectdb.sh                      # psql shell
@@ -326,18 +332,22 @@ five-minute health-check interval in the guacd 1.6.0 image, which exceeds setup'
 three-minute wait limit. Guacamole starts after guacd and the database are healthy.
 
 For a failed fresh installation with no connections or session history to preserve,
-update the code, stop the containers, and move the failed database aside:
+update the source, install it, then remove the failed database:
 
 ```bash
+cd /path/to/guacamole-saml-sso &&
 git pull --ff-only &&
+./setup.sh --install-only &&
+cd /opt/guacamole &&
 docker compose down &&
-mv data "data.failed-$(date +%Y%m%d-%H%M%S)" &&
+rm -rf -- /opt/guacamole/data &&
+rm -f -- /opt/guacamole/init/001-initdb.sql &&
 ./setup.sh
 ```
 
-Keep `.env` and use the same database password. Setup regenerates an incomplete
-schema and initialises a new database. The old database remains in `data.failed-*`.
-Do not use this reset to change access. Access changes belong in the identity provider.
+Keep `/opt/guacamole/.env` and use the same database password. Setup regenerates the
+schema and initialises a new database. Do not use this reset to change access. Access
+changes belong in the identity provider.
 
 ## Security notes
 

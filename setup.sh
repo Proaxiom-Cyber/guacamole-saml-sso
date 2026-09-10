@@ -4,7 +4,57 @@
 set +x
 set +a
 set -euo pipefail
-cd "$(dirname "$0")"
+SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
+INSTALL_DIR=/opt/guacamole
+INSTALL_ONLY=false
+if [ "${1:-}" = --install-only ]; then
+  INSTALL_ONLY=true
+  shift
+fi
+
+# The repository is the update source. Install the live deployment under /opt,
+# then continue there. Program files are replaced; local configuration is kept.
+if [ "$SOURCE_DIR" != "$INSTALL_DIR" ]; then
+  if [ "$(id -u)" = 0 ]; then
+    INSTALL_AS=()
+  elif command -v sudo >/dev/null 2>&1; then
+    INSTALL_AS=(sudo)
+  else
+    printf 'setup needs root or sudo to install in %s\n' "$INSTALL_DIR" >&2
+    exit 1
+  fi
+
+  "${INSTALL_AS[@]}" mkdir -p \
+    "$INSTALL_DIR/lib" "$INSTALL_DIR/init" "$INSTALL_DIR/nginx/templates"
+  "${INSTALL_AS[@]}" install -m 755 \
+    "$SOURCE_DIR/setup.sh" "$SOURCE_DIR/connectdb.sh" "$SOURCE_DIR/destroy.sh" \
+    "$INSTALL_DIR/"
+  "${INSTALL_AS[@]}" install -m 644 \
+    "$SOURCE_DIR/docker-compose.yaml" "$SOURCE_DIR/.env.example" \
+    "$SOURCE_DIR/README.md" "$SOURCE_DIR/LICENSE" "$INSTALL_DIR/"
+  "${INSTALL_AS[@]}" install -m 644 "$SOURCE_DIR"/lib/*.sh "$INSTALL_DIR/lib/"
+  "${INSTALL_AS[@]}" install -m 644 "$SOURCE_DIR/init/002-groups.sh" "$INSTALL_DIR/init/"
+
+  # Carry the existing non-secret configuration into the installed deployment.
+  # Never replace configuration that already exists in /opt.
+  if [ ! -f "$INSTALL_DIR/.env" ] && [ -f "$SOURCE_DIR/.env" ]; then
+    "${INSTALL_AS[@]}" install -m 600 "$SOURCE_DIR/.env" "$INSTALL_DIR/.env"
+  fi
+
+  # The person who invoked setup must be able to create runtime directories and
+  # replace .env. Do not recursively change ownership of an existing database.
+  "${INSTALL_AS[@]}" chown "$(id -u):$(id -g)" \
+    "$INSTALL_DIR" "$INSTALL_DIR/init" "$INSTALL_DIR/nginx"
+  if [ -f "$INSTALL_DIR/.env" ]; then
+    "${INSTALL_AS[@]}" chown "$(id -u):$(id -g)" "$INSTALL_DIR/.env"
+  fi
+  printf 'Installed the live deployment in %s\n' "$INSTALL_DIR"
+  [ "$INSTALL_ONLY" = false ] || exit 0
+  exec "$INSTALL_DIR/setup.sh" "$@"
+fi
+
+cd "$INSTALL_DIR"
+[ "$INSTALL_ONLY" = false ] || exit 0
 
 # ---- Look ---------------------------------------------------------------------
 # Brand colours from the Proaxiom logo. Only on a terminal, never with NO_COLOR.

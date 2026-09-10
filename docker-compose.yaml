@@ -2,6 +2,8 @@
 # Settings come from .env. Use setup.sh to start or recreate the services;
 # it supplies the credentials through an in-memory Compose override.
 
+name: guacamole-saml-sso
+
 networks:
   guacnet:
     driver: bridge
