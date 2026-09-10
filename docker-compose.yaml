@@ -1,6 +1,6 @@
 # Apache Guacamole with SAML single sign-on, behind nginx.
-# Settings come from .env. POSTGRES_PASSWORD, and TUNNEL_TOKEN when the
-# cloudflare profile is on, must be exported in the shell.
+# Settings come from .env. Use setup.sh to start or recreate the services;
+# it supplies the credentials through an in-memory Compose override.
 
 networks:
   guacnet:
@@ -19,7 +19,7 @@ services:
       PGDATA: /var/lib/postgresql/data/guacamole
       POSTGRES_DB: guacamole_db
       POSTGRES_USER: guacamole_user
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?export POSTGRES_PASSWORD in the shell first}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
       # Read by init/002-groups.sh on first start only.
       GUAC_ADMIN_GROUP: ${GUAC_ADMIN_GROUP:?}
       GUAC_OPERATOR_GROUP: ${GUAC_OPERATOR_GROUP:?}
@@ -28,16 +28,27 @@ services:
     volumes:
       - ./init:/docker-entrypoint-initdb.d:ro
       - ./data:/var/lib/postgresql/data
+    healthcheck:
+      # TCP checks the supplied password, including on an existing database.
+      test: ["CMD-SHELL", "PGPASSWORD=\"$$POSTGRES_PASSWORD\" psql --host=127.0.0.1 --username=\"$$POSTGRES_USER\" --dbname=\"$$POSTGRES_DB\" --no-password --command='SELECT 1' >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
   guacamole:
     image: guacamole/guacamole:${GUAC_VERSION:?}
-    depends_on: [guacd, postgres]
+    depends_on:
+      guacd:
+        condition: service_started
+      postgres:
+        condition: service_healthy
     environment:
       GUACD_HOSTNAME: guacd
       POSTGRESQL_HOSTNAME: postgres
       POSTGRESQL_DATABASE: guacamole_db
       POSTGRESQL_USERNAME: guacamole_user
-      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD:-}
       # SAML authenticates. The database only authorises.
       SAML_IDP_METADATA_URL: ${SAML_IDP_METADATA_URL:?}
       # Entra ID rejects an entity ID that ends in "/". This must match the
@@ -59,16 +70,23 @@ services:
   # Started only when COMPOSE_PROFILES in .env contains "cloudflare".
   cloudflared:
     image: cloudflare/cloudflared:latest
-    command: tunnel --no-autoupdate run
+    command: tunnel --no-autoupdate --metrics 127.0.0.1:2000 run
     environment:
       # Not ":?" — Compose interpolates every service, even ones outside the active profile.
       TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
     networks: [guacnet]
     profiles: [cloudflare]
     restart: always
+    healthcheck:
+      test: ["CMD", "cloudflared", "tunnel", "--metrics", "127.0.0.1:2000", "ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
   nginx:
     image: nginx:1.30-alpine
+    depends_on: [guacamole]
     environment:
       GUAC_HOSTNAME: ${GUAC_HOSTNAME:?}
     networks: [guacnet]

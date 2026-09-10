@@ -4,3 +4,4 @@ nginx/certs/
 nginx/log/
 data/
 .DS_Store
+__pycache__/

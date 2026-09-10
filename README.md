@@ -21,7 +21,8 @@ target. This one does neither.
 
 ## Components
 
-Four containers on one Docker network. Only nginx listens on the host.
+Four containers on one Docker network, plus `cloudflared` when enabled. Only nginx
+listens on the host.
 
 | Service | Image | Role |
 |---|---|---|
@@ -29,6 +30,7 @@ Four containers on one Docker network. Only nginx listens on the host.
 | guacamole | guacamole/guacamole | Web application, SAML authentication |
 | guacd | guacamole/guacd | Protocol worker (SSH, RDP, VNC) |
 | postgres | postgres:18-alpine | Groups, connections, session history |
+| cloudflared | cloudflare/cloudflared:latest | Optional Cloudflare Tunnel connector |
 
 ## Requirements
 
@@ -70,37 +72,37 @@ also a certificate for that name that your clients trust, and a firewall rule fo
 
 ## Deploy
 
-1. Run `./setup.sh`. On the first run it asks for the public hostname and whether to
-   publish through Cloudflare, and writes `.env` from `.env.example`. Everything else
-   keeps its default; edit `.env` to change the group names. For Okta or Keycloak, set
-   the identity provider metadata URL in `.env` before running again.
-2. The script then creates the folders, generates the database schema, and makes a
+1. Keep the database password in your secret store. For an existing database, use its
+   current password. For a new database, create a password in the store first.
+2. Run `./setup.sh`. On the first run it asks for the public hostname and whether to
+   publish through Cloudflare, then writes non-secret configuration to `.env`.
+   To change group names or use Okta or Keycloak, copy `.env.example` to `.env` and edit
+   it before the first run. Set the identity provider metadata URL for Okta or Keycloak.
+3. Supply the database password at the masked prompt and confirm it. Setup can also
+   retrieve it through `POSTGRES_PASSWORD_CMD` or use an existing `POSTGRES_PASSWORD`
+   session variable. It never generates a replacement password on a later run.
+4. The script creates the folders, generates the database schema, and makes a
    self-signed certificate. If the metadata URL is empty, it also registers the
    application in Entra ID: it shows a device code, you sign in as an administrator,
    and it writes the metadata URL back to `.env`.
    With `COMPOSE_PROFILES=cloudflare` (the default), it then asks for a Cloudflare API
    token and publishes the hostname: a tunnel, a proxied DNS record, and Cloudflare
-   Access with Entra ID sign-in in front. It prints the tunnel token at the end.
-3. Without Cloudflare: replace `nginx/certs/fullchain.pem` and `privkey.pem` with a
-   certificate your clients trust, and open `HTTPS_PORT`.
-4. Okta or Keycloak: register the application yourself. See below.
-5. Start the stack. Neither secret is ever written to a file:
-
-   ```bash
-   export POSTGRES_PASSWORD="$(openssl rand -base64 24)"   # keep it: every compose command needs it
-   export TUNNEL_TOKEN="..."                                # from setup.sh; only with the cloudflare profile
-   docker compose up -d
-   docker compose ps
-   ```
-
-6. Open `https://<GUAC_HOSTNAME>/guacamole/`. Sign-in starts at once.
+   Access with Entra ID sign-in in front. Setup gets the tunnel token without displaying it.
+5. Setup starts the containers and waits for the database and tunnel health checks.
+   It checks the Guacamole page through local nginx, shows container status, then prints
+   the service URL. If Cloudflare Access is not ready, setup stops before starting the
+   services. Activate the zone and run setup again.
+6. Without Cloudflare, replace `nginx/certs/fullchain.pem` and `privkey.pem` with a
+   certificate your clients trust, then run setup again. Open `HTTPS_PORT` to your clients.
+7. Open the URL from the summary. With Cloudflare, it is
+   `https://<GUAC_HOSTNAME>/guacamole/`. Sign-in starts at once.
 
 The `init/` scripts run only when `data/` is empty. Get the group names right before
 the first start, or delete `data/` and start again.
 
 ## Configuration
 
-All of it lives in `.env`, except the database password.
+Non-secret configuration lives in `.env`. Passwords and tokens do not belong there.
 
 | Setting | What it does |
 |---|---|
@@ -112,14 +114,27 @@ All of it lives in `.env`, except the database password.
 | `SAML_GROUP_ATTRIBUTE` | Name of the SAML attribute that carries group membership. |
 | `GUAC_ADMIN_GROUP` | Group whose members use the connections. |
 | `GUAC_OPERATOR_GROUP` | Group whose members create and manage the connections. |
-
+| `POSTGRES_PASSWORD_CMD` | Optional command that retrieves the existing database password. Empty means a masked prompt. A session variable with this name overrides the value in `.env`. |
 | `COMPOSE_PROFILES` | `cloudflare` publishes through Cloudflare and starts the `cloudflared` container. Empty skips Cloudflare. |
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID, used to link straight to the token page. Asked for if empty. |
 | `CLOUDFLARE_TEAM` | Zero Trust team name, used only if the Cloudflare account has none yet. |
 
-`POSTGRES_PASSWORD` and `TUNNEL_TOKEN` are deliberately not in `.env`. Export them in
-the shell before each compose command, and keep them in a password manager or a secret
-store.
+Use `./setup.sh` to start or recreate the services. It passes the database password and
+tunnel token to Compose through a pipe. It does not print them or write them to `.env`,
+an override file, or a command argument. Docker supplies them to the containers as
+environment variables.
+
+On Linux, inject the database secret into the SSH session from the Mac's Keychain.
+For example, after connecting with `ssh-secret <host> guacamole-postgres`, run:
+
+```bash
+POSTGRES_PASSWORD_CMD='secret-get guacamole-postgres' ./setup.sh
+```
+
+The command must return the same password on later runs. If the command fails, setup
+stops. With no command or session password, paste the stored password at the masked
+prompt. Setup checks database authentication before it starts Guacamole. It does not
+change the password of an existing database.
 
 ## Identity provider
 
@@ -236,9 +251,9 @@ Do not use the Global API Key. You cannot scope it, expire it or rotate it on it
 user token (My Profile → API Tokens) also works, but Cloudflare deletes it when that
 user leaves the account.
 
-The token you paste covers setup only. The value the script prints at the end, the
-tunnel token, is a separate credential. `cloudflared` holds that one at runtime, and it
-cannot touch DNS, Access or the API.
+The token you paste covers setup only. The tunnel token is a separate credential that
+setup retrieves and passes to `cloudflared` without displaying it. The connector uses
+that token at runtime. It cannot use it to change DNS or Access configuration.
 
 The script finds the zone from `GUAC_HOSTNAME`, then creates or updates:
 
@@ -254,9 +269,9 @@ The script finds the zone from `GUAC_HOSTNAME`, then creates or updates:
    that identity provider. Authorisation stays with Entra ID, which only issues the SAML
    assertion to members of the assigned groups, and with Guacamole's group mapping.
 
-At the end it prints the tunnel token. Keep it with the database password and export it
-as `TUNNEL_TOKEN` for every compose command. Every step finds what exists before it
-creates anything, so the script can be run again.
+Setup then starts the services and waits for the tunnel to connect to Cloudflare.
+Every provisioning step finds what exists before it creates anything. On a later run,
+setup retrieves the tunnel token again and requires the same database password.
 
 ## Access model
 
@@ -280,6 +295,9 @@ interface. Two settings matter:
 Then grant READ on the connection to the administrator group.
 
 ## Operate
+
+Use `./setup.sh` to start or recreate the containers. These commands inspect or stop
+the existing containers without asking you to enter credentials:
 
 ```bash
 docker compose logs -f guacamole    # application and SAML log

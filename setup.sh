@@ -1,6 +1,8 @@
 #!/bin/bash
-# One-time host preparation: tools, folders, database schema, a certificate,
-# the Entra ID application, and the Cloudflare tunnel with Access in front.
+# Prepare and start Guacamole with Entra ID and optional Cloudflare Access.
+# Disable tracing before any credentials enter the script.
+set +x
+set +a
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -37,6 +39,8 @@ rule
 # Read only the values this script needs. Do not source .env: a group name
 # with a space in it is valid to Compose but not to the shell.
 env_get() { sed -n "s/^$1=//p" .env | tail -n 1; }
+# shellcheck source=lib/startup.sh
+source lib/startup.sh
 
 # First run: write .env from .env.example. Only two answers have no default.
 if [ ! -f .env ]; then
@@ -82,6 +86,10 @@ need() {
 }
 for t in curl jq openssl docker; do need "$t"; done
 docker compose version >/dev/null 2>&1 && ok "docker compose" || die "The Docker Compose plugin is missing."
+
+step "Database password"
+get_database_password
+ok "database password supplied"
 
 # ---- Host ---------------------------------------------------------------------
 step "Host"
@@ -416,8 +424,14 @@ GUIDE
     jq -r '.name_servers[] | "      " + .' <<<"$ZINFO" >&2
     warn "then run ./setup.sh again to add the Access application. The tunnel and DNS record are ready."
   fi
+  [ -n "$PUBLISHED" ] || die "Cloudflare Access is not ready. Activate the zone and run setup again."
   TUNNEL_TOKEN_OUT="$(cf GET "/accounts/$ACCT/cfd_tunnel/$TUNNEL/token" | jq -r .)"
 fi
+
+# ---- Start --------------------------------------------------------------------
+step "Start services"
+start_stack
+unset DB_PASSWORD TUNNEL_TOKEN_OUT CF_TOKEN TOKEN
 
 # ---- Summary ------------------------------------------------------------------
 echo
@@ -425,18 +439,8 @@ rule
 printf '%s%s Ready.%s\n\n' "$M" "$B" "$X"
 if [ -n "$PUBLISHED" ]; then
   printf '  %shttps://%s/guacamole/%s\n  %sthrough Cloudflare, behind Access%s\n\n' "$B" "$GUAC_HOSTNAME" "$X" "$D" "$X"
-elif [ -n "$TUNNEL_TOKEN_OUT" ]; then
-  printf '  %shttps://%s/guacamole/%s\n  %safter the nameservers move and a second run%s\n\n' "$B" "$GUAC_HOSTNAME" "$X" "$D" "$X"
 else
   printf '  %shttps://%s:%s/guacamole/%s\n  %sreplace nginx/certs/*.pem with a trusted certificate%s\n\n' \
     "$B" "$GUAC_HOSTNAME" "$(env_get HTTPS_PORT)" "$X" "$D" "$X"
 fi
-if [ -n "$TUNNEL_TOKEN_OUT" ]; then
-  printf '  Tunnel token for the cloudflared container. %sStore it with the database password.%s\n' "$B" "$X"
-  printf '  %s%s%s\n\n' "$D" "$TUNNEL_TOKEN_OUT" "$X"
-fi
-printf '  Next:\n'
-printf '    %sexport POSTGRES_PASSWORD="$(openssl rand -base64 24)"%s   # keep it safe\n' "$T" "$X"
-[ -z "$TUNNEL_TOKEN_OUT" ] || printf '    %sexport TUNNEL_TOKEN="<the token above>"%s\n' "$T" "$X"
-printf '    %sdocker compose up -d%s\n' "$T" "$X"
 rule
