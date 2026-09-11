@@ -228,6 +228,12 @@ func recorded(st *state.State, r state.Resource) bool {
 // outcome turns uncertain work into a reportable outcome. It carries no
 // Kind: it is not a removal step, it is work that could not be accounted
 // for, and it counts as residue.
+//
+// The detail is deliberately short here. The full explanation — what the
+// phase may have left, why the provider could not be asked, and what to do
+// about it — is printed once in its own section; repeating the whole
+// sentence in the residue list made the same paragraph appear twice and
+// buried the list it belongs to.
 func (u Uncertainty) outcome() Outcome {
 	return Outcome{
 		Item: Item{
@@ -235,7 +241,7 @@ func (u Uncertainty) outcome() Outcome {
 			Resource: state.Resource{Provider: u.Provider, Type: "unreconciled-phase", Name: u.Intent},
 		},
 		Status: StatusUncertain,
-		Detail: u.Detail,
+		Detail: "could not be checked; see above",
 	}
 }
 

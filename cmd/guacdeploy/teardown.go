@@ -40,14 +40,25 @@ func teardownCmd(ctx context.Context, stateDir string, consent, deleteData bool,
 	}
 
 	reg := settingsRegistry()
-	plan := teardown.BuildPlan(st, settings.List(ctx, st, reg), deleteData)
-
 	ops := teardown.DefaultOps(teardown.HostOptions{
 		DeploymentID: st.DeploymentID,
 		StateDir:     stateDir,
 		InstallDir:   installDirOf(st),
 	})
-	teardownProviders(&ops, st, stateDir, u)
+	cf, ec := teardownProviders(&ops, st, stateDir, u)
+
+	// Reconcile before planning. A phase that created resources and then
+	// failed before recording them leaves nothing in the deployment record,
+	// so a plan built from the record alone would miss them and the run
+	// would report a completeness it has not earned. Reconcile asks each
+	// provider by this deployment's exact ownership marker and records what
+	// it can prove; a name-only match is reported for review, never adopted.
+	rec := teardown.Reconcile(ctx, st, teardown.Finders{
+		"entra":      findEntra(ec, st),
+		"cloudflare": findCloudflare(cf),
+	})
+	plan := teardown.BuildPlan(st, settings.List(ctx, st, reg), deleteData)
+	plan.Reconciled = rec
 
 	if _, err = teardown.Run(ctx, st, plan, ops, u, teardown.Options{
 		Consent:  consent,
@@ -87,7 +98,7 @@ func installDirOf(st *state.State) string {
 // teardownProviders fills in the provider half of the removal seam. Each
 // delete re-verifies its own ownership marker at deletion time and refuses
 // with ErrNotOwned otherwise, which teardown reports as retained.
-func teardownProviders(ops *teardown.Ops, st *state.State, stateDir string, u *ui.UI) {
+func teardownProviders(ops *teardown.Ops, st *state.State, stateDir string, u *ui.UI) (*cloudflare.Provisioner, *entra.Client) {
 	m := &creds.Manager{
 		Mode:       st.Config["credential-mode"],
 		Dir:        filepath.Join(stateDir, "credentials"),
@@ -120,5 +131,75 @@ func teardownProviders(ops *teardown.Ops, st *state.State, stateDir string, u *u
 	}
 	ops.DeleteEntraGroup = func(ctx context.Context, id string) error {
 		return ec.CleanupGroup(ctx, ecfg, id)
+	}
+	return cf, ec
+}
+
+// findEntra queries the tenant by this deployment's ownership marker. Plan
+// is the same marker query resume uses and creates nothing, so it is safe
+// to call from a teardown.
+func findEntra(ec *entra.Client, st *state.State) teardown.Finder {
+	return func(ctx context.Context) (teardown.Found, error) {
+		// AfterUncertainCreate stays false: this is a query, not a resume,
+		// so a name-only match should come back as unowned rather than as
+		// an error.
+		p, err := ec.Plan(ctx, entra.Config{
+			Hostname: st.Config["guac-hostname"], DeploymentID: st.DeploymentID,
+			AdminGroup: st.Config["admin-group"], OperatorGroup: st.Config["operator-group"],
+		})
+		if err != nil {
+			return teardown.Found{}, err // including ErrRequiresReview: a person decides
+		}
+		var f teardown.Found
+		if p.App != nil {
+			r := state.Resource{Provider: "entra", Type: "application",
+				ProviderID: p.App.ObjectID, Name: p.App.DisplayName}
+			if !p.App.ProvenOurs {
+				f.Unowned = append(f.Unowned, r)
+			} else {
+				r.Ownership = "marker " + p.App.Marker + " in the application notes and tags"
+				f.Owned = append(f.Owned, r)
+				if p.SP != nil {
+					f.Owned = append(f.Owned, state.Resource{Provider: "entra",
+						Type: "service-principal", ProviderID: p.SP.ObjectID,
+						Name:      p.App.DisplayName,
+						Ownership: "service principal of the marked application"})
+				}
+			}
+		}
+		for _, g := range p.Groups {
+			r := state.Resource{Provider: "entra", Type: "group",
+				ProviderID: g.ObjectID, Name: g.Name}
+			if !g.ProvenOurs {
+				f.Unowned = append(f.Unowned, r)
+				continue
+			}
+			r.Ownership = "marker " + entra.Marker(st.DeploymentID) + " in the group description"
+			f.Owned = append(f.Owned, r)
+		}
+		return f, nil
+	}
+}
+
+// findCloudflare lists what this deployment's naming could refer to and
+// keeps ownership separate from the name match.
+func findCloudflare(cf *cloudflare.Provisioner) teardown.Finder {
+	return func(ctx context.Context) (teardown.Found, error) {
+		found, err := cf.FindOwned(ctx)
+		if err != nil {
+			return teardown.Found{}, err
+		}
+		var f teardown.Found
+		for _, r := range found {
+			res := state.Resource{Provider: "cloudflare", Type: r.Type,
+				ProviderID: r.ID, Name: r.Name}
+			if !r.Ours {
+				f.Unowned = append(f.Unowned, res)
+				continue
+			}
+			res.Ownership = r.Ownership
+			f.Owned = append(f.Owned, res)
+		}
+		return f, nil
 	}
 }
