@@ -4,6 +4,13 @@ This guide grows with each delivered slice. It currently covers the
 deployment session commands. The full terminal experience and the complete
 guide arrive with the final wizard work.
 
+## Install
+
+Install `guacdeploy` from a signed release with the launcher script. See the
+install section of the README for the command, and
+[release-and-verification.md](release-and-verification.md) for what the
+launcher verifies and which network destinations it uses.
+
 ## Commands
 
 | Command | Purpose |

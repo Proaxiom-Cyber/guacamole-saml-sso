@@ -80,6 +80,22 @@ is all: Cloudflare provides the tunnel and the public certificate. Without Cloud
 also a certificate for that name that your clients trust, and a firewall rule for
 `HTTPS_PORT`.
 
+## Install the deployment tool
+
+The V1 `guacdeploy` tool installs from a signed GitHub release. No checkout and no Go
+toolchain are needed on the server. The launcher verifies the SHA-256 checksum and the
+Sigstore signature of the release, and refuses to install anything that fails either
+check:
+
+```sh
+curl -fsSLO https://github.com/Proaxiom-Cyber/guacamole-saml-sso/releases/latest/download/get-guacdeploy.sh && sh get-guacdeploy.sh
+```
+
+Read the script before you run it. [Release and verification](docs/release-and-verification.md)
+describes the signing identity, the trust bootstrap, the network destinations the
+launcher uses, and the approval an administrator must give on hosts with application
+allowlisting.
+
 ## Deploy
 
 1. Keep the database password in your secret store. For an existing database, use its
