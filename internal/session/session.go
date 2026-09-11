@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/creds"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/host"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/ui"
@@ -30,13 +32,117 @@ type Phase struct {
 }
 
 // Phases builds the ordered registry for one session. Later tickets append
-// their phases (credentials, stack, integrations) here.
+// their phases (stack, integrations) here. Credential-storage choices come
+// before host mutations, matching the installation flow.
 func Phases(opts *Options) []Phase {
 	return []Phase{
 		{Name: "initialise-deployment", Run: initialiseDeployment},
 		{Name: "host-preflight", Run: opts.hostPreflight},
+		{Name: "credential-mode", Run: opts.credentialMode},
+		{Name: "credential-check", Run: opts.credentialCheck},
 		{Name: "host-dependencies", Run: opts.hostDependencies},
 	}
+}
+
+func (o *Options) credentialMode(ctx context.Context, st *state.State, u *ui.UI) error {
+	mode := o.CredentialMode
+	if mode == "" {
+		if !u.Interactive {
+			return fmt.Errorf("%w: no credential mode selected; pass --credentials prompt|env|file", ErrApprovalRequired)
+		}
+		u.Say("Choose how this deployment receives credentials:")
+		for _, m := range creds.Modes {
+			u.Say("  %s — %s", m, creds.Explain(m))
+		}
+		k, err := u.Choose("Credential mode?", []ui.Choice{
+			{Key: 'p', Label: "Hidden prompts"},
+			{Key: 'e', Label: "Environment variables"},
+			{Key: 'f', Label: "Owner-only plaintext files (explicit approval required)"},
+		})
+		if err != nil {
+			return err
+		}
+		mode = map[rune]string{'p': creds.ModePrompt, 'e': creds.ModeEnv, 'f': creds.ModeFile}[k]
+		if mode == creds.ModeFile {
+			ok, err := u.Confirm("Plaintext storage is an approved exception, protected only by file permissions. Select it?")
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return errors.New("plaintext storage not approved; run setup again to choose another mode")
+			}
+		}
+	}
+	switch mode {
+	case creds.ModePrompt, creds.ModeEnv, creds.ModeFile:
+	default:
+		return fmt.Errorf("unknown credential mode %q; valid modes: prompt, env, file", mode)
+	}
+	if mode == creds.ModePrompt && !u.Interactive {
+		return errors.New("prompt-mode credentials cannot support unattended operation; choose env or file")
+	}
+	if st.Config == nil {
+		st.Config = map[string]string{}
+	}
+	st.Config["credential-mode"] = mode
+	u.Say("Credential storage method: %s. %s", mode, creds.Explain(mode))
+	return nil
+}
+
+func (o *Options) manager(st *state.State, u *ui.UI) *creds.Manager {
+	return &creds.Manager{
+		Mode:       st.Config["credential-mode"],
+		Dir:        filepath.Join(o.StateDir, "credentials"),
+		ReadSecret: u.SecretReader(),
+	}
+}
+
+func (o *Options) credSpecs() []creds.Spec {
+	if o.CredSpecs != nil {
+		return o.CredSpecs
+	}
+	return creds.Required
+}
+
+func (o *Options) credentialCheck(ctx context.Context, st *state.State, u *ui.UI) error {
+	m := o.manager(st, u)
+	missing := m.Missing(o.credSpecs())
+	if m.Mode == creds.ModeFile && u.Interactive && len(missing) > 0 {
+		for _, s := range o.credSpecs() {
+			if _, err := os.Stat(filepath.Join(m.Dir, s.Name)); err == nil {
+				continue
+			}
+			v, err := u.SecretReader()(fmt.Sprintf("Enter %s (%s)", s.Name, s.Purpose))
+			if err != nil {
+				return err
+			}
+			createdDir, err := m.StoreFile(s, v)
+			if err != nil {
+				return err
+			}
+			now := time.Now().UTC()
+			if createdDir {
+				st.Resources = append(st.Resources, state.Resource{
+					ID: state.NewID(), Provider: "host", Type: "credential-dir", Name: m.Dir,
+					Ownership: "created by this deployment", CreatedAt: now,
+				})
+			}
+			st.Resources = append(st.Resources, state.Resource{
+				ID: state.NewID(), Provider: "host", Type: "credential-file", Name: s.Name,
+				Ownership: "written by this deployment", CreatedAt: now,
+			})
+		}
+		missing = m.Missing(o.credSpecs())
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("credentials are not available yet:\n  %s\nSupply them and resume", strings.Join(missing, "\n  "))
+	}
+	if m.Mode == creds.ModePrompt {
+		u.Say("Credentials will be requested with hidden prompts when needed. Nothing is stored on disk.")
+	} else {
+		u.Say("All required credentials are available via the %s method.", m.Mode)
+	}
+	return nil
 }
 
 func (o *Options) probes() *host.Probes {
@@ -121,8 +227,10 @@ func initialiseDeployment(ctx context.Context, st *state.State, u *ui.UI) error 
 type Options struct {
 	StateDir            string
 	UI                  *ui.UI
-	Resume              bool // unattended only: explicit consent to continue interrupted work
-	InstallDependencies bool // unattended only: explicit consent to install missing dependencies
+	Resume              bool   // unattended only: explicit consent to continue interrupted work
+	InstallDependencies bool   // unattended only: explicit consent to install missing dependencies
+	CredentialMode      string // explicit credential mode; guided asks when empty
+	CredSpecs           []creds.Spec
 	Host                *host.Probes
 	Phases              []Phase
 }

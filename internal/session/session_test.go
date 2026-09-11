@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/creds"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/host"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/ui"
@@ -73,7 +74,7 @@ func completeState() *state.State {
 func TestUnattendedFreshSetupCompletesWithoutPrompts(t *testing.T) {
 	dir := t.TempDir()
 	u, out := testUI(false, "")
-	if err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: fakeHost(t)}); err != nil {
+	if err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: fakeHost(t), CredentialMode: creds.ModeEnv, CredSpecs: []creds.Spec{}}); err != nil {
 		t.Fatalf("unattended fresh setup: %v (output: %s)", err, out.String())
 	}
 	st, err := state.Read(dir)
@@ -93,13 +94,13 @@ func TestUnattendedPendingRequiresExplicitResume(t *testing.T) {
 	seed(t, dir, pendingState())
 
 	u, _ := testUI(false, "")
-	err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: fakeHost(t)})
+	err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: fakeHost(t), CredentialMode: creds.ModeEnv, CredSpecs: []creds.Spec{}})
 	if !errors.Is(err, ErrApprovalRequired) {
 		t.Fatalf("want ErrApprovalRequired, got %v", err)
 	}
 
 	u2, _ := testUI(false, "")
-	if err := Run(context.Background(), Options{StateDir: dir, UI: u2, Resume: true, Host: fakeHost(t)}); err != nil {
+	if err := Run(context.Background(), Options{StateDir: dir, UI: u2, Resume: true, Host: fakeHost(t), CredentialMode: creds.ModeEnv, CredSpecs: []creds.Spec{}}); err != nil {
 		t.Fatalf("unattended --resume: %v", err)
 	}
 	st, _ := state.Read(dir)
@@ -114,7 +115,7 @@ func TestGuidedResumeShowsInterruptedWorkAndResumes(t *testing.T) {
 	seed(t, dir, st)
 
 	u, out := testUI(true, "r\n")
-	if err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: fakeHost(t)}); err != nil {
+	if err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: fakeHost(t), CredentialMode: creds.ModeEnv, CredSpecs: []creds.Spec{}}); err != nil {
 		t.Fatalf("guided resume: %v", err)
 	}
 	text := out.String()
@@ -135,7 +136,7 @@ func TestGuidedCleanupRemovesRecordWithoutResources(t *testing.T) {
 	seed(t, dir, pendingState())
 
 	u, _ := testUI(true, "c\n")
-	if err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: fakeHost(t)}); err != nil {
+	if err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: fakeHost(t), CredentialMode: creds.ModeEnv, CredSpecs: []creds.Spec{}}); err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "state.json")); !os.IsNotExist(err) {
@@ -150,7 +151,7 @@ func TestGuidedCleanupRefusedWhenResourcesExist(t *testing.T) {
 	seed(t, dir, st)
 
 	u, _ := testUI(true, "c\n")
-	err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: fakeHost(t)})
+	err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: fakeHost(t), CredentialMode: creds.ModeEnv, CredSpecs: []creds.Spec{}})
 	if err == nil || !strings.Contains(err.Error(), "teardown") {
 		t.Fatalf("want teardown refusal, got %v", err)
 	}
@@ -166,7 +167,7 @@ func TestExistingCompleteDeploymentIsExplainedNotOverwritten(t *testing.T) {
 
 	// Guided: explanation, exit clean, nothing changed.
 	u, out := testUI(true, "")
-	if err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: fakeHost(t)}); err != nil {
+	if err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: fakeHost(t), CredentialMode: creds.ModeEnv, CredSpecs: []creds.Spec{}}); err != nil {
 		t.Fatalf("guided on existing: %v", err)
 	}
 	if !strings.Contains(out.String(), "does not overwrite") {
@@ -179,7 +180,7 @@ func TestExistingCompleteDeploymentIsExplainedNotOverwritten(t *testing.T) {
 
 	// Unattended: nonzero with explanation, no prompt.
 	u2, _ := testUI(false, "")
-	if err := Run(context.Background(), Options{StateDir: dir, UI: u2, Host: fakeHost(t)}); err == nil {
+	if err := Run(context.Background(), Options{StateDir: dir, UI: u2, Host: fakeHost(t), CredentialMode: creds.ModeEnv, CredSpecs: []creds.Spec{}}); err == nil {
 		t.Fatal("unattended on existing deployment must fail")
 	}
 }
@@ -245,7 +246,7 @@ func TestUnattendedMissingDependenciesRequireConsent(t *testing.T) {
 	h := bareHost(t, &calls)
 
 	u, _ := testUI(false, "")
-	err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: h})
+	err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: h, CredentialMode: creds.ModeEnv, CredSpecs: []creds.Spec{}})
 	if !errors.Is(err, ErrApprovalRequired) || !strings.Contains(err.Error(), "--install-dependencies") {
 		t.Fatalf("want approval-required naming the flag, got %v", err)
 	}
@@ -255,7 +256,7 @@ func TestUnattendedMissingDependenciesRequireConsent(t *testing.T) {
 
 	// Explicit consent resumes and installs, recording host changes.
 	u2, _ := testUI(false, "")
-	if err := Run(context.Background(), Options{StateDir: dir, UI: u2, Host: h, Resume: true, InstallDependencies: true}); err != nil {
+	if err := Run(context.Background(), Options{StateDir: dir, UI: u2, Host: h, Resume: true, InstallDependencies: true, CredentialMode: creds.ModeEnv, CredSpecs: []creds.Spec{}}); err != nil {
 		t.Fatalf("consented install: %v", err)
 	}
 	if !strings.Contains(strings.Join(calls, "\n"), "dnf -y install") {
@@ -286,7 +287,7 @@ func TestGuidedDependencyDeclineStopsSetup(t *testing.T) {
 
 	// y = start fresh setup, n = decline dependency installation.
 	u, _ := testUI(true, "y\nn\n")
-	err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: h})
+	err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: h, CredentialMode: creds.ModeEnv, CredSpecs: []creds.Spec{}})
 	if err == nil || !strings.Contains(err.Error(), "declined") {
 		t.Fatalf("want decline error, got %v", err)
 	}
@@ -299,11 +300,99 @@ func TestQuitRetainsInterruptedWork(t *testing.T) {
 	dir := t.TempDir()
 	seed(t, dir, pendingState())
 	u, _ := testUI(true, "q\n")
-	if err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: fakeHost(t)}); err != nil {
+	if err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: fakeHost(t), CredentialMode: creds.ModeEnv, CredSpecs: []creds.Spec{}}); err != nil {
 		t.Fatalf("quit: %v", err)
 	}
 	st, _ := state.Read(dir)
 	if st == nil || len(st.Pending()) != 1 {
 		t.Fatal("interrupted work not retained after quit")
+	}
+}
+
+func TestGuidedFileModeStoresOwnerOnlyAndKeepsSecretsOut(t *testing.T) {
+	dir := t.TempDir()
+	// y = fresh setup, f = file mode, y = approve plaintext exception.
+	u, out := testUI(true, "y\nf\ny\n")
+	const secret = "sekret-value-1234"
+	u.Secret = func(string) (string, error) { return secret, nil }
+
+	err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: fakeHost(t)})
+	if err != nil {
+		t.Fatalf("guided file-mode setup: %v", err)
+	}
+	st, _ := state.Read(dir)
+	if st.Config["credential-mode"] != creds.ModeFile {
+		t.Fatalf("mode not recorded: %+v", st.Config)
+	}
+	if !strings.Contains(out.String(), "Credential storage method: file") {
+		t.Fatalf("chosen method not shown:\n%s", out.String())
+	}
+
+	credFile := filepath.Join(dir, "credentials", "cloudflare-api-token")
+	info, err := os.Stat(credFile)
+	if err != nil {
+		t.Fatalf("credential file missing: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("credential file mode %v, want 0600", info.Mode().Perm())
+	}
+	dinfo, _ := os.Stat(filepath.Join(dir, "credentials"))
+	if dinfo.Mode().Perm() != 0o700 {
+		t.Fatalf("credential dir mode %v, want 0700", dinfo.Mode().Perm())
+	}
+
+	// The secret must not appear in state, output, or resource records.
+	raw, _ := os.ReadFile(filepath.Join(dir, "state.json"))
+	if strings.Contains(string(raw), secret) || strings.Contains(out.String(), secret) {
+		t.Fatal("secret value leaked into state or output")
+	}
+	var dirRec, fileRec bool
+	for _, r := range st.Resources {
+		if r.Type == "credential-dir" {
+			dirRec = true
+		}
+		if r.Type == "credential-file" && r.Name == "cloudflare-api-token" {
+			fileRec = true
+		}
+	}
+	if !dirRec || !fileRec {
+		t.Fatalf("owned credential material not recorded for teardown: %+v", st.Resources)
+	}
+}
+
+func TestUnattendedRequiresCredentialModeFlag(t *testing.T) {
+	dir := t.TempDir()
+	u, _ := testUI(false, "")
+	err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: fakeHost(t)})
+	if !errors.Is(err, ErrApprovalRequired) || !strings.Contains(err.Error(), "--credentials") {
+		t.Fatalf("want approval-required naming --credentials, got %v", err)
+	}
+}
+
+func TestUnattendedPromptModeRejected(t *testing.T) {
+	dir := t.TempDir()
+	u, _ := testUI(false, "")
+	err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: fakeHost(t), CredentialMode: creds.ModePrompt})
+	if err == nil || !strings.Contains(err.Error(), "unattended") {
+		t.Fatalf("want unattended rejection, got %v", err)
+	}
+}
+
+func TestEnvModeMissingCredentialNamesVariableAndResumes(t *testing.T) {
+	dir := t.TempDir()
+	u, _ := testUI(false, "")
+	err := Run(context.Background(), Options{StateDir: dir, UI: u, Host: fakeHost(t), CredentialMode: creds.ModeEnv})
+	if err == nil || !strings.Contains(err.Error(), "GUACDEPLOY_CRED_CLOUDFLARE_API_TOKEN") {
+		t.Fatalf("want instruction naming the variable, got %v", err)
+	}
+
+	t.Setenv("GUACDEPLOY_CRED_CLOUDFLARE_API_TOKEN", "tok-abc123")
+	u2, out := testUI(false, "")
+	if err := Run(context.Background(), Options{StateDir: dir, UI: u2, Host: fakeHost(t), CredentialMode: creds.ModeEnv, Resume: true}); err != nil {
+		t.Fatalf("resume with variable set: %v", err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(dir, "state.json"))
+	if strings.Contains(string(raw), "tok-abc123") || strings.Contains(out.String(), "tok-abc123") {
+		t.Fatal("credential value leaked")
 	}
 }

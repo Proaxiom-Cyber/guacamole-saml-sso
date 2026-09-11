@@ -35,6 +35,7 @@ Flags for setup:
   --non-interactive        Never prompt; exit 3 where approval is required
   --resume                 Non-interactive only: consent to continue interrupted work
   --install-dependencies   Non-interactive only: consent to install missing dependencies
+  --credentials MODE       Credential mode: prompt, env, or file
   --state-dir DIR          Override the state directory (default ` + "/var/lib/guacdeploy" + `)
 `
 
@@ -50,6 +51,7 @@ func run(args []string) int {
 	nonInteractive := fs.Bool("non-interactive", false, "never prompt")
 	resume := fs.Bool("resume", false, "non-interactive: continue interrupted work")
 	installDeps := fs.Bool("install-dependencies", false, "non-interactive: consent to install missing dependencies")
+	credMode := fs.String("credentials", "", "credential mode: prompt, env, or file")
 	stateDir := fs.String("state-dir", state.DefaultDir(), "state directory")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	if err := fs.Parse(args); err != nil {
@@ -74,7 +76,7 @@ func run(args []string) int {
 	var err error
 	switch cmd {
 	case "setup":
-		opts := session.Options{StateDir: *stateDir, UI: u, Resume: *resume, InstallDependencies: *installDeps}
+		opts := session.Options{StateDir: *stateDir, UI: u, Resume: *resume, InstallDependencies: *installDeps, CredentialMode: *credMode}
 		if s := os.Getenv("GUACDEPLOY_TEST_SLEEP_PHASE"); s != "" {
 			// Test hook: replace the registry with a slow phase so session
 			// interruption is testable end to end on any development host.

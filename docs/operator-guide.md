@@ -51,6 +51,26 @@ service) and asks before installing. Unattended runs need
 are recorded as changes made by this deployment. Docker that was already
 present is pre-existing and is never offered for removal at teardown.
 
+## Credentials
+
+Setup asks how the deployment receives credentials and shows the choice:
+
+- **prompt** — hidden interactive prompts at the moment of use. Nothing is
+  stored on disk. This mode cannot support unattended operation.
+- **env** — `GUACDEPLOY_CRED_*` environment variables supplied to each
+  invocation. Unattended operation works when the caller injects them.
+- **file** — owner-only plaintext files under the state directory's
+  `credentials/` folder. This is an approved exception for this project
+  and is never chosen silently: selecting it requires explicit approval
+  (guided confirmation or the explicit `--credentials file` flag).
+
+Unattended runs select the mode with `--credentials prompt|env|file`.
+Setup checks that required credentials are available and names exactly
+what to supply when one is missing. Credential values never appear in
+deployment state, logs, or command arguments. Files written by the tool
+are recorded as material owned by this deployment, so teardown can offer
+their removal; files you placed yourself are pre-existing and stay.
+
 ## State
 
 The deployment record lives in `/var/lib/guacdeploy/`. It never contains

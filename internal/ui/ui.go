@@ -31,8 +31,23 @@ type UI struct {
 	Out         io.Writer
 	Interactive bool
 
+	// Secret overrides hidden input, for tests.
+	Secret func(prompt string) (string, error)
+
 	fd    int
 	saved *term.State
+}
+
+// SecretReader returns the hidden-input function for this UI, or nil when
+// no interactive terminal is available.
+func (u *UI) SecretReader() func(string) (string, error) {
+	if u.Secret != nil {
+		return u.Secret
+	}
+	if !u.Interactive {
+		return nil
+	}
+	return u.HiddenLine
 }
 
 // New builds a UI on stdin/stdout. Interactive requires stdin to be a
