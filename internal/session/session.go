@@ -91,10 +91,6 @@ func Phases(opts *Options) []Phase {
 		{Name: "backup-schedule", Run: opts.backupSchedule, Always: true},
 		{Name: "recording-schedule", Run: opts.recordingSchedule, Always: true},
 		{Name: "stack-health", Run: opts.stackHealth},
-		// The off-host copy is optional and is offered only when asked for.
-		// It follows the stack so a destination is chosen for a deployment
-		// that already works, and precedes nothing that publishes.
-		{Name: "azure-destination", Run: opts.azureDestination},
 		{Name: "entra-signin", Run: opts.entraSignin},
 		// The DNS record comes before Access so that Access can be
 		// verified against the hostname it protects. This publishes no
@@ -111,6 +107,11 @@ func Phases(opts *Options) []Phase {
 		// leaves the origin unreachable rather than reachable and
 		// unprotected.
 		{Name: "cloudflare-connect", Run: opts.cloudflareConnect},
+		// The off-host copy is last, and only when asked for. It needs the
+		// tenant and the service principal the identity phase produces, and
+		// it must never gate publication: a deployment that works should not
+		// be left unpublished because a storage account could not be made.
+		{Name: "azure-destination", Run: opts.azureDestination},
 	}
 }
 
@@ -1011,6 +1012,10 @@ func (o *Options) entraSignin(ctx context.Context, st *state.State, u *ui.UI) er
 
 	st.Config["saml-metadata-url"] = res.MetadataURL
 	st.Config["entra-tenant-id"] = res.TenantID
+	// The service principal is the identity an unattended Azure upload signs
+	// in as, so its object ID has to outlive this phase for the Azure
+	// destination to be able to grant it a role.
+	st.Config["entra-sp-object-id"] = res.App.SPObjectID
 	// Cloudflare Access needs the group object IDs; without them its
 	// allow-list silently degrades to email addresses.
 	for _, g := range res.Groups {

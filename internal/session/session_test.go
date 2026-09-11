@@ -1594,3 +1594,20 @@ func TestChooseFromListMapsTheAnswerBackToItsIndex(t *testing.T) {
 		t.Fatal("a menu of twelve options was offered with nine keys")
 	}
 }
+
+// The Azure destination needs the tenant and the service principal that the
+// identity phase produces, and it must never gate publication: a working
+// deployment should not be left unpublished because a storage account could
+// not be created.
+func TestAzureDestinationRunsAfterIdentityAndAfterPublication(t *testing.T) {
+	idx := map[string]int{}
+	for i, p := range Phases(&Options{}) {
+		idx[p.Name] = i
+	}
+	if idx["azure-destination"] < idx["entra-signin"] {
+		t.Fatal("the Azure phase runs before the identity phase, so the tenant and the service principal it needs do not exist yet")
+	}
+	if idx["azure-destination"] < idx["cloudflare-connect"] {
+		t.Fatal("the Azure phase runs before publication, so a storage failure would leave a working deployment unpublished")
+	}
+}
