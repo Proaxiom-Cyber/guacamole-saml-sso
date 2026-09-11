@@ -479,7 +479,20 @@ An object is removed only when the ownership marker read back from the
 service proves it is this deployment's. Ordinary teardown removes nothing
 from Azure and never deletes a container or a storage account.
 
-**Not yet reachable from setup.** Choosing an Azure destination during a
-guided run is not wired in yet, so the destination has to be configured
-before these commands are useful. The steps are written up in
-`internal/azure/WIRING.md`.
+**Choosing the destination during setup.** `guacdeploy setup --azure` offers
+it: you sign in with a device code, pick a subscription, then select an
+existing storage account and container or ask for new ones with
+`--azure-create --azure-location <region>`. `--azure-subscription`,
+`--azure-account` and `--azure-container` answer those questions ahead of
+time. Nothing is created before the intent is written to the deployment
+record, and no destination is recorded until a real write has proved that
+blob data access works — a granted role takes minutes to take effect, and
+the run waits for it rather than assuming.
+
+Without any of those flags the phase does nothing: a deployment with no
+Azure account is the ordinary case.
+
+**Not proven against real Azure.** Every Azure path in this tool is tested
+against a fake identity platform and a fake management plane. No device
+code has been entered by a person, no real subscription listed, no storage
+account created, and no role assignment watched taking effect.

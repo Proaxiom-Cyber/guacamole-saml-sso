@@ -70,6 +70,13 @@ Flags for setup:
   --require-mount          The backup destination must sit on an approved mounted share
   --no-backup-schedule     Do not install the scheduled backup timer
   --recording-budget SIZE  Local recording storage budget, for example 20GiB
+  --azure                  Offer an Azure Blob container as the off-host copy
+  --azure-subscription ID  Azure subscription for the off-host copy
+  --azure-account NAME     Azure storage account for the off-host copy
+  --azure-container NAME   Blob container for the off-host copy
+  --azure-create           Create the storage account and container instead of selecting
+  --azure-location REGION  Azure region to create storage in
+  --azure-resource-group N Resource group to create storage in
   --state-dir DIR          Override the state directory (default ` + "/var/lib/guacdeploy" + `)
 
 Flags for backup:
@@ -151,6 +158,13 @@ func run(args []string) int {
 	identityFile := fs.String("identity-file", "", "restore: age identity file instead of the passphrase prompt")
 	yes := fs.Bool("yes", false, "restore/teardown/recover: unattended consent")
 	keyExport := fs.String("key-export", "", "recover: the passphrase-encrypted recovery key export from the lost host")
+	azureDest := fs.Bool("azure", false, "setup: offer an Azure Blob container as the off-host copy")
+	azureSubscription := fs.String("azure-subscription", "", "setup: Azure subscription ID for the off-host copy")
+	azureAccount := fs.String("azure-account", "", "setup: Azure storage account for the off-host copy")
+	azureContainer := fs.String("azure-container", "", "setup: blob container for the off-host copy")
+	azureCreate := fs.Bool("azure-create", false, "setup: create the storage account and container rather than selecting them")
+	azureLocation := fs.String("azure-location", "", "setup: Azure region to create storage in")
+	azureResourceGroup := fs.String("azure-resource-group", "", "setup: resource group to create storage in")
 	deleteData := fs.Bool("delete-data", false, "teardown: also delete the database, recordings and backups")
 	stateDir := fs.String("state-dir", state.DefaultDir(), "state directory")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
@@ -185,7 +199,11 @@ func run(args []string) int {
 			InstallDependencies: *installDeps, CredentialMode: *credMode,
 			Hostname: *hostname, AdminGroup: *adminGroup, OperatorGroup: *operatorGroup,
 			Zone: *zone, AccessEmails: *accessEmails, ACMEContact: *acmeContact,
-			BackupDest: *backupDest, BackupSchedule: *backupSchedule, BackupKeep: *backupKeep,
+			Azure: *azureDest, AzureSubscription: *azureSubscription,
+			AzureAccount: *azureAccount, AzureContainer: *azureContainer,
+			AzureCreate: *azureCreate, AzureLocation: *azureLocation,
+			AzureResourceGroup: *azureResourceGroup,
+			BackupDest:         *backupDest, BackupSchedule: *backupSchedule, BackupKeep: *backupKeep,
 			BackupPlaintext: *plaintext, BackupRequireMount: *requireMount,
 			NoBackupSchedule: *noBackupSchedule, RecordingBudget: *recordingBudget,
 		}
