@@ -1,7 +1,11 @@
 // Package ui provides the terminal primitives for the guided wizard and the
 // readable output of unattended mode. Text identifies success, failure, and
-// required action; colour would be supplementary and arrives with the full
-// terminal experience (issue #23).
+// required action; colour is supplementary.
+//
+// The guided path may run full screen: UI.StartWizard switches prompts,
+// output and phase status onto the alternate screen buffer (see wizard.go).
+// Everything degrades to the line-oriented output here when the terminal
+// cannot support it, and unattended mode never waits for input either way.
 package ui
 
 import (
@@ -36,6 +40,7 @@ type UI struct {
 
 	fd    int
 	saved *term.State
+	wiz   *Wizard // non-nil once StartWizard succeeds; never cleared
 }
 
 // SecretReader returns the hidden-input function for this UI, or nil when
@@ -64,9 +69,14 @@ func New(allowInteractive bool) *UI {
 	return u
 }
 
-// RestoreTerminal returns the terminal to its saved settings. Safe to call
-// multiple times and from a signal handler.
+// RestoreTerminal returns the terminal to its saved settings, leaving the
+// full-screen view first and replaying the session output. Safe to call
+// multiple times, from a signal handler, and while a panic unwinds: the
+// wizard leaves the alternate screen exactly once.
 func (u *UI) RestoreTerminal() {
+	if u.wiz != nil {
+		u.wiz.stop()
+	}
 	if u.saved != nil {
 		term.Restore(u.fd, u.saved)
 	}
@@ -74,13 +84,67 @@ func (u *UI) RestoreTerminal() {
 
 // Say writes one line to the user.
 func (u *UI) Say(format string, args ...any) {
-	fmt.Fprintf(u.Out, format+"\n", args...)
+	s := fmt.Sprintf(format, args...)
+	if w := u.wizard(); w != nil {
+		w.say(s)
+		return
+	}
+	fmt.Fprintln(u.Out, s)
+}
+
+// PhaseList declares the ordered phases of the session, so the full-screen
+// view can show what is done, what is running, what failed and what is still
+// to come. It writes nothing in line-oriented output.
+func (u *UI) PhaseList(names []string) {
+	if w := u.wizard(); w != nil {
+		w.setPhases(names)
+	}
+}
+
+// PhaseStart marks a phase as running. It writes nothing in line-oriented
+// output, which reports a phase only once it has finished.
+func (u *UI) PhaseStart(name string) {
+	if w := u.wizard(); w != nil {
+		w.setPhase(name, phaseRunning)
+	}
+}
+
+// PhaseDone marks a phase as complete.
+func (u *UI) PhaseDone(name string) {
+	if w := u.wizard(); w != nil {
+		w.setPhase(name, phaseDone)
+		return
+	}
+	u.Say("Phase %s: complete.", name)
+}
+
+// PhaseSkipped marks a phase that an earlier session already completed.
+func (u *UI) PhaseSkipped(name string) {
+	if w := u.wizard(); w != nil {
+		w.setPhase(name, phaseSkipped)
+		return
+	}
+	u.Say("Phase %s: already complete, skipping.", name)
+}
+
+// PhaseFailed reports a failed phase. Both outputs name the action that
+// failed, the work that was retained, and the recovery choices.
+func (u *UI) PhaseFailed(name string, err error) {
+	if w := u.wizard(); w != nil {
+		w.failed(name, err)
+		return
+	}
+	u.Say("Phase %s failed: %v", name, err)
+	u.Say("Completed work is retained. Run setup again to resume or clean up.")
 }
 
 // Choose presents options and reads one. It re-asks on unrecognised input.
 func (u *UI) Choose(prompt string, choices []Choice) (rune, error) {
 	if !u.Interactive {
 		return 0, fmt.Errorf("%w: %s", ErrInputRequired, prompt)
+	}
+	if w := u.wizard(); w != nil {
+		return w.choose(prompt, choices)
 	}
 	for {
 		fmt.Fprintf(u.Out, "%s\n", prompt)
@@ -107,6 +171,9 @@ func (u *UI) Choose(prompt string, choices []Choice) (rune, error) {
 func (u *UI) Line(prompt, def string) (string, error) {
 	if !u.Interactive {
 		return "", fmt.Errorf("%w: %s", ErrInputRequired, prompt)
+	}
+	if w := u.wizard(); w != nil {
+		return w.readLine(prompt, def, false)
 	}
 	for {
 		if def != "" {
@@ -140,6 +207,9 @@ func (u *UI) Confirm(prompt string) (bool, error) {
 func (u *UI) HiddenLine(prompt string) (string, error) {
 	if !u.Interactive {
 		return "", fmt.Errorf("%w: %s", ErrInputRequired, prompt)
+	}
+	if w := u.wizard(); w != nil {
+		return w.readLine(prompt, "", true)
 	}
 	fmt.Fprintf(u.Out, "%s: ", prompt)
 	b, err := term.ReadPassword(u.fd)
