@@ -1488,3 +1488,48 @@ func TestMenuExplainsWhySealedModesAreUnavailable(t *testing.T) {
 		t.Fatalf("the operator's choice was not honoured: %+v", st.Config)
 	}
 }
+
+// An encrypted deployment has to be startable without a person. The only
+// ways to supply a credential were a hidden prompt and a plaintext file, so
+// unattended plus tpm was impossible: nobody answers the prompt, and writing
+// the value in plaintext first is the downgrade the mode exists to avoid.
+// One environment variable supplies it for one run, and what lands on disk is
+// still only the sealed blob.
+func TestSealedModeAcceptsTheValueOnceFromTheEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	u, out := testUI(false, "")
+	u.Secret = func(string) (string, error) {
+		t.Fatal("an unattended run must never wait on a hidden prompt")
+		return "", nil
+	}
+	const token = "cf-token-value-9876"
+	t.Setenv("GUACDEPLOY_CRED_CLOUDFLARE_API_TOKEN", token)
+	var calls []string
+	d, run := sealingHost(t, &calls)
+
+	o := Options{StateDir: dir, UI: u, Host: fakeHost(t), CredentialMode: creds.ModeTPM,
+		CredDetector: d, CredsRun: run}
+	if err := Run(context.Background(), core(o)); err != nil {
+		t.Fatalf("unattended tpm-mode setup: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "credentials", "cloudflare-api-token.cred")); err != nil {
+		t.Fatalf("the supplied credential was not sealed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "credentials", "cloudflare-api-token")); err == nil {
+		t.Fatal("the value was written in plaintext on the way to being sealed")
+	}
+	raw, _ := os.ReadFile(filepath.Join(dir, "state.json"))
+	if strings.Contains(string(raw), token) || strings.Contains(out.String(), token) {
+		t.Fatal("the supplied value leaked into state or output")
+	}
+	for _, c := range calls {
+		if strings.Contains(c, token) {
+			t.Fatalf("the value travelled in a command argument: %s", c)
+		}
+	}
+	// The operator is told the variable is not needed again, because the
+	// value is now kept the way they chose.
+	if !strings.Contains(out.String(), "not needed again") {
+		t.Errorf("the run did not say the environment variable is no longer needed:\n%s", out.String())
+	}
+}

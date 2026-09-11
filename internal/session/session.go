@@ -425,6 +425,16 @@ func (o *Options) credentialCheck(ctx context.Context, st *state.State, u *ui.UI
 			case s.Generate:
 				v = creds.NewSecret()
 				u.Say("Generated %s in memory and storing it in the approved credential directory.", s.Name)
+			case os.Getenv(s.EnvVar()) != "":
+				// Supply once, keep it the chosen way. Without this an
+				// unattended run could never start an encrypted deployment at
+				// all: nobody is there to answer a hidden prompt, and the only
+				// other way to supply a value would be to write it in plaintext
+				// first, which is the downgrade this mode exists to avoid. The
+				// environment holds the value for this one invocation.
+				v = os.Getenv(s.EnvVar())
+				u.Say("Taking %s from %s for this run and storing it with the %s method; the environment variable is not needed again.",
+					s.Name, s.EnvVar(), m.Mode)
 			case u.Interactive:
 				var err error
 				v, err = u.SecretReader()(fmt.Sprintf("Enter %s (%s)", s.Name, s.Purpose))
