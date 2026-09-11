@@ -273,3 +273,29 @@ publication fails.
 
 The deployment record lives in `/var/lib/guacdeploy/`. It never contains
 credential values. Do not edit it by hand.
+
+## Entra sign-in
+
+Setup provisions the Entra application, service principal and the two
+groups that carry sign-in, then restarts Guacamole with SAML enabled.
+
+Supply a Microsoft Graph token in `GUACDEPLOY_GRAPH_TOKEN` before this
+phase runs. The token needs Application.ReadWrite.All,
+Group.ReadWrite.All, AppRoleAssignment.ReadWrite.All and
+Organization.Read.All. The token is never written to state or logs.
+
+Setup checks what the token can actually do before it creates anything.
+It records what it intends to create before creating it. If a creation
+request is sent and the answer is lost, the attempt is recorded as
+uncertain and the next run searches by ownership marker before retrying,
+so a second application is never created.
+
+An application that already exists and does not carry this deployment's
+marker is never changed without approval: setup shows each field with its
+current and proposed value and asks. Unattended runs stop with exit
+code 3. A name that matches without the marker is reported for review and
+is never adopted.
+
+Groups that already existed are reused and are never offered for removal
+at teardown. Only the application, service principal and groups this
+deployment created are recorded as its own.

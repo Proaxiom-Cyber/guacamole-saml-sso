@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -458,6 +459,8 @@ func TestStackPhasesFullPipelineUnattended(t *testing.T) {
 		},
 		ProbeCheck: func(context.Context, stack.Config) error { return nil },
 	}
+	// Sign-in provisioning has its own tests; this one covers the local stack.
+	opts.Phases = withoutPhase(Phases(&opts), "entra-signin")
 	if err := Run(context.Background(), opts); err != nil {
 		t.Fatalf("full pipeline: %v\n%s", err, out.String())
 	}
@@ -636,5 +639,93 @@ func TestSAMLGroupAttributeNeverSilentlyDefaults(t *testing.T) {
 	}
 	if !strings.Contains(string(env), "SAML_GROUP_ATTRIBUTE="+entra.GroupClaimAttribute) {
 		t.Fatalf("rendered .env does not carry the Entra claim URI:\n%s", env)
+	}
+}
+
+func withoutPhase(all []Phase, name string) []Phase {
+	var out []Phase
+	for _, p := range all {
+		if p.Name != name {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// TestEntraPhaseWithoutTokenSaysWhatIsMissing keeps the failure actionable:
+// the operator must learn which variable to set and which permissions it
+// needs, not just that a phase failed.
+func TestEntraPhaseWithoutTokenSaysWhatIsMissing(t *testing.T) {
+	t.Setenv(entra.DefaultTokenEnv, "")
+	o := &Options{}
+	_, err := o.entraClient()
+	if err == nil {
+		t.Fatal("a missing Graph token must be reported")
+	}
+	for _, want := range []string{entra.DefaultTokenEnv, "Application.ReadWrite.All"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error does not mention %q: %v", want, err)
+		}
+	}
+}
+
+// TestUncertainResultIsJournalledAndDrivesReconciliation pins the
+// reconciliation contract: when a create request is sent and the response is
+// lost, the attempt must be recorded as uncertain (not merely failed), and
+// the next run must know to query by ownership marker before retrying, so a
+// duplicate cloud resource is never created.
+func TestUncertainResultIsJournalledAndDrivesReconciliation(t *testing.T) {
+	dir := t.TempDir()
+	phases := []Phase{{Name: "entra-signin", Run: func(context.Context, *state.State, *ui.UI) error {
+		return fmt.Errorf("%w: creating the application", ErrUncertain)
+	}}}
+
+	u, _ := testUI(false, "")
+	if err := Run(context.Background(), Options{StateDir: dir, UI: u, Phases: phases}); err == nil {
+		t.Fatal("phase should have failed")
+	}
+	st, _ := state.Read(dir)
+	last := st.Actions[len(st.Actions)-1]
+	if last.Result != state.ResultUncertain {
+		t.Fatalf("result = %q, want %q", last.Result, state.ResultUncertain)
+	}
+	if !lastAttemptUncertain(st, "entra-signin") {
+		t.Fatal("the next run would not reconcile before retrying creation")
+	}
+	// An ordinary failure must NOT look uncertain.
+	if lastAttemptUncertain(&state.State{Actions: []state.Action{
+		{Intent: "entra-signin", Result: state.ResultFailed},
+	}}, "entra-signin") {
+		t.Fatal("a plain failure must not trigger reconciliation")
+	}
+}
+
+// TestIntentIsJournalledBeforeTheWork proves a phase can persist what it is
+// about to do before doing it, which is what makes a lost response
+// recoverable, and that each attempt carries a correlation identifier.
+func TestIntentIsJournalledBeforeTheWork(t *testing.T) {
+	dir := t.TempDir()
+	u, _ := testUI(false, "")
+	opts := &Options{StateDir: dir, UI: u}
+	opts.Phases = []Phase{{Name: "risky", Run: func(context.Context, *state.State, *ui.UI) error {
+		if opts.journalIntent == nil {
+			return errors.New("phases were given no way to journal intent")
+		}
+		if err := opts.journalIntent("will create application guac-test"); err != nil {
+			return err
+		}
+		return errors.New("response lost after journalling")
+	}}}
+
+	if err := Run(context.Background(), *opts); err == nil {
+		t.Fatal("phase should have failed")
+	}
+	st, _ := state.Read(dir)
+	last := st.Actions[len(st.Actions)-1]
+	if last.CorrelationID == "" {
+		t.Fatal("no correlation identifier recorded for reconciliation")
+	}
+	if last.Intent != "risky" || last.Result != state.ResultFailed {
+		t.Fatalf("unexpected journal entry: %+v", last)
 	}
 }

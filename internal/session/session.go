@@ -26,6 +26,12 @@ import (
 // needs interactive approval. Callers exit nonzero without waiting for input.
 var ErrApprovalRequired = errors.New("interactive approval required")
 
+// ErrUncertain means a mutating request was sent and its response was lost,
+// so whether the resource exists is unknown. The phase result is journalled
+// as uncertain, and the next run queries before retrying any creation
+// rather than risking a duplicate.
+var ErrUncertain = errors.New("uncertain result: a request was sent but the response was lost")
+
 // Phase is one unit of setup work. Phases must be idempotent: resume re-runs
 // the first phase without a successful journal entry.
 type Phase struct {
@@ -59,6 +65,7 @@ func Phases(opts *Options) []Phase {
 		// version gets repaired instead of skipped for ever.
 		{Name: "stack-schema", Run: opts.stackSchema, Always: true},
 		{Name: "stack-up", Run: opts.stackUp},
+		{Name: "entra-signin", Run: opts.entraSignin},
 		{Name: "stack-health", Run: opts.stackHealth},
 	}
 }
@@ -431,10 +438,16 @@ type Options struct {
 	InstallDir          string // default /opt/guacamole
 	CredSpecs           []creds.Spec
 	Host                *host.Probes
-	StackRun            stack.Runner                              // injectable for tests
-	StackRunOut         stack.OutRunner                           // injectable for tests
-	ProbeCheck          func(context.Context, stack.Config) error // injectable for tests
-	Phases              []Phase
+	StackRun            stack.Runner    // injectable for tests
+	StackRunOut         stack.OutRunner // injectable for tests
+	Entra               *entra.Client   // injectable for tests; nil builds one from the environment token
+
+	// journalIntent persists what the running phase is about to do, before
+	// it does it. runPhases sets it; phases call it before any cloud
+	// creation so a lost response can be reconciled on resume.
+	journalIntent func(detail string) error
+	ProbeCheck    func(context.Context, stack.Config) error // injectable for tests
+	Phases        []Phase
 }
 
 func (o *Options) phases() []Phase {
@@ -474,13 +487,13 @@ func Run(ctx context.Context, opts Options) error {
 		if err := store.Save(st); err != nil {
 			return err
 		}
-		return runPhases(ctx, store, st, u, opts.phases())
+		return runPhases(ctx, store, st, u, &opts, opts.phases())
 
 	case len(st.Pending()) > 0:
 		showInterrupted(u, st)
 		if !u.Interactive {
 			if opts.Resume {
-				return runPhases(ctx, store, st, u, opts.phases())
+				return runPhases(ctx, store, st, u, &opts, opts.phases())
 			}
 			return fmt.Errorf("%w: interrupted work exists; pass --resume to continue it, or run interactively to choose resume or cleanup", ErrApprovalRequired)
 		}
@@ -494,7 +507,7 @@ func Run(ctx context.Context, opts Options) error {
 		}
 		switch k {
 		case 'r':
-			return runPhases(ctx, store, st, u, opts.phases())
+			return runPhases(ctx, store, st, u, &opts, opts.phases())
 		case 'c':
 			return cleanup(store, st, u)
 		default:
@@ -541,7 +554,7 @@ func cleanup(store *state.Store, st *state.State, u *ui.UI) error {
 
 // runPhases executes the registry, skipping phases with a successful journal
 // entry, journalling intent before each run and the result after it.
-func runPhases(ctx context.Context, store *state.Store, st *state.State, u *ui.UI, phases []Phase) error {
+func runPhases(ctx context.Context, store *state.Store, st *state.State, u *ui.UI, opts *Options, phases []Phase) error {
 	done := map[string]bool{}
 	for _, a := range st.Actions {
 		if a.FinishedAt != nil && a.Result == state.ResultOK {
@@ -561,12 +574,30 @@ func runPhases(ctx context.Context, store *state.Store, st *state.State, u *ui.U
 		if err := store.Save(st); err != nil {
 			return err
 		}
+		// Let the phase persist what it is about to do, before it does
+		// it, so a lost response is reconcilable on the next run.
+		if opts != nil {
+			opts.journalIntent = func(detail string) error {
+				a := &st.Actions[len(st.Actions)-1]
+				a.Detail = detail
+				return store.Save(st)
+			}
+		}
 		err := p.Run(ctx, st, u)
+		if opts != nil {
+			opts.journalIntent = nil
+		}
 		now := time.Now().UTC()
 		last := &st.Actions[len(st.Actions)-1]
 		last.FinishedAt = &now
 		if err != nil {
 			last.Result = state.ResultFailed
+			if errors.Is(err, ErrUncertain) {
+				// The request was sent and the answer lost: the resource
+				// may exist. Record that so the next run queries by
+				// ownership marker before retrying any creation.
+				last.Result = state.ResultUncertain
+			}
 			last.Detail = err.Error()
 			if saveErr := store.Save(st); saveErr != nil {
 				return saveErr
@@ -613,4 +644,185 @@ func Status(dir string, u *ui.UI) error {
 		u.Say("Interrupted work exists. Run setup to resume or clean up.")
 	}
 	return nil
+}
+
+// entraSignin provisions the Entra application, service principal and
+// groups that carry sign-in, then re-renders and restarts the stack so
+// Guacamole comes up with SAML enabled.
+//
+// Ordering matters: intent is journalled before any creation, so a lost
+// response can be reconciled on the next run instead of creating a
+// duplicate. A pre-existing application is never changed without
+// interactive approval.
+func (o *Options) entraSignin(ctx context.Context, st *state.State, u *ui.UI) error {
+	c, err := o.entraClient()
+	if err != nil {
+		return err
+	}
+
+	cfg := entra.Config{
+		Hostname:      st.Config["guac-hostname"],
+		DeploymentID:  st.DeploymentID,
+		AdminGroup:    st.Config["admin-group"],
+		OperatorGroup: st.Config["operator-group"],
+		// Resume after a lost creation response: a name match without our
+		// marker must be reviewed by a person, not adopted or duplicated.
+		AfterUncertainCreate: lastAttemptUncertain(st, "entra-signin"),
+	}
+
+	pf, err := c.CheckPermissions(ctx)
+	if err != nil {
+		return fmt.Errorf("checking Entra permissions failed: %w", err)
+	}
+	if !pf.ReadOK {
+		return fmt.Errorf("the Entra token cannot read applications: %s", pf.ReadDetail)
+	}
+	if pf.ClaimsChecked && !pf.MutationOK {
+		return fmt.Errorf("the Entra token is missing required permissions: %s (needs %s)",
+			pf.MutationDetail, strings.Join(entra.RequiredPermissions, ", "))
+	}
+	if !pf.ClaimsChecked {
+		u.Say("Entra token permissions could not be checked in advance (opaque token); the first change is the proof.")
+	}
+
+	plan, err := c.Plan(ctx, cfg)
+	if err != nil {
+		if errors.Is(err, entra.ErrRequiresReview) {
+			return fmt.Errorf("Entra needs review before anything is created or changed: %w", err)
+		}
+		return err
+	}
+
+	// Journal intent before any creation.
+	if len(plan.Creations) > 0 && o.journalIntent != nil {
+		var names []string
+		for _, cr := range plan.Creations {
+			names = append(names, cr.Type+" "+cr.Name)
+		}
+		if err := o.journalIntent("will create in Entra: " + strings.Join(names, ", ")); err != nil {
+			return err
+		}
+		u.Say("Entra changes planned: %s", strings.Join(names, ", "))
+	}
+
+	// A pre-existing application is only changed after approval.
+	if plan.App != nil && !plan.App.ProvenOurs && len(plan.Changes) > 0 {
+		u.Say("An existing Entra application %q (object %s) would be changed:", plan.App.DisplayName, plan.App.ObjectID)
+		for _, ch := range plan.Changes {
+			u.Say("  %s: %s -> %s", ch.Field, string(ch.Original), string(ch.Applied))
+		}
+		if !u.Interactive {
+			return fmt.Errorf("%w: changing the pre-existing Entra application needs interactive approval", ErrApprovalRequired)
+		}
+		ok, err := u.Confirm("Apply these changes to the existing application?")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("changes to the existing Entra application were declined")
+		}
+	}
+
+	res, err := c.Apply(ctx, plan)
+	if err != nil {
+		if errors.Is(err, entra.ErrUncertain) {
+			// Journal as uncertain: the next run queries by marker first.
+			return fmt.Errorf("%w: %v", ErrUncertain, err)
+		}
+		if errors.Is(err, entra.ErrRequiresReview) {
+			return fmt.Errorf("Entra needs review: %w", err)
+		}
+		return err
+	}
+
+	now := time.Now().UTC()
+	if res.App.CreatedApp {
+		st.EnsureResource(state.Resource{
+			Provider: "entra", Type: "application", ProviderID: res.App.ObjectID,
+			Name: res.App.DisplayName, Ownership: res.App.Evidence,
+			CorrelationID: cfg.DeploymentID, CreatedAt: now,
+		})
+	}
+	if res.App.CreatedSP {
+		st.EnsureResource(state.Resource{
+			Provider: "entra", Type: "service-principal", ProviderID: res.App.SPObjectID,
+			Name: res.App.DisplayName, Ownership: res.App.Evidence, CreatedAt: now,
+		})
+	}
+	for _, g := range res.Groups {
+		if !g.Created {
+			continue // pre-existing: never recorded, never offered at teardown
+		}
+		st.EnsureResource(state.Resource{
+			Provider: "entra", Type: "group", ProviderID: g.ObjectID,
+			Name: g.Name, Ownership: g.Evidence, CreatedAt: now,
+		})
+	}
+	for _, ch := range res.Changes {
+		st.Changes = append(st.Changes, state.SettingChange{
+			ID: state.NewID(), Provider: "entra",
+			Target:   "application/" + res.App.ObjectID + "/" + ch.Field,
+			Original: ch.Original, Applied: ch.Applied,
+		})
+	}
+
+	entityID, err := c.VerifyMetadata(ctx, res.MetadataURL)
+	if err != nil {
+		return fmt.Errorf("the sign-in configuration could not be verified: %w", err)
+	}
+	if o.journalIntent != nil {
+		if err := o.journalIntent("verified identity provider " + entityID); err != nil {
+			return err
+		}
+	}
+
+	st.Config["saml-metadata-url"] = res.MetadataURL
+	st.Config["entra-tenant-id"] = res.TenantID
+	// Cloudflare Access needs the group object IDs; without them its
+	// allow-list silently degrades to email addresses.
+	for _, g := range res.Groups {
+		switch g.Name {
+		case st.Config["admin-group"]:
+			st.Config["entra-admin-group-id"] = g.ObjectID
+		case st.Config["operator-group"]:
+			st.Config["entra-operator-group-id"] = g.ObjectID
+		}
+	}
+	u.Say("Entra sign-in configured. Identity provider verified: %s", entityID)
+
+	// Re-render and restart so the SAML block reaches Guacamole.
+	cfgStack := o.stackConfig(st)
+	if err := stack.Render(cfgStack); err != nil {
+		return err
+	}
+	password, token, err := o.stackSecrets(st, u)
+	if err != nil {
+		return err
+	}
+	u.Say("Restarting the stack so Guacamole picks up SAML sign-in.")
+	return stack.Up(ctx, o.stackRun(), cfgStack, password, token)
+}
+
+// entraClient builds the Graph client, or explains what is missing.
+func (o *Options) entraClient() (*entra.Client, error) {
+	if o.Entra != nil {
+		return o.Entra, nil
+	}
+	if os.Getenv(entra.DefaultTokenEnv) == "" {
+		return nil, fmt.Errorf("Entra sign-in needs a Microsoft Graph token: set %s and resume. Required permissions: %s",
+			entra.DefaultTokenEnv, strings.Join(entra.RequiredPermissions, ", "))
+	}
+	return &entra.Client{Token: entra.StaticTokenFromEnv(entra.DefaultTokenEnv)}, nil
+}
+
+// lastAttemptUncertain reports whether the most recent attempt at an intent
+// ended with a lost response.
+func lastAttemptUncertain(st *state.State, intent string) bool {
+	uncertain := false
+	for _, a := range st.Actions {
+		if a.Intent == intent {
+			uncertain = a.Result == state.ResultUncertain
+		}
+	}
+	return uncertain
 }
