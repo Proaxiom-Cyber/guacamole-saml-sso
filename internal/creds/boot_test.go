@@ -89,8 +89,10 @@ func TestInstallBootCopiesTheBinaryAndCallsIt(t *testing.T) {
 		t.Fatalf("the installed runtime binary is not executable: %v", fi.Mode())
 	}
 	// It is the same path internal/schedule uses, so a host that installs
-	// both ends up with one binary.
-	if def := (BootOptions{RuntimeDir: DefaultRuntimeDir}).RuntimePath(); def != "/usr/local/lib/guacdeploy/guacdeploy" {
+	// both ends up with one binary. It must sit in a directory SELinux
+	// labels bin_t: from /usr/local/lib (lib_t) systemd leaves the service
+	// in init_t, which cannot open an outbound connection.
+	if def := (BootOptions{RuntimeDir: DefaultRuntimeDir}).RuntimePath(); def != "/usr/local/sbin/guacdeploy-runtime" {
 		t.Fatalf("the default runtime path moved: %s", def)
 	}
 
