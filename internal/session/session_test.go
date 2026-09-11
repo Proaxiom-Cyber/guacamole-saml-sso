@@ -267,8 +267,11 @@ func TestUnattendedMissingDependenciesRequireConsent(t *testing.T) {
 	if !errors.Is(err, ErrApprovalRequired) || !strings.Contains(err.Error(), "--install-dependencies") {
 		t.Fatalf("want approval-required naming the flag, got %v", err)
 	}
-	if len(calls) != 0 {
-		t.Fatalf("commands ran without consent: %v", calls)
+	for _, c := range calls {
+		// modprobe -n is a read-only probe; mutating commands must not run.
+		if strings.HasPrefix(c, "dnf") || strings.HasPrefix(c, "systemctl") {
+			t.Fatalf("mutating command ran without consent: %v", calls)
+		}
 	}
 
 	// Explicit consent resumes and installs, recording host changes.

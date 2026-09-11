@@ -83,8 +83,19 @@ func ExecRunner(ctx context.Context, stdin string, name string, args ...string) 
 // Render is idempotent and safe to re-run on resume.
 func Render(cfg Config) error {
 	cfg.defaults()
-	for _, d := range []string{"", "init", "nginx/templates", "nginx/certs", "nginx/log"} {
-		if err := os.MkdirAll(filepath.Join(cfg.InstallDir, d), 0o750); err != nil {
+	if err := os.MkdirAll(cfg.InstallDir, 0o750); err != nil {
+		return err
+	}
+	// Container processes read these bind mounts as non-root users, and a
+	// bind mount exposes the directory's own mode, so they need 0755.
+	// Secrets never live here: .env is 0600 in the 0750 root directory and
+	// the TLS key is 0600.
+	for _, d := range []string{"init", "nginx/templates", "nginx/certs", "nginx/log"} {
+		p := filepath.Join(cfg.InstallDir, d)
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			return err
+		}
+		if err := os.Chmod(p, 0o755); err != nil { // repair earlier renders
 			return err
 		}
 	}

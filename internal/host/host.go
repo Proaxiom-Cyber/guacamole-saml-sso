@@ -66,14 +66,15 @@ var setupEndpoints = []string{
 
 // Facts is what one gathering pass observed.
 type Facts struct {
-	OSID            string
-	VersionID       string
-	Root            bool
-	ExistingInstall string // first marker path found, empty if none
-	DockerPath      string
-	Podman          bool
-	ComposeOK       bool
-	Unreachable     []string
+	OSID              string
+	VersionID         string
+	Root              bool
+	ExistingInstall   string // first marker path found, empty if none
+	DockerPath        string
+	Podman            bool
+	ComposeOK         bool
+	KernelNetfilterOK bool
+	Unreachable       []string
 }
 
 // Gather observes the host without changing it.
@@ -104,6 +105,14 @@ func (p *Probes) Gather(ctx context.Context) (*Facts, error) {
 			f.ExistingInstall = dir
 			break
 		}
+	}
+
+	// Docker's bridge networking needs netfilter modules (xt_addrtype) for
+	// the running kernel. Stock cloud images ship kernel-modules-core only,
+	// and a kernel update without a reboot leaves the running kernel unable
+	// to load them. modprobe -n resolves without loading.
+	if _, err := p.Run(ctx, "modprobe", "-qn", "xt_addrtype"); err == nil {
+		f.KernelNetfilterOK = true
 	}
 
 	if path, err := p.LookPath("docker"); err == nil {
@@ -138,6 +147,9 @@ func Preflight(f *Facts) error {
 	}
 	if f.Podman {
 		return errors.New("the docker command runs Podman (podman-docker) on this host; this deployment is only verified with Docker. Use a host with Docker or remove podman-docker")
+	}
+	if !f.KernelNetfilterOK {
+		return errors.New("the running kernel cannot load the netfilter modules Docker needs (xt_addrtype). If the kernel was updated (cloud images often update on first boot), reboot into the new kernel and resume; otherwise install the kernel-modules package for the running kernel")
 	}
 	if len(f.Unreachable) > 0 {
 		return fmt.Errorf("required endpoints are unreachable: %s. Fix outbound connectivity (TCP 443) and resume", strings.Join(f.Unreachable, ", "))

@@ -50,7 +50,7 @@ func TestGatherParsesOSReleaseAndProbes(t *testing.T) {
 
 func TestPreflightRejections(t *testing.T) {
 	base := func() *Facts {
-		return &Facts{OSID: "rocky", VersionID: "10.0", Root: true}
+		return &Facts{OSID: "rocky", VersionID: "10.0", Root: true, KernelNetfilterOK: true}
 	}
 	cases := []struct {
 		name string
@@ -64,6 +64,7 @@ func TestPreflightRejections(t *testing.T) {
 		{"existing-install", func(f *Facts) { f.ExistingInstall = "/opt/guacamole" }, "does not adopt or overwrite"},
 		{"podman", func(f *Facts) { f.Podman = true }, "Podman"},
 		{"offline", func(f *Facts) { f.Unreachable = []string{"download.docker.com:443"} }, "unreachable"},
+		{"no-netfilter", func(f *Facts) { f.KernelNetfilterOK = false }, "netfilter"},
 	}
 	for _, c := range cases {
 		f := base()
