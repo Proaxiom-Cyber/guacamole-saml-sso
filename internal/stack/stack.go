@@ -1,9 +1,20 @@
 // Package stack renders and runs the local Guacamole containers: guacd,
-// PostgreSQL, the Guacamole web application, nginx, and (in a later slice)
-// cloudflared. Assets are embedded in the binary and rendered under the
-// installation directory, so the tool works without a repository checkout.
-// The database password reaches Compose through an in-memory stdin override
-// and never lands in a rendered file.
+// PostgreSQL, the Guacamole web application, nginx, and cloudflared. Assets
+// are embedded in the binary and rendered under the installation directory,
+// so the tool works without a repository checkout.
+//
+// Credentials never reach a container as an environment field. Docker stores
+// a container's environment in its own metadata, at
+// /var/lib/docker/containers/<id>/config.v2.json, and keeps it for the life
+// of the container. An environment field is therefore a plaintext copy of the
+// credential on persistent disk, present even when the deployment's own
+// credential store is sealed to the TPM, and re-read on every boot because
+// the services carry "restart: always".
+//
+// Instead each credential is written at start time into a memory-backed,
+// owner-only file that the container reads for itself. See runtimeSecrets for
+// the per-image mechanism, and CheckDelivery for the check that proves no
+// copy reached a rendered file or Docker's metadata.
 package stack
 
 import (
@@ -16,7 +27,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	_ "embed"
-	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -42,6 +52,12 @@ var groupsScript string
 // GuacVersion is the pinned Guacamole release for this tool version.
 const GuacVersion = "1.6.0"
 
+// DefaultRuntimeSecretsDir is where the credential files the containers read
+// are written. /run is tmpfs on every systemd host, so the contents are held
+// in memory and a cold boot leaves nothing behind. writeRuntimeSecrets
+// refuses to write anywhere that is not memory-backed.
+const DefaultRuntimeSecretsDir = "/run/guacdeploy/secrets"
+
 // Config is the non-secret stack configuration. It mirrors what the tool
 // records in deployment state.
 type Config struct {
@@ -57,6 +73,10 @@ type Config struct {
 	// Guacamole and every sign-in lands with no permissions.
 	SAMLGroupAttribute string
 	ComposeProfiles    string // e.g. "cloudflare" once the tunnel slice lands
+	// RuntimeSecretsDir holds the credential files the containers read.
+	// Tests point it at a temporary directory; real runs leave it empty and
+	// take DefaultRuntimeSecretsDir.
+	RuntimeSecretsDir string
 }
 
 func (c *Config) defaults() {
@@ -65,6 +85,9 @@ func (c *Config) defaults() {
 	}
 	if c.HTTPSPort == "" {
 		c.HTTPSPort = "443"
+	}
+	if c.RuntimeSecretsDir == "" {
+		c.RuntimeSecretsDir = runtimeSecretsDir()
 	}
 }
 
@@ -223,33 +246,38 @@ func GenerateSchema(ctx context.Context, run OutRunner, cfg Config) error {
 	return os.WriteFile(schemaPath, []byte(out+"\n"+marker+"\n"), 0o644)
 }
 
-// override builds the in-memory Compose override that delivers credentials.
-// Dollar signs are doubled so Compose does not interpolate secret contents.
-func override(password, tunnelToken string) string {
-	esc := func(s string) string { return strings.ReplaceAll(s, "$", "$$") }
-	o := map[string]any{"services": map[string]any{
-		"postgres":    map[string]any{"environment": map[string]string{"POSTGRES_PASSWORD": esc(password)}},
-		"guacamole":   map[string]any{"environment": map[string]string{"POSTGRESQL_PASSWORD": esc(password)}},
-		"cloudflared": map[string]any{"environment": map[string]string{"TUNNEL_TOKEN": esc(tunnelToken)}},
-	}}
-	b, _ := json.Marshal(o)
-	return string(b)
-}
-
 func (c Config) composeArgs(rest ...string) []string {
 	return append([]string{"compose",
 		"--project-directory", c.InstallDir,
 		"--env-file", filepath.Join(c.InstallDir, ".env"),
-		"-f", filepath.Join(c.InstallDir, "compose.yaml"),
-		"-f", "-"}, rest...)
+		"-f", filepath.Join(c.InstallDir, "compose.yaml")}, rest...)
 }
 
-// Up starts the stack and waits for container health. The password travels
-// only through stdin; it never appears in arguments or rendered files.
+// Up starts the stack and waits for container health.
+//
+// The credentials are written to owner-only files on tmpfs first, and the
+// containers read them for themselves. Nothing secret reaches an argument, an
+// environment field, a rendered file, or Docker's container metadata. See
+// secrets.go, and CheckDelivery for the check that proves it.
 func Up(ctx context.Context, run Runner, cfg Config, password, tunnelToken string) error {
 	cfg.defaults()
-	out, err := run(ctx, override(password, tunnelToken), "docker",
-		cfg.composeArgs("up", "--detach", "--wait", "--wait-timeout", "180")...)
+	fresh, err := writeRuntimeSecrets(cfg, password, tunnelToken)
+	if err != nil {
+		return err
+	}
+	args := []string{"up", "--detach", "--wait", "--wait-timeout", "180"}
+	if fresh {
+		// Cold boot: the tmpfs was empty, so Docker's restart policy has
+		// already started the containers against an empty mount and they
+		// are running without a credential. The compose configuration has
+		// not changed, so an ordinary "up" would leave them running and
+		// broken — and a Guacamole container with no database password
+		// still serves pages, so the deployment would look healthy while
+		// every sign-in failed. Recreating is what fixes it. On a first
+		// install there is nothing to recreate and the flag does nothing.
+		args = append(args, "--force-recreate")
+	}
+	out, err := run(ctx, "", "docker", cfg.composeArgs(args...)...)
 	if err != nil {
 		return fmt.Errorf("the services did not become healthy: %v\n%s", err, tail(out))
 	}
@@ -257,10 +285,13 @@ func Up(ctx context.Context, run Runner, cfg Config, password, tunnelToken strin
 }
 
 // Containers lists the stack's running container names.
+//
+// password and tunnelToken are no longer read: credentials reach the
+// containers as files now, so no Compose override has to be built here. The
+// parameters stay for call-site compatibility.
 func Containers(ctx context.Context, run Runner, cfg Config, password, tunnelToken string) ([]string, error) {
 	cfg.defaults()
-	out, err := run(ctx, override(password, tunnelToken), "docker",
-		cfg.composeArgs("ps", "--format", "{{.Name}}")...)
+	out, err := run(ctx, "", "docker", cfg.composeArgs("ps", "--format", "{{.Name}}")...)
 	if err != nil {
 		return nil, fmt.Errorf("docker compose ps failed: %v\n%s", err, tail(out))
 	}
