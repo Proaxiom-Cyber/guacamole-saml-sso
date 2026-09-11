@@ -16,7 +16,8 @@ status command, and a timer. Nothing under `internal/session`, `internal/stack`,
 
 Files: `internal/azure/{azure.go,auth.go,blob.go,check.go,upload.go}` (issue #17),
 `internal/azure/{create.go,role.go}` (issue #18), `internal/azure/unit.go` (issue #19),
-`internal/azure/expire.go` (issue #20), `cmd/guacdeploy/azure.go`.
+`internal/azure/expire.go` and `internal/azure/prune.go` (issue #20),
+`cmd/guacdeploy/azure.go`.
 
 ## The four slices
 
@@ -28,8 +29,9 @@ completeness, retrieval — is shared.
 
 Issue #19 is **running the upload on the backup timer**, unattended: `InstallUpload` adds
 one drop-in to the scheduled backup's service, and `Upload` is the run it starts. Issue #20
-is **remote recording retention**: `Expire`, which the same run calls once the upload has
-completed.
+is **remote retention**, which is two separate rules that never touch each other's objects:
+`Expire` removes recordings by **age**, and `PruneBackups` keeps the last seven successful
+database backups by **count**.
 
 The management plane is reached through exactly two helpers: `armGet`, which only reads,
 and `armPut`, which only writes with PUT. There is no third.
@@ -186,7 +188,62 @@ and the recording results are clean. The copies in the container are all that is
 recording the local budget has already deleted, and a run that could not prove what it holds
 must not start removing things.
 
-### 6. Naming
+### 6. Remote database backup retention is a count, and it is a different rule (issue #20)
+
+`PruneBackups` lists **only** `guacdeploy/<deployment-id>/db/` and keeps the last
+`Keep` successful backups, default `schedule.DefaultKeep` (seven, the same constant local
+retention uses, so the two cannot drift apart). A recording is not filtered out, it is never
+seen. The two rules share nothing but the ownership primitive.
+
+**This corrects a misreading.** "Preserve remote backups and their supporting storage
+resources during ordinary **teardown**" is about teardown, and says nothing about ordinary
+operation. The policy for ordinary operation is the specification's own: "retain the last
+seven successful backups by default. Make schedule and retention configurable", and
+"Database backups retain the separate default of seven successful backups". Reading the
+teardown sentence as "remote database backups are kept for ever" is what let them
+accumulate without limit.
+
+| | Recordings (`Expire`) | Database backups (`PruneBackups`) |
+|---|---|---|
+| Prefix listed | `.../recordings/` | `.../db/` |
+| Rule | age, in days, chosen by the administrator | count, default seven, configurable |
+| Clock | the blob's `Last-Modified` in Azure | the completion manifest's `PublishedAt` |
+| Below the minimum | `Days < 1` refused | `Keep < 1` refused; `Keep == 0` means the default |
+
+**What counts as one of the seven.** Only a copy the run can prove is a complete backup of
+this deployment, using the evidence `RemoteComplete` uses when the local file is gone: the
+blob carries the `guacdeploy_deployment` marker, its completion manifest blob exists and
+decodes, that manifest names this deployment and this file at the right manifest version,
+and the blob's own length and `guacdeploy_sha256` metadata match it. The body is **not**
+fetched back and re-hashed — `Content-MD5` does its work at the write, where Put Blob
+rejects a mismatched body and `UploadPublished` reads the blob back before writing any
+manifest, so a manifest exists only for a body the service already confirmed. Downloading
+every backup every night would cost the whole container in transfer and prove nothing more.
+
+**Why seven failed uploads cannot evict seven good backups.** An upload that stops between
+the bytes and the manifest leaves a blob that is not a backup. It never enters the count, so
+it can never push a real backup out of it. It is reported and left in place, and — unlike
+the recording case — it does **not** fail the run: it is a fact about the container, and a
+retention rule that suspends itself for ever after one half-finished upload is how remote
+backups accumulate again.
+
+**And an object the run could not check at all stops it removing anything.** A refused or
+failed read means the count is unknown, and pruning on an unknown count is how good backups
+disappear. `PruneReport.Withheld` says so, the run returns an error, and every older copy
+survives. Same for a failed listing: nothing is removed.
+
+**Ordering is the manifest's `PublishedAt`, not `Last-Modified`.** A catch-up upload of an
+old backup must not count as the newest one, and `Last-Modified` is the recording rule's
+clock, which this rule deliberately does not share. A manifest with no publication time
+cannot be placed in order, so it is not counted and not removed.
+
+**The completion manifest is deleted first, then the backup**, for the reason
+`internal/backup` gives for writing it last: a manifest describing a blob that is already
+gone would let a later blob landing on that name inherit completion evidence it never
+earned. A failure between the two leaves an orphan that no run counts and the next run
+reports.
+
+### 7. Naming
 
 | Resource | Candidate | Why |
 |---|---|---|
@@ -278,6 +335,15 @@ er, err := azure.Expire(ctx, c, azure.ExpireOptions{
 er.Removed / er.Kept / er.NotOwned / er.Failed
 er.Summary()
 
+// Remote database backup retention: a count, not an age. Separate rule,
+// separate prefix, separate report. NOTHING CALLS THIS YET — see below.
+pr, err := azure.PruneBackups(ctx, c, azure.PruneOptions{
+        Destination: d, DeploymentID: st.DeploymentID,
+        Keep: keep})   // 0 means the default of seven; below 1 is refused
+pr.Removed / pr.Kept / pr.NotOwned / pr.Failed
+pr.Withheld                            // why the run removed nothing at all
+pr.Summary()
+
 // Make the backup timer upload as well. Install AFTER schedule.Install: it
 // extends that service and refuses when it is not there.
 in, err := azure.InstallUpload(ctx, azure.UnitOptions{
@@ -290,6 +356,28 @@ removed, err := azure.UninstallUpload(ctx, azure.UnitOptions{
 
 `azure.Destination` holds only non-secret references and is safe in deployment state and in
 the status file.
+
+### Wiring `PruneBackups` — the parent's three lines
+
+`PruneBackups` is exposed and tested but **not yet called by anything**, so remote database
+backups still accumulate until the parent wires it. It belongs beside `Expire` at the end of
+`Upload`, under the same condition — a failed upload prunes nothing — in `upload.go`:
+
+```go
+        pr, err := PruneBackups(ctx, c, PruneOptions{Destination: o.Destination,
+                DeploymentID: o.DeploymentID, Keep: o.KeepBackups, Now: o.Now})
+        rep.Prune = &pr
+        if err != nil {
+                return o.fail(rep, err)
+        }
+```
+
+with `KeepBackups int` added to `Options`, `Prune *PruneReport` added to `Report`, and
+`rep.Prune.Summary()` appended in `Report.Summary()` beside `rep.Expire`'s. The value comes
+from deployment state: add one key, `azure-backup-retention-count`, holding the same number
+the local backup schedule keeps (`schedule.Options.Keep`), and pass zero when it is absent
+so the specification's default of seven applies. Unlike the recording period, an absent
+value must **not** mean "keep for ever" — that is the defect this closes.
 
 ## Phase placement
 
@@ -368,6 +456,7 @@ Non-secret references only, as usual. The constants live in `cmd/guacdeploy/azur
 | `azure-client-id` | the unattended application's client ID |
 | `azure-upload-schedule` | `OnCalendar` expression actually installed (the backup timer's) |
 | `azure-recording-retention-days` | days recordings are kept in Azure; absent means never expire |
+| `azure-backup-retention-count` | successful database backups kept in Azure; absent means the default of seven, never "for ever" |
 | `azure-location` | region the storage was created in (creation path only) |
 | `azure-role-assignment` | the uploader's role assignment name, a GUID (creation path only) |
 
@@ -537,8 +626,9 @@ intent, it belongs behind its own approval, in its own review — not here.
 
 If a future slice needs to remove blobs, the safe primitive is `DeleteOwnedBlob`: it
 refuses anything outside this deployment's prefix, reads the ownership marker back from the
-service, and refuses anything that does not carry this deployment's ID. Remote retention by
-age is issue #20 and is not implemented here.
+service, and refuses anything that does not carry this deployment's ID. Both retention rules
+already go through it: `Expire` for recordings by age, `PruneBackups` for database backups
+by count.
 
 ## Status output
 
@@ -583,10 +673,17 @@ recording the local budget lost for good, and the remote retention result.
 - **A failed upload expires nothing remote.** `Upload` reaches `Expire` only after both
   results are clean. Do not move the expiry call above the failure check, and do not add a
   second caller that runs it unconditionally.
-- **Remote retention never reaches a database backup.** The listing is scoped to the
-  recordings prefix. Widening it — "so we can expire old backups too" — is how the seven
-  successful database backups get silently deleted by an age rule that was never meant for
-  them.
+- **The recording age rule never reaches a database backup, and the database count rule
+  never reaches a recording.** Each lists only its own area. Widening either listing — "so
+  we can expire old backups too", "so we can cap the number of recordings" — is how the
+  seven successful database backups get silently deleted by an age rule that was never meant
+  for them. Do not merge `Expire` and `PruneBackups`, and do not give them a shared listing.
+- **A copy that cannot be proved complete is never one of the seven, and is never deleted.**
+  That is the whole of why a run of failed uploads cannot evict good backups. Counting
+  objects instead of verified backups reintroduces the failure directly.
+- **A run that could not read the whole database prefix removes nothing.** `Withheld` says
+  so. Do not "carry on with what we could read": the count would be wrong in the one
+  direction that deletes things.
 - **Local recording cleanup is never made conditional on an upload.** The budget wins, the
   loss is reported. Do not add a "skip deletion when the upload failed" path anywhere.
 - **The retention period is asked for, never defaulted.** An absent
@@ -633,12 +730,14 @@ needs. Retrieval tooling must therefore use Entra sign-in (`az storage blob down
   expire and nothing would report it. `ListBlobs` is still one page, and its one caller
   needs a single object. A walk stops after 5000 pages rather than looping for ever on a
   repeated marker, and says so.
-- **Remote database backups are never deleted, by anything.** Local retention keeps the
-  last seven; the copies already in the container stay for ever. That is deliberate for V1
-  — they are the disaster-recovery copy, and "preserve remote backups" is the dominant
-  instruction — but it does mean remote database storage grows without limit. Pruning them
-  would be a new, separately approved deletion path, not an extension of the recording age
-  rule.
+- **`PruneBackups` exists but nothing calls it yet.** Until the parent wires it (see
+  "Wiring `PruneBackups`" above), remote database backups still accumulate without limit.
+  The function, its report and its tests are here; the phase and command wiring is not.
+- **Remote backup retention prunes nothing it cannot account for.** An orphan blob left by a
+  half-finished upload is reported every run and removed by nothing, because no age rule
+  applies to the database area and it is not a backup. It is cleared when the next
+  successful upload of the same name rewrites it, or by hand. Growth from that residue is
+  bounded by how often an upload fails between the bytes and the manifest.
 - **A failed database backup also skips that night's upload**, because systemd stops a
   `oneshot` service at the first failing `ExecStart`. See decision 4 for the trade and the
   manual command.
@@ -672,7 +771,9 @@ needs. Retrieval tooling must therefore use Entra sign-in (`az storage blob down
   then turn into `ErrNameTaken` rather than a duplicate. Add `nextLink` following before
   that is likely.
 - **Everything here is unit-tested against a fake HTTP seam and a temporary filesystem.**
-  No call has been made to a real Azure subscription, and no systemd unit has been loaded
-  by systemd. Live verification of sign-in, creation, role behaviour, upload, retrieval,
-  the timer actually firing, and expiry against real blob ages is still required before
+  **No live Azure run has ever happened in this project.** No call has been made to a real
+  Azure subscription, no blob has been written to a real container, and no systemd unit has
+  been loaded by systemd. Mocked tests are not acceptance. Live verification of sign-in,
+  creation, role behaviour, upload, retrieval, the timer actually firing, expiry against
+  real blob ages, and backup pruning against a real container is still required before
   acceptance (A18, A19, A20, A21, A23).

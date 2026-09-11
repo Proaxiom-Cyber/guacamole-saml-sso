@@ -71,8 +71,8 @@ type ExpireReport struct {
 // Only `guacdeploy/<deployment-id>/recordings/`. The listing is taken under
 // that prefix, so a database backup is not merely skipped, it is never seen:
 // database backups keep their own separate retention of the last seven
-// successful backups, and the recording age rule is not applied to them
-// (specification). Every deletion then goes through DeleteOwnedBlob, which
+// successful backups (PruneBackups), and the recording age rule is not applied
+// to them (specification). Every deletion then goes through DeleteOwnedBlob, which
 // refuses a name outside this deployment's prefix and reads the
 // guacdeploy_deployment marker back from the service before deleting. An
 // object whose marker is missing or names someone else is left in place and
