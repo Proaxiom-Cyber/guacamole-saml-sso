@@ -33,6 +33,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 )
 
 const graphBase = "https://graph.microsoft.com/v1.0"
@@ -352,4 +353,40 @@ func (c *Client) VerifyMetadata(ctx context.Context, metadataURL string) (string
 		return "", errors.New("federation metadata has no entityID")
 	}
 	return md.EntityID, nil
+}
+
+// DefaultReplicationWait bounds how long the tool waits for a freshly
+// created directory object to become addressable.
+const DefaultReplicationWait = 90 * time.Second
+
+// ReplicationWait is the bound used by waitVisible; a variable so tests do
+// not sleep.
+var ReplicationWait = DefaultReplicationWait
+
+// waitVisible polls a freshly created object until Graph can read it.
+//
+// Entra is eventually consistent. A create call returns an object ID, and a
+// write against that ID moments later can still fail with
+// Request_ResourceNotFound because the directory has not replicated. That
+// is a delay, not an error, so the tool waits for it instead of failing a
+// deployment; if it never appears, the error says so plainly.
+func (c *Client) waitVisible(ctx context.Context, path string) error {
+	deadline := time.Now().Add(ReplicationWait)
+	var last error
+	for {
+		if _, err := c.call(ctx, http.MethodGet, path, nil); err == nil {
+			return nil
+		} else {
+			last = err
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("%s was created but did not become readable within %s, so the directory has not replicated it: %w",
+				path, ReplicationWait, last)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
 }

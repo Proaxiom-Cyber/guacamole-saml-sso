@@ -517,6 +517,14 @@ func (c *Client) Apply(ctx context.Context, plan *Plan) (*Result, error) {
 		}
 		sp = &FoundSP{ObjectID: created.ID, AppRoleID: nilRoleID}
 		res.App.CreatedSP = true
+		// Entra is eventually consistent: a service principal accepted by
+		// the create call is not immediately addressable everywhere, and
+		// the very next write returns Request_ResourceNotFound. Wait for
+		// the directory to catch up rather than fail a deployment over a
+		// delay the specification tells us to expect.
+		if err := c.waitVisible(ctx, "/servicePrincipals/"+created.ID); err != nil {
+			return nil, err
+		}
 	}
 	res.App.SPObjectID = sp.ObjectID
 

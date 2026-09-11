@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fake routes Graph and metadata calls by "METHOD /path". No real tenant is
@@ -217,6 +218,9 @@ func TestApplyFreshProvisioning(t *testing.T) {
 				t.Fatalf("service principal must link to the created app: %v", b)
 			}
 			return jsonResp(201, map[string]string{"id": "sp-1"})
+		},
+		"GET /v1.0/servicePrincipals/sp-1": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(200, `{"id":"sp-1"}`)
 		},
 		"PATCH /v1.0/servicePrincipals/sp-1": func(t *testing.T, r *http.Request) *http.Response {
 			b := readBody(t, r)
@@ -456,6 +460,9 @@ func TestPreExistingAppChangesReturnOriginals(t *testing.T) {
 			}
 			return jsonResp(204, nil)
 		},
+		"GET /v1.0/servicePrincipals/sp-1": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(200, `{"id":"sp-1"}`)
+		},
 		"PATCH /v1.0/servicePrincipals/sp-1": func(t *testing.T, r *http.Request) *http.Response {
 			return jsonResp(204, nil)
 		},
@@ -683,5 +690,51 @@ func TestTenantIDComesFromTheTokenClaim(t *testing.T) {
 		if p == "Organization.Read.All" {
 			t.Fatal("Organization.Read.All is still required even though the tenant ID comes from the token")
 		}
+	}
+}
+
+// TestServicePrincipalWaitsForReplication pins the fix for a live failure:
+// Entra accepted the service-principal creation and then rejected the very
+// next write against the returned ID with Request_ResourceNotFound,
+// because the directory had not replicated it yet. The specification says
+// to account for delayed visibility, so the tool waits instead of failing
+// the deployment.
+func TestServicePrincipalWaitsForReplication(t *testing.T) {
+	old := ReplicationWait
+	ReplicationWait = 5 * time.Second
+	defer func() { ReplicationWait = old }()
+
+	reads := 0
+	c := &Client{
+		Token: func(context.Context) (string, error) { return "t", nil },
+		Do: func(r *http.Request) (*http.Response, error) {
+			if r.Method == http.MethodGet && r.URL.Path == "/v1.0/servicePrincipals/sp-new" {
+				reads++
+				if reads < 2 {
+					return jsonResp(404, `{"error":{"code":"Request_ResourceNotFound","message":"does not exist"}}`), nil
+				}
+				return jsonResp(200, `{"id":"sp-new"}`), nil
+			}
+			return jsonResp(200, `{}`), nil
+		},
+	}
+	if err := c.waitVisible(context.Background(), "/servicePrincipals/sp-new"); err != nil {
+		t.Fatalf("the wait gave up on a replication delay: %v", err)
+	}
+	if reads < 2 {
+		t.Fatalf("it did not actually poll: %d reads", reads)
+	}
+
+	// An object that never appears is reported, not waited on for ever.
+	ReplicationWait = 10 * time.Millisecond
+	missing := &Client{
+		Token: func(context.Context) (string, error) { return "t", nil },
+		Do: func(*http.Request) (*http.Response, error) {
+			return jsonResp(404, `{"error":{"code":"Request_ResourceNotFound","message":"does not exist"}}`), nil
+		},
+	}
+	err := missing.waitVisible(context.Background(), "/servicePrincipals/never")
+	if err == nil || !strings.Contains(err.Error(), "has not replicated") {
+		t.Fatalf("want a replication error, got %v", err)
 	}
 }
