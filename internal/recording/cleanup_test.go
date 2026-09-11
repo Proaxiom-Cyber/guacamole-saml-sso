@@ -185,7 +185,7 @@ func TestInstalledUnitsCallTheDeploymentOwnedCopy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if in.RuntimePath != filepath.Join(o.RuntimeDir, "guacdeploy") {
+	if in.RuntimePath != filepath.Join(o.RuntimeDir, RuntimeBinaryName) {
 		t.Fatalf("runtime path = %s", in.RuntimePath)
 	}
 	copied, err := os.ReadFile(in.RuntimePath)

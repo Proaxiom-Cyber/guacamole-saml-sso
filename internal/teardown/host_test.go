@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/schedule"
 )
 
 // The backup schedule goes last, because its Uninstall deletes the binary
@@ -24,7 +26,7 @@ func TestHostUnitsRemovesBinaryLast(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	binary := filepath.Join(runtimeDir, "guacdeploy")
+	binary := filepath.Join(runtimeDir, schedule.RuntimeBinaryName)
 	if err := os.WriteFile(binary, []byte("ELF"), 0o755); err != nil {
 		t.Fatal(err)
 	}
