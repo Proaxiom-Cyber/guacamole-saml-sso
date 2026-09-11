@@ -183,97 +183,38 @@ connection credentials. Treat plaintext backups accordingly.
 
 ## Scheduled backups
 
-Setup can install a daily backup. It keeps the last seven successful
-backups. Both the schedule and the retention count are configurable.
+Setup installs a daily backup timer after the stack is running. Change
+the schedule with `--backup-schedule`, how many successful backups to
+keep with `--backup-keep` (seven by default), and where they go with
+`--backup-dest`. Use `--require-mount` when the destination must sit on a
+mounted share: a missing or replaced mount then fails visibly instead of
+writing to local disk. `--no-backup-schedule` declines scheduling; manual
+backups still work.
 
-The schedule is a systemd timer, `guacdeploy-backup.timer`, and a service,
-`guacdeploy-backup.service`. The service runs `guacdeploy backup-run`.
+Scheduled backups encrypt with the recorded backup public key and never
+need the recovery passphrase. If no key exists yet, setup does not
+install the timer and says so, rather than installing one that would
+write unencrypted backups. Generate a key with `guacdeploy backup-key`,
+then run setup again.
 
-The scheduled backup does not need the binary you downloaded to install
-the deployment. Setup copies that binary to
-`/usr/local/lib/guacdeploy/guacdeploy` and the service calls the copy. You
-can delete the binary you downloaded. The backup continues to run after a
-reboot.
+The schedule is a systemd timer, `guacdeploy-backup.timer`, with a
+service that runs `guacdeploy backup-run`. The service calls a copy of
+the tool kept at `/usr/local/sbin/guacdeploy-runtime`, so you can delete
+the binary you downloaded and the backup keeps running across reboots.
+The timer is persistent: if the host is off at the scheduled time, the
+backup runs at the next start. A failed backup never expires an earlier
+good one.
 
-A scheduled backup uses the backup public key only. It never needs the
-recovery passphrase.
+`guacdeploy backup-status` shows the destination and the last result.
+`guacdeploy backup-run` performs the scheduled backup immediately.
 
-The timer is persistent. If the host is off at the scheduled time, the
-backup runs at the next start.
-
-Use these commands to examine the schedule:
+To examine the schedule:
 
 ```
 systemctl list-timers guacdeploy-backup.timer
 systemctl status guacdeploy-backup.service
 journalctl -u guacdeploy-backup.service
 ```
-
-### Retention
-
-Retention runs only after a backup is published. A failed backup deletes
-nothing. Earlier successful backups always stay.
-
-Retention counts only complete backups of this deployment. For each file
-it reads the completion manifest, then measures and re-hashes the file
-against it. A truncated, damaged, or replaced file does not match and is
-not counted. This needs no recovery key, so the scheduled backup can
-check an encrypted file it cannot decrypt.
-
-Retention deletes only files that pass this check, with their manifests.
-Everything else stays: a `.partial-` file from a failed export, a backup
-that another deployment wrote into the same share, a backup with no
-manifest, and any unrelated file.
-
-Retention keeps the newest backups by the time in the name. Where two
-backups share a timestamp, the one with the higher `-N` suffix is the
-newer, because the tool only uses `-2` after `-1` is taken.
-
-Retention always keeps at least one backup. A retention count of zero is
-refused.
-
-### Results of the last run
-
-```
-guacdeploy backup-status
-```
-
-This shows the destination, the schedule, the retention count, the time
-and result of the last run, the published file or the reason for the
-failure, how many backups are held, and which files retention removed.
-It reads `/var/lib/guacdeploy/backup-status.json`, which contains no
-credentials.
-
-### Destinations on a mounted share
-
-Give `--dest` a directory on the share. The directory must exist. It can
-be the mount point or any subfolder inside it, such as
-`/mnt/backups/guacamole`.
-
-Add `--require-mount` for a destination on a share. The first checked run
-approves what it finds: it records the mount point the destination sits
-inside, in `/var/lib/guacdeploy/backup-mount.json`, and writes a marker
-file, `.guacdeploy-backup-mount`, on the share. The record and the marker
-hold no secrets. A destination on the same filesystem as
-`/var/lib/guacdeploy` is refused, because that is local storage, not a
-share.
-
-Every later run compares against the record. The run fails, and exports
-nothing, when the destination is no longer inside the approved mount, or
-when the marker on the share is missing or different. Both mean the
-expected share is not mounted. Without this option, a directory that
-exists but holds no mount accepts the backup into local storage, which
-fills the system disk and gives no warning.
-
-To approve a replacement share, delete
-`/var/lib/guacdeploy/backup-mount.json`. The next run records the new
-share.
-
-The tool publishes a backup with a hard link where the filesystem
-supports one. Many SMB/CIFS shares do not. On those it reserves the
-published name, then copies the file into it. Both ways refuse to
-overwrite an existing backup, and both keep the `.partial-` export if
-publication fails.
 
 ## State
 
@@ -359,7 +300,7 @@ marker is never deleted.
 
 Renewal is installed as a systemd timer that runs daily and renews when
 less than 30 days remain. It calls a copy of the tool kept under
-`/usr/local/lib/guacdeploy`, so renewal keeps working after the
+`/usr/local/sbin/guacdeploy-runtime`, so renewal keeps working after the
 downloaded binary is gone. A successful renewal reloads nginx, which
 keeps established sessions alive. A failed renewal keeps the existing
 certificate, reports the failure and exits nonzero; certificate
@@ -371,28 +312,6 @@ result. `guacdeploy renew-cert` renews immediately.
 If the deployment uses prompt-mode credentials, setup does not install
 the timer: a timer has no terminal to ask for a passphrase. Renew
 manually, or deploy with the env or file credential mode.
-
-## Scheduled backups
-
-Setup installs a daily backup timer after the stack is running. Change
-the schedule with `--backup-schedule`, how many successful backups to
-keep with `--backup-keep` (seven by default), and where they go with
-`--backup-dest`. Use `--require-mount` when the destination must sit on a
-mounted share: a missing or replaced mount then fails visibly instead of
-writing to local disk. `--no-backup-schedule` declines scheduling; manual
-backups still work.
-
-Scheduled backups encrypt with the recorded backup public key. If no key
-exists yet, setup does not install the timer and says so, rather than
-installing one that would write unencrypted backups. Generate a key with
-`guacdeploy backup-key`, then run setup again.
-
-Like certificate renewal, the timer calls a copy of the tool kept under
-`/usr/local/lib/guacdeploy`, so it keeps working after the downloaded
-binary is gone. A failed backup never expires an earlier good one.
-
-`guacdeploy backup-status` shows the destination and the last result.
-`guacdeploy backup-run` performs the scheduled backup immediately.
 
 ## Session recordings
 

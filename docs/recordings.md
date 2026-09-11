@@ -99,7 +99,7 @@ because the web application is given the same directory read-only.
 Setup asks how much local disk session recordings may use. A scheduled job checks that
 budget, by default every hour. It runs from a systemd timer and needs no downloaded
 provisioning binary: setup installs its own copy at
-`/usr/local/lib/guacdeploy/guacdeploy`, which the unit calls.
+`/usr/local/sbin/guacdeploy-runtime`, which the unit calls.
 
 ```
 guacdeploy-recordings.timer     when to run
