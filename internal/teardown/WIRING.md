@@ -49,6 +49,8 @@ question keeps the data and removes everything else.
 ## API surface
 
 ```go
+func Reconcile(ctx, *state.State, Finders) Reconciliation            // queries providers, records what is proven ours
+func Obligations(*state.State) []Obligation                          // reads the journal only
 func BuildPlan(*state.State, []settings.Entry, deleteData bool) Plan  // reads only
 func (Plan) Report(*ui.UI)                                           // prints only
 func Run(ctx, *state.State, Plan, Ops, *ui.UI, Options) (Result, error)
@@ -97,8 +99,9 @@ half from `DefaultOps`.
 ## What is never offered
 
 - **Pre-existing resources.** They are not in the deployment record: `internal/session`
-  records a group or an application only when it created it. There is nothing to
-  filter, and nothing here goes looking at a provider for things to delete.
+  records a group or an application only when it created it. Reconciliation does ask the
+  providers what is there (see below), but it only ever adopts what this deployment's
+  ownership marker proves is its own.
 - **A recorded resource with no ownership evidence.** A matching name never
   establishes ownership, so it goes to review and stops the run.
 - **A created resource that now supports unrelated use.** The specification's worked
@@ -112,6 +115,232 @@ half from `DefaultOps`.
   enabled service are the same rule again, and are always kept.
 - **Remote backups.** `internal/azure` has no teardown: blobs in the customer's own
   storage account are never removed, with or without `--delete-data`. The plan says so.
+
+## Reconciliation: what the command still has to pass in (issue #11)
+
+`state.Resources` is only half the truth. `entra.Apply` creates an application, a service
+principal, a signing certificate, two groups and two role assignments; an error partway
+through returns before one resource ID reaches the record. On the lab that produced
+"Teardown is complete. Nothing eligible is outstanding." while an Entra application, its
+service principal and a group were still in the tenant.
+
+`Reconcile` closes it. It reads the journal — `state.Pending()`, the latest attempt per
+intent — and takes every phase that creates provider resources and did **not** succeed as
+a reconciliation obligation. For each one it asks that provider what is there:
+
+```go
+type Found struct {
+        Owned   []state.Resource // ownership marker verified: eligible
+        Unowned []state.Resource // name match only: never touched, always reported
+}
+type Finder  func(ctx context.Context) (Found, error)
+type Finders map[string]Finder // keyed as state keys providers: "entra", "cloudflare"
+```
+
+Marker-verified resources go into `st.Resources`, so the plan offers them, the operator
+approves them, and a failed delete keeps them for the next run. Name-only matches are
+reported and never touched. A provider that **cannot be asked at all** — no Finder, no
+credential, no network, an API error — becomes uncertain work: it is reported with what
+to check, `Result.Complete()` is false, `Run` returns `ErrIncomplete`, and `teardownCmd`
+therefore returns before it can delete the deployment record. There is no name-only
+cleanup and no state reset on a failed query anywhere in this package.
+
+The phases that carry an obligation are `entra-signin`, `cloudflare-tunnel`,
+`cloudflare-dns` and `cloudflare-access` (`creators` in `reconcile.go`).
+
+### Three lines in `teardownCmd`
+
+```go
+finders := teardown.Finders{"entra": findEntra(st), "cloudflare": findCloudflare(cf)}
+rec := teardown.Reconcile(ctx, st, finders)   // before BuildPlan: it records what it proves
+plan := teardown.BuildPlan(st, settings.List(ctx, st, reg), deleteData)
+plan.Reconciled = rec
+```
+
+`cf` is the `*cloudflare.Provisioner` `teardownProviders` already builds. Nothing else in
+the command changes.
+
+### The Entra Finder needs no change to `internal/entra`
+
+`Client.Plan` is already the marker query — it is what resume uses — and it creates
+nothing:
+
+```go
+func findEntra(ec *entra.Client, st *state.State) teardown.Finder {
+        return func(ctx context.Context) (teardown.Found, error) {
+                p, err := ec.Plan(ctx, entra.Config{
+                        Hostname: st.Config["guac-hostname"], DeploymentID: st.DeploymentID,
+                        AdminGroup: st.Config["admin-group"], OperatorGroup: st.Config["operator-group"],
+                })
+                if err != nil {
+                        return teardown.Found{}, err // including ErrRequiresReview: a person decides
+                }
+                var f teardown.Found
+                if p.App != nil {
+                        r := state.Resource{Provider: "entra", Type: "application",
+                                ProviderID: p.App.ObjectID, Name: p.App.DisplayName}
+                        if !p.App.ProvenOurs {
+                                f.Unowned = append(f.Unowned, r)
+                        } else {
+                                r.Ownership = "marker " + p.App.Marker + " in the application notes and tags"
+                                f.Owned = append(f.Owned, r)
+                                if p.SP != nil {
+                                        f.Owned = append(f.Owned, state.Resource{Provider: "entra",
+                                                Type: "service-principal", ProviderID: p.SP.ObjectID,
+                                                Name: p.App.DisplayName,
+                                                Ownership: "service principal of the marked application"})
+                                }
+                        }
+                }
+                for _, g := range p.Groups {
+                        r := state.Resource{Provider: "entra", Type: "group",
+                                ProviderID: g.ObjectID, Name: g.Name}
+                        if !g.ProvenOurs {
+                                f.Unowned = append(f.Unowned, r)
+                                continue
+                        }
+                        r.Ownership = "marker " + entra.Marker(st.DeploymentID) + " in the group description"
+                        f.Owned = append(f.Owned, r)
+                }
+                return f, nil
+        }
+}
+```
+
+Leave `AfterUncertainCreate` false here: this is a query, not a resume, and a name-only
+match must come back as `Unowned` rather than as an error.
+
+`Plan` still returns `ErrRequiresReview` for two cases a teardown would rather see as
+`Unowned`: two applications sharing the display name, and a pre-existing application
+serving a different entity ID. Both become uncertain work, which stops the teardown being
+called complete until a person looks. That is the safe direction and it needs no change
+to `internal/entra`; soften it there only if a real deployment is ever blocked by it.
+
+### The Cloudflare Finder needs one read-only method on `internal/cloudflare`
+
+That package's HTTP seam (`Client.do`) and its marker (`Provisioner.marker`) are both
+unexported, so the marker rules cannot be applied from outside without copying them —
+which is exactly what must not happen. Its owner adds one method, reusing the three
+lookups `ApplyTunnel`, `ApplyDNS` and `applyAccessApp` already perform:
+
+```go
+// OwnedResource is one resource at Cloudflare that matches this deployment's
+// naming. Ours reports whether the ownership marker proves it is this
+// deployment's; a name match alone never does.
+type OwnedResource struct {
+        Type      string // "tunnel", "dns-record", "access-application"
+        ID, Name  string
+        Ours      bool
+        Ownership string // the evidence, for the deployment record
+}
+
+// FindOwned lists them. It only reads: teardown calls it to reconcile a phase
+// that failed before it could record what it created.
+func (p *Provisioner) FindOwned(ctx context.Context) ([]OwnedResource, error) {
+        var out []OwnedResource
+        var tunnels []Tunnel
+        path := "/accounts/" + p.AccountID + "/cfd_tunnel?is_deleted=false&per_page=50&include_prefix=" +
+                url.QueryEscape(p.tunnelPrefix())
+        if err := p.Client.do(ctx, "GET", path, nil, &tunnels); err != nil {
+                return nil, err
+        }
+        for _, t := range tunnels {
+                out = append(out, OwnedResource{Type: "tunnel", ID: t.ID, Name: t.Name,
+                        Ours:      t.Name == p.TunnelName(),
+                        Ownership: "deployment ID embedded in the tunnel name"})
+        }
+        var records []Record
+        if err := p.Client.do(ctx, "GET", "/zones/"+p.ZoneID+"/dns_records?per_page=50&name="+
+                url.QueryEscape(p.Hostname), nil, &records); err != nil {
+                return out, err
+        }
+        for _, r := range records {
+                out = append(out, OwnedResource{Type: "dns-record", ID: r.ID, Name: r.Name,
+                        Ours:      r.Comment == p.marker(),
+                        Ownership: "record comment carries this deployment's marker"})
+        }
+        apps, err := p.Client.listAccessApps(ctx, p.AccountID, "")
+        if err != nil {
+                return out, err
+        }
+        for _, a := range apps {
+                if !strings.HasPrefix(a.Name, p.accessNamePrefix()) && !p.covers(a) {
+                        continue // nothing to do with this deployment's hostname
+                }
+                out = append(out, OwnedResource{Type: "access-application", ID: a.ID, Name: a.Name,
+                        Ours:      a.Name == p.AccessAppName() && p.covers(a),
+                        Ownership: "deployment ID in the application name, verified against the hostname"})
+        }
+        return out, nil
+}
+```
+
+Every marker test above is the one that package's own `Apply*` and `Delete*` already use:
+the tunnel name, the DNS record comment, and the Access application name **plus** the
+hostname-coverage check. The Access policy is not listed: it is removed with its
+application and is never deleted separately.
+
+The command then maps it:
+
+```go
+func findCloudflare(cf *cloudflare.Provisioner) teardown.Finder {
+        return func(ctx context.Context) (teardown.Found, error) {
+                found, err := cf.FindOwned(ctx)
+                if err != nil {
+                        return teardown.Found{}, err
+                }
+                var f teardown.Found
+                for _, r := range found {
+                        res := state.Resource{Provider: "cloudflare", Type: r.Type,
+                                ProviderID: r.ID, Name: r.Name}
+                        if !r.Ours {
+                                f.Unowned = append(f.Unowned, res)
+                                continue
+                        }
+                        res.Ownership = r.Ownership
+                        f.Owned = append(f.Owned, res)
+                }
+                return f, nil
+        }
+}
+```
+
+Until `FindOwned` exists, pass no `"cloudflare"` Finder: a failed Cloudflare phase is
+then reported as uncertain work with "no cloudflare query is wired into this run", which
+is honest and keeps the teardown from being called complete. The Entra half works today.
+
+### Azure is deliberately absent
+
+Nothing journals a `state.Action` for the Azure destination: it is a separate command,
+not a session phase, so there is no creation intent to reconcile against and no
+obligation to find. On the day it is journalled, add `"azure-destination": "azure"` to
+`creators` in `reconcile.go` and a Finder that matches on the `guacdeploy_deployment`
+tag and blob metadata (`internal/azure`'s `ownerMetadata`). Teardown still removes no
+remote backup either way.
+
+### Host phases are not reconciled, and do not need to be
+
+`boot-recovery`, `backup-schedule`, `recording-schedule` and `origin-certificate` create
+host units, not cloud resources. `HostUnits` removes by marker whatever is on disk,
+whether or not it was ever recorded, and every removal is verified against the filesystem
+(below), so a half-installed unit is found by the removal step itself.
+
+## Removed means gone
+
+A path is reported under **Removed** only when it is actually gone. `hostUnitOutcomes`
+re-stats every unit path after `RemoveHostUnits` returns, and that check — not the step's
+own account of itself — decides the outcome. A live teardown listed
+`systemd-unit /usr/local/lib/guacdeploy/guacdeploy` as removed while the file was still
+on the host: a nil error was read as "all of them went", but each package here removes
+only what still carries this deployment's marker, and `creds.UninstallBoot` deliberately
+leaves the shared binary alone while another unit still calls it — both without an error.
+A path that is still there is now **retained**, with the reason, and stays in the record.
+
+Anything that cannot be stat-ed takes its result from the operation that performed it:
+`RemoveContainers` from `docker compose down`, `RemoveRendered` and `RemoveCredentials`
+from `removeIfEmpty`'s own `os.Remove`, `RemoveTree` from `os.RemoveAll`, and each
+provider delete from its API call. A stat that fails for any reason other than "it is not
+there" counts as still there: an unanswerable stat is never evidence of removal.
 
 ## Ownership is re-checked at deletion time
 
