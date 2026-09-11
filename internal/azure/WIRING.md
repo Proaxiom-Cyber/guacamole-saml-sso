@@ -345,7 +345,7 @@ the recording run. Two ways, both fine:
 - Install a separate timer at a later hour, the same way `schedule.Install` does.
 
 Either way the installed routine calls the deployment-owned runtime copy of the binary
-(`/usr/local/lib/guacdeploy/guacdeploy`), not the provisioning binary — see
+(`/usr/local/sbin/guacdeploy-runtime`), not the provisioning binary — see
 `internal/schedule/WIRING.md`. This package needs nothing else from the provisioning run:
 the destination comes from state and the credential from the credential store.
 

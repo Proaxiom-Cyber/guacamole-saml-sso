@@ -144,7 +144,7 @@ connection. The error says the credential is bound to this host and must be re-s
 ## 5. Reboot recovery without the provisioning binary (A11)
 
 `InstallBoot` follows the convention `internal/schedule` set: it copies the **running
-executable** to `/usr/local/lib/guacdeploy/guacdeploy` and installs a unit that calls the
+executable** to `/usr/local/sbin/guacdeploy-runtime` and installs a unit that calls the
 copy. It is the same path `schedule.Install` uses, and the copy is content-compared, so a
 host that installs both ends up with exactly one binary and the second install does
 nothing.
@@ -175,7 +175,7 @@ entry for one file.
 
 ### The command you have to add
 
-The unit runs `/usr/local/lib/guacdeploy/guacdeploy stack-start --state-dir DIR`. That
+The unit runs `/usr/local/sbin/guacdeploy-runtime stack-start --state-dir DIR`. That
 subcommand does not exist yet, and adding it means editing `main.go`, which is outside my
 boundary. It is about fifteen lines in a new `cmd/guacdeploy/stack-start.go`:
 

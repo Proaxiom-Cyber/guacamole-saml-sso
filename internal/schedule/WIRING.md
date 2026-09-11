@@ -16,7 +16,7 @@ and ran. It may sit in a home directory or a temporary directory, and it may be 
 as soon as setup finishes. A unit pointing at that path breaks on the next reboot.
 
 So `Install` copies the **running executable** to a deployment-owned runtime path,
-`/usr/local/lib/guacdeploy/guacdeploy`, and the service unit calls that copy. The
+`/usr/local/sbin/guacdeploy-runtime`, and the service unit calls that copy. The
 installed routine then depends on nothing but itself, the state directory, and Docker.
 `/usr/local/bin/guacdeploy` is deliberately **not** used: that is where the launcher
 puts the provisioning binary, and the operator is free to remove it.

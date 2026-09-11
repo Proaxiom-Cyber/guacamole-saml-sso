@@ -140,7 +140,7 @@ for _, r := range []struct{ typ, name string }{
 
 Record the expiry in `Ownership` (or re-record the resource on each renewal if the
 schema later grows a field for it). The runtime binary copy is **not** recorded here:
-`internal/schedule` already records `/usr/local/lib/guacdeploy/guacdeploy` as a created
+`internal/schedule` already records `/usr/local/sbin/guacdeploy-runtime` as a created
 resource, and there is only one copy.
 
 ## Teardown
