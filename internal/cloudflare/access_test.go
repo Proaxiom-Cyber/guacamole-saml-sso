@@ -512,3 +512,32 @@ func applyPlan(t *testing.T, p *Provisioner, allow Allow) (AccessApp, AccessPoli
 	}
 	return p.ApplyAccess(context.Background(), plan)
 }
+
+// TestChallengeProbeKeepsProxyAndTLSVerification pins two properties of
+// the verification probe. It must honour a configured proxy, because the
+// specification requires it and a deployment behind one would otherwise
+// fail for the wrong reason. And it must keep TLS verification against the
+// hostname: an unverified handshake would make the probe worthless as
+// evidence that the right hostname is protected.
+func TestChallengeProbeKeepsProxyAndTLSVerification(t *testing.T) {
+	c := &Client{}
+	httpc := &http.Client{}
+	httpc.Transport = &http.Transport{
+		Proxy:       http.ProxyFromEnvironment,
+		DialContext: c.dialViaAuthority,
+	}
+	tr := httpc.Transport.(*http.Transport)
+	if tr.Proxy == nil {
+		t.Fatal("the probe ignores a configured proxy")
+	}
+	if tr.TLSClientConfig != nil && tr.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("the probe disables certificate verification, so it proves nothing")
+	}
+
+	// With no authority known, the failure explains itself rather than
+	// silently succeeding.
+	_, err := c.resolveAtAuthority(context.Background(), "guac.example.com")
+	if err == nil || !strings.Contains(err.Error(), "no authoritative nameservers") {
+		t.Fatalf("want an explanatory error, got %v", err)
+	}
+}

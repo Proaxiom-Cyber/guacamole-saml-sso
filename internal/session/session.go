@@ -926,14 +926,17 @@ func (o *Options) cloudflareClient(st *state.State, u *ui.UI) *cloudflare.Client
 		return o.Cloudflare
 	}
 	m := o.manager(st, u)
-	return &cloudflare.Client{Token: func(context.Context) (string, error) {
-		for _, s := range o.credSpecs() {
-			if s.Name == "cloudflare-api-token" {
-				return m.Get(s) // in-memory only; never journalled
+	return &cloudflare.Client{
+		AuthorityNameServers: splitList(st.Config["cloudflare-zone-nameservers"]),
+		Token: func(context.Context) (string, error) {
+			for _, s := range o.credSpecs() {
+				if s.Name == "cloudflare-api-token" {
+					return m.Get(s) // in-memory only; never journalled
+				}
 			}
-		}
-		return "", errors.New("no cloudflare-api-token credential is configured")
-	}}
+			return "", errors.New("no cloudflare-api-token credential is configured")
+		},
+	}
 }
 
 func (o *Options) provisioner(st *state.State, u *ui.UI) *cloudflare.Provisioner {
@@ -986,6 +989,9 @@ func (o *Options) cloudflareSelect(ctx context.Context, st *state.State, u *ui.U
 	st.Config["cloudflare-account-name"] = z.Account.Name
 	st.Config["cloudflare-zone-id"] = z.ID
 	st.Config["cloudflare-zone-name"] = z.Name
+	// Remembered so later phases can resolve the hostname at its authority
+	// when this host's resolver cannot see the zone.
+	st.Config["cloudflare-zone-nameservers"] = strings.Join(z.NameServers, ",")
 	u.Say("Cloudflare account %q, zone %q selected. The zone itself is pre-existing and is never removed by teardown.", z.Account.Name, z.Name)
 	return nil
 }

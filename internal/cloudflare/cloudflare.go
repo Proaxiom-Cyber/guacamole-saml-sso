@@ -120,6 +120,12 @@ type TokenSource func(ctx context.Context) (string, error)
 
 // Client is a minimal Cloudflare v4 API client.
 type Client struct {
+	// AuthorityNameServers are the zone's authoritative nameservers. A
+	// verification probe uses them when the deployment host's own resolver
+	// cannot see the zone, which happens whenever that resolver is
+	// authoritative for the same domain internally.
+	AuthorityNameServers []string
+
 	HTTP  *http.Client // injectable seam; nil means http.DefaultClient
 	Base  string       // "" means DefaultBase
 	Token TokenSource  // required
@@ -279,6 +285,11 @@ type Zone struct {
 func (c *Client) ZonesByName(ctx context.Context, name string) ([]Zone, error) {
 	var z []Zone
 	err := c.do(ctx, "GET", "/zones?name="+url.QueryEscape(name)+"&per_page=50", nil, &z)
+	// Remember the authority so a later probe can resolve a hostname this
+	// host's own resolver cannot see.
+	if err == nil && len(z) == 1 {
+		c.AuthorityNameServers = z[0].NameServers
+	}
 	return z, err
 }
 

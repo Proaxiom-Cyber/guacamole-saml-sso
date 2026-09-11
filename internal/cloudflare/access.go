@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -560,6 +561,23 @@ func (c *Client) accessChallenge(ctx context.Context, hostname, authDomain strin
 	if c.HTTP != nil {
 		httpc.Transport, httpc.Timeout = c.HTTP.Transport, c.HTTP.Timeout
 	}
+	if httpc.Transport == nil {
+		// The deployment host's resolver may be authoritative for this
+		// domain internally and answer NXDOMAIN for a name published at
+		// Cloudflare. That is a split-horizon resolver, not an unprotected
+		// hostname, so fall back to the addresses the zone's own authority
+		// gives rather than reporting a verification failure.
+		// Proxy and certificate trust are deliberately left as the
+		// defaults: the specification requires configured proxies and the
+		// host's trust store to be respected, and TLS verification against
+		// the hostname is what makes this probe evidence at all. Only the
+		// address dialled changes, so the certificate is still checked for
+		// the hostname in the URL.
+		httpc.Transport = &http.Transport{
+			Proxy:       http.ProxyFromEnvironment,
+			DialContext: c.dialViaAuthority,
+		}
+	}
 	resp, err := httpc.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("could not reach %s to check that Access is enforcing: %v", target, err)
@@ -602,4 +620,52 @@ func (p *Provisioner) DeleteAccessApp(ctx context.Context, appID string) error {
 			appID, app.Domain, p.Hostname, ErrNotOwned)
 	}
 	return p.Client.do(ctx, "DELETE", "/accounts/"+p.AccountID+"/access/apps/"+appID, nil, nil)
+}
+
+// dialViaAuthority dials normally, and on a lookup failure resolves the
+// name at the zone's authoritative nameservers instead. A proxied record's
+// authority is Cloudflare itself, so this asks the same servers the rest of
+// the internet would.
+func (c *Client) dialViaAuthority(ctx context.Context, network, addr string) (net.Conn, error) {
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, network, addr)
+	if err == nil {
+		return conn, nil
+	}
+	var dnsErr *net.DNSError
+	if !errors.As(err, &dnsErr) {
+		return nil, err
+	}
+	host, port, splitErr := net.SplitHostPort(addr)
+	if splitErr != nil {
+		return nil, err
+	}
+	ips, resolveErr := c.resolveAtAuthority(ctx, host)
+	if resolveErr != nil || len(ips) == 0 {
+		return nil, fmt.Errorf("%v (and the zone's authority could not be asked either: %v)", err, resolveErr)
+	}
+	for _, ip := range ips {
+		if conn, dialErr := d.DialContext(ctx, network, net.JoinHostPort(ip, port)); dialErr == nil {
+			return conn, nil
+		}
+	}
+	return nil, err
+}
+
+// resolveAtAuthority returns the addresses the zone's authoritative
+// nameservers give for a name.
+func (c *Client) resolveAtAuthority(ctx context.Context, host string) ([]string, error) {
+	if len(c.AuthorityNameServers) == 0 {
+		return nil, errors.New("no authoritative nameservers are known for this zone")
+	}
+	for _, ns := range c.AuthorityNameServers {
+		r := &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var dl net.Dialer
+			return dl.DialContext(ctx, network, net.JoinHostPort(ns, "53"))
+		}}
+		if addrs, err := r.LookupHost(ctx, host); err == nil && len(addrs) > 0 {
+			return addrs, nil
+		}
+	}
+	return nil, errors.New("the zone's authoritative nameservers did not answer for " + host)
 }
