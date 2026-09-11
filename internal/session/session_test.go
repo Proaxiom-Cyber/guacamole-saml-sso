@@ -462,7 +462,7 @@ func TestStackPhasesFullPipelineUnattended(t *testing.T) {
 	// Sign-in provisioning has its own tests; this one covers the local stack.
 	opts.Phases = withoutPhases(Phases(&opts),
 		"cloudflare-select", "cloudflare-tunnel", "cloudflare-dns",
-		"cloudflare-connect", "entra-signin", "cloudflare-access")
+		"cloudflare-connect", "entra-signin", "cloudflare-access", "origin-certificate")
 	if err := Run(context.Background(), opts); err != nil {
 		t.Fatalf("full pipeline: %v\n%s", err, out.String())
 	}
@@ -852,5 +852,36 @@ func TestConnectorRefusesWithoutVerifiedAccess(t *testing.T) {
 	}
 	if strings.Contains(st.Config["compose-profiles"], "cloudflare") {
 		t.Fatal("the connector profile was enabled by a refused publication")
+	}
+}
+
+// TestCertificatePrecedesStackStart pins the ordering that lets the tunnel
+// keep origin TLS verification on: the real certificate must be installed
+// before nginx starts, and certainly before the connector is published.
+func TestCertificatePrecedesStackStart(t *testing.T) {
+	var order []string
+	for _, p := range Phases(&Options{}) {
+		order = append(order, p.Name)
+	}
+	pos := func(name string) int {
+		for i, n := range order {
+			if n == name {
+				return i
+			}
+		}
+		t.Fatalf("phase %q missing: %v", name, order)
+		return -1
+	}
+	if pos("origin-certificate") < pos("stack-render") {
+		t.Fatal("the certificate phase runs before the certificate directory is rendered")
+	}
+	for _, after := range []string{"stack-up", "cloudflare-connect"} {
+		if pos("origin-certificate") > pos(after) {
+			t.Fatalf("origin-certificate runs after %s: the origin would serve the temporary self-signed certificate", after)
+		}
+	}
+	// The zone must be selected before the certificate can be validated.
+	if pos("cloudflare-select") > pos("origin-certificate") {
+		t.Fatal("DNS-01 validation needs the zone selected first")
 	}
 }

@@ -338,3 +338,28 @@ the Access policy is verified. If any earlier phase fails, the service
 stays unreachable from the internet rather than reachable without
 protection. The connector refuses to start at all unless a verified
 Access application already covers the hostname.
+
+## Origin certificate
+
+Setup issues a Let's Encrypt certificate for the deployment hostname and
+installs it for nginx before the stack starts, so the tunnel never has to
+accept an unverified origin. Validation uses DNS-01 through Cloudflare,
+because port 443 is reachable only through the tunnel, which refuses an
+unverified origin. Challenge records are always removed afterwards,
+including when issuance fails, and a record without this deployment's
+marker is never deleted.
+
+Renewal is installed as a systemd timer that runs daily and renews when
+less than 30 days remain. It calls a copy of the tool kept under
+`/usr/local/lib/guacdeploy`, so renewal keeps working after the
+downloaded binary is gone. A successful renewal reloads nginx, which
+keeps established sessions alive. A failed renewal keeps the existing
+certificate, reports the failure and exits nonzero; certificate
+verification is never disabled to work around it.
+
+`guacdeploy cert-status` shows the certificate and the last renewal
+result. `guacdeploy renew-cert` renews immediately.
+
+If the deployment uses prompt-mode credentials, setup does not install
+the timer: a timer has no terminal to ask for a passphrase. Renew
+manually, or deploy with the env or file credential mode.

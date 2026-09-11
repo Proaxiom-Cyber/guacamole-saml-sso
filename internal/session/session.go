@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/certs"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/cloudflare"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/creds"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/entra"
@@ -70,6 +71,10 @@ func Phases(opts *Options) []Phase {
 		// missing or corrupt. It re-runs so a schema written by an earlier
 		// version gets repaired instead of skipped for ever.
 		{Name: "stack-schema", Run: opts.stackSchema, Always: true},
+		// The real certificate replaces the temporary self-signed one
+		// before nginx starts, so the tunnel never has to accept an
+		// unverified origin.
+		{Name: "origin-certificate", Run: opts.originCertificate},
 		{Name: "stack-up", Run: opts.stackUp},
 		// Health is checked against the local origin before anything is
 		// published, so a failure later never leaves an exposed service.
@@ -469,6 +474,7 @@ type Options struct {
 	Entra               *entra.Client   // injectable for tests; nil builds one from the environment token
 	Cloudflare          *cloudflare.Client
 	Zone                string // explicit Cloudflare zone name
+	ACMEContact         string // optional operator address for the ACME account
 	AccessEmails        string // comma-separated Access allow-list fallback
 
 	// journalIntent persists what the running phase is about to do, before
@@ -1096,5 +1102,64 @@ func (o *Options) cloudflareConnect(ctx context.Context, st *state.State, u *ui.
 		return err
 	}
 	u.Say("Deployment published. Sign-in goes through Cloudflare Access, then Entra.")
+	return nil
+}
+
+// originCertificate issues the origin certificate and installs renewal.
+//
+// It runs after the stack is rendered (so the certificate directory
+// exists and a temporary self-signed certificate is already in place) and
+// before the stack starts, so nginx comes up serving the real certificate.
+// Validation is DNS-01 through Cloudflare, because port 443 is reachable
+// only through the tunnel, which refuses an unverified origin.
+func (o *Options) originCertificate(ctx context.Context, st *state.State, u *ui.UI) error {
+	if st.Config["cloudflare-zone-id"] == "" {
+		return errors.New("the origin certificate needs the Cloudflare zone; run zone selection first")
+	}
+	opts := certs.Options{
+		Hostname:     st.Config["guac-hostname"],
+		InstallDir:   o.installDir(),
+		StateDir:     o.StateDir,
+		DirectoryURL: st.Config["acme-directory-url"],
+		Contact:      o.ACMEContact,
+		DNS:          &cloudflare.DNS01{P: o.provisioner(st, u)},
+	}
+	if o.journalIntent != nil {
+		if err := o.journalIntent("will issue an origin certificate for " + opts.Hostname + " by DNS-01"); err != nil {
+			return err
+		}
+	}
+	status, err := certs.Renew(ctx, opts)
+	if err != nil {
+		return fmt.Errorf("issuing the origin certificate failed: %w", err)
+	}
+	u.Say("Origin certificate: %s", status.Reason)
+
+	// Renewal must keep working without this binary and without a person.
+	// A prompt-mode deployment cannot supply credentials to a timer, so say
+	// so rather than installing a unit that will fail every night.
+	if st.Config["credential-mode"] == creds.ModePrompt {
+		u.Say("Credential mode is prompt, so automatic renewal cannot run unattended: a timer has no terminal to ask.")
+		u.Say("Renew manually with 'guacdeploy renew-cert', or re-deploy with the env or file credential mode.")
+		return nil
+	}
+	installed, err := certs.Install(ctx, certs.InstallOptions{
+		DeploymentID: st.DeploymentID,
+		StateDir:     o.StateDir,
+	})
+	if err != nil {
+		return fmt.Errorf("installing certificate renewal failed: %w", err)
+	}
+	now := time.Now().UTC()
+	for _, unit := range []string{installed.ServicePath, installed.TimerPath, installed.RuntimePath} {
+		if unit == "" {
+			continue
+		}
+		st.EnsureResource(state.Resource{
+			Provider: "host", Type: "systemd-unit", Name: unit,
+			Ownership: "installed by this deployment for certificate renewal", CreatedAt: now,
+		})
+	}
+	u.Say("Certificate renewal installed; it runs without this binary present.")
 	return nil
 }

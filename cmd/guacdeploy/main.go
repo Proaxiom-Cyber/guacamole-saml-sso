@@ -33,6 +33,8 @@ Commands:
   backup-key  Generate the backup recovery key (guided only); --verify demonstrates recovery
   backup   Export the database, encrypted with the backup key, into a directory
   restore  Replace the database from a backup file (asks for consent)
+  renew-cert  Renew the origin certificate now (used by the installed timer)
+  cert-status Show the origin certificate and its last renewal result
   version  Print the tool version
 
 Flags for setup:
@@ -45,6 +47,7 @@ Flags for setup:
   --operator-group NAME    Identity-provider group for operators
   --zone NAME              Cloudflare zone name (default: the hostname's apex)
   --access-emails LIST     Cloudflare Access allow-list when Entra groups are unavailable
+  --acme-contact ADDR      Operator address for the certificate account
   --state-dir DIR          Override the state directory (default ` + "/var/lib/guacdeploy" + `)
 
 Flags for backup:
@@ -75,6 +78,7 @@ func run(args []string) int {
 	operatorGroup := fs.String("operator-group", "", "identity-provider group for operators")
 	zone := fs.String("zone", "", "Cloudflare zone name (default: the hostname's apex)")
 	accessEmails := fs.String("access-emails", "", "comma-separated Cloudflare Access allow-list, used when Entra groups are unavailable")
+	acmeContact := fs.String("acme-contact", "", "operator address for the certificate account, e.g. mailto:ops@example.com")
 	verify := fs.Bool("verify", false, "backup-key: demonstrate recovery from the existing export")
 	dest := fs.String("dest", "", "backup: destination directory (default <state-dir>/backups)")
 	plaintext := fs.Bool("plaintext", false, "backup: explicitly write an unencrypted backup")
@@ -109,7 +113,7 @@ func run(args []string) int {
 			StateDir: *stateDir, UI: u, Resume: *resume,
 			InstallDependencies: *installDeps, CredentialMode: *credMode,
 			Hostname: *hostname, AdminGroup: *adminGroup, OperatorGroup: *operatorGroup,
-			Zone: *zone, AccessEmails: *accessEmails,
+			Zone: *zone, AccessEmails: *accessEmails, ACMEContact: *acmeContact,
 		}
 		if s := os.Getenv("GUACDEPLOY_TEST_SLEEP_PHASE"); s != "" {
 			// Test hook: replace the registry with a slow phase so session
@@ -137,6 +141,10 @@ func run(args []string) int {
 		err = backupCmd(ctx, backup.ExecRunner, *stateDir, *dest, *plaintext, u)
 	case "restore":
 		err = restoreCmd(ctx, backup.ExecRunner, *stateDir, *file, *identityFile, *yes, u)
+	case "renew-cert":
+		err = renewCertCmd(ctx, *stateDir, u)
+	case "cert-status":
+		err = certStatusCmd(*stateDir, u)
 	case "version":
 		u.Say("guacdeploy %s", version)
 	default:
