@@ -10,7 +10,7 @@ package certs
 //
 // So this follows internal/schedule exactly: Install copies the running
 // executable to the same deployment-owned runtime path,
-// /usr/local/lib/guacdeploy/guacdeploy, and the unit calls that copy. There
+// /usr/local/sbin/guacdeploy-runtime, and the unit calls that copy. There
 // is one convention on the host, not two — the backup timer and the renewal
 // timer run the same installed binary, and installing it twice is a no-op
 // because the copy is content-compared first.

@@ -32,7 +32,7 @@ type HostOptions struct {
 	StateDir     string
 	InstallDir   string
 	UnitDir      string // default /etc/systemd/system
-	RuntimeDir   string // default /usr/local/lib/guacdeploy
+	RuntimeDir   string // default /usr/local/sbin
 }
 
 func (o *HostOptions) defaults() {
