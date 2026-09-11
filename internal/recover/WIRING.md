@@ -60,18 +60,23 @@ func recoverCmd(ctx context.Context, o Options, file, keyExport string, yes bool
                 return err
         }
 
-        rep := recover.Reconcile(ctx, l, finders(l, token))
+        // The same two Finders teardownCmd builds. Nothing new to write.
+        st := l.Snapshot.State
+        rep := recover.Reconcile(ctx, l, teardown.Finders{
+                "entra":      findEntra(ec, st),
+                "cloudflare": findCloudflare(cf),
+        })
         rep.Print(u)
         if err := rep.RequiresReview(); err != nil {
                 return err // exit 3, beside session.ErrApprovalRequired
         }
         if !yes { ...u.Confirm... }
 
-        st, err := recover.Restore(l, rep, time.Now())
+        rec, err := recover.Restore(l, rep, time.Now())
         if err != nil {
                 return err
         }
-        if err := store.Save(st); err != nil {
+        if err := store.Save(rec); err != nil {
                 return err
         }
         ...existing setup phases, then backup.Apply(ctx, opts, l.SQL)...
@@ -85,108 +90,75 @@ Map `recover.ErrReviewRequired` to the same exit code as `teardown.ErrReviewRequ
 `ErrKeyRequired`, `ErrIncompatible` and `ErrNoRecord` are ordinary failures: nothing was
 changed, so a retry costs nothing.
 
-## 2. The Finders
+## 2. The Finders: teardown's, unchanged
+
+Recovery asks the **same question teardown asks**, through the same seam, so it is the same
+type and the same wiring:
 
 ```go
-type Finder func(ctx context.Context, r state.Resource) (recover.Live, error)
-type Finders map[string]Finder // keyed by recover.Key(r) == "<provider>/<type>"
+type Finder  func(ctx context.Context) (teardown.Found, error)
+type Finders map[string]Finder // keyed as state keys providers: "entra", "cloudflare"
 ```
 
-A `Finder` must **create nothing**. Fill in `Live{Present, ProviderID, Marker}` and let the
-package apply the rules. It classifies, you do not:
+`teardownCmd` already builds these with `findEntra` and `findCloudflare`
+(`internal/teardown/WIRING.md`, section "The Entra Finder" and "The Cloudflare Finder").
+**Pass the same two functions here.** There is nothing new to write at either provider, and
+`cloudflare.FindOwned` already covers the tunnel, the DNS record and the Access application
+in one call.
 
-| What the provider reports | Disposition |
+One marker sweep per provider answers both of recovery's questions at once:
+
+| What the sweep says about a resource | Disposition |
 |---|---|
-| present, `Marker == recover.Marker(deploymentID)` | `Adopt` — reused, never created again |
-| absent | `Recreate` — created again, intent journalled first |
-| present, marker absent or different | `Review` — never adopted, never deleted |
-| lookup errored, or no `Finder` wired | `Review` |
+| in `Found.Owned`, and the record holds it | `Adopt` — reused, never created again |
+| in `Found.Owned`, and the record does **not** | `Adopt`, `Recovered: true` — see below |
+| in `Found.Unowned` (name match, no marker) | `Review` — never adopted, never deleted |
+| in neither | `Recreate` — created again, intent journalled first |
+| the Finder errored, or none is wired | `Review` |
 
-An unwired key is review, not a skip. That is deliberate: recreating on an unanswered
-question is exactly how a duplicate tunnel gets made.
+An error is not an empty answer, and an unwired provider is not a skip. Recreating on an
+unanswered question is exactly how a duplicate tunnel gets made. A partial `Found` returned
+*with* an error — which is what `cloudflare.FindOwned` does when its second call fails — is
+not trusted either: half a sweep proves nothing about the half that failed.
 
-Look each resource up **by the deployment's own name and marker, not by the recorded
-provider ID**, and report the ID you found in `Live.ProviderID`. The marker is the durable
-evidence; a recorded ID is only a hint, and `Adopt` takes the live ID over the recorded one.
+A recorded resource is matched to the sweep by provider ID first and by
+provider/type/name second, so a resource renamed at the provider but still carrying the
+marker is recognised rather than created beside itself.
 
-The five keys to wire: `cloudflare/tunnel`, `cloudflare/dns-record`,
-`cloudflare/access-application`, `entra/application`, `entra/group`. `cloudflare/access-policy`
-and `entra/service-principal` are never queried — they have no lifecycle of their own — and
-`host/*` and `docker/*` are rebuilt by setup on the new VM.
+`cloudflare/access-policy` and `entra/service-principal` are never classified from the
+sweep: they have no lifecycle of their own and follow their parent. `host/*` and `docker/*`
+are rebuilt by setup on the new VM.
 
-### Entra: works today
+### Why a sweep and not a lookup per resource
 
-`entra.Client.Plan` is already the read-only reconciliation query, and it returns the marker
-it found. Call it once, serve both keys from the result:
+Because the resource list is only half the record. A phase creates several resources and can
+fail before any of them is saved, and those resources are still at the provider carrying
+this deployment's marker with nothing in `state.Resources` pointing at them. A per-resource
+lookup cannot see them, so a recovery would create a second set beside them — the same
+orphan failure teardown had to fix, reintroduced on the replacement host. The sweep sees
+both, and `Item.Recovered` marks what it found that the record was missing.
 
-```go
-p, err := client.Plan(ctx, entra.Config{
-        Hostname:      st.Config["guac-hostname"],
-        DeploymentID:  st.DeploymentID,
-        AdminGroup:    st.Config["admin-group"],
-        OperatorGroup: st.Config["operator-group"],
-        // A name match without our marker must be review, not a reusable
-        // pre-existing resource. On a replacement host nobody can tell the two
-        // apart from here.
-        AfterUncertainCreate: true,
-})
-```
+### The journal is the other half
 
-`p.App` nil means gone (`Live{}`); otherwise `Live{Present: true, ProviderID: p.App.ObjectID,
-Marker: p.App.Marker}`. Same for `p.Groups[name]` — it carries `ProvenOurs` rather than the
-marker text, so pass `recover.Marker(st.DeploymentID)` when it is true and `""` when it is
-not. `entra.ErrRequiresReview` from `Plan` is returned as the Finder's error, which is
-review anyway.
+`teardown.Obligations(st)` names the unfinished phases that create at a provider, from
+teardown's own `creators` map. Recovery asks that provider even when the record mentions it
+nowhere, and reports the result as a `recover.Obligation`:
 
-### Cloudflare: three lookups you have to add
+- **Answered** — the provider was asked. Anything it proved ours is adopted above.
+- **Not answered** — no Finder, or the Finder errored. `Report.Unanswered()` lists these and
+  `RequiresReview()` fails, so `Restore` refuses. The detail says which provider to check and
+  which marker to look for.
 
-`Client.do` is unexported, so a read-only lookup cannot be written from outside the package,
-and `ApplyTunnel` / `ApplyDNS` **create** when nothing matches. Recovery must not call them
-before it has reported.
-
-Split the query half out of each `Apply*` and have `Apply*` call it. That keeps recovery's
-view and provisioning's view from ever drifting apart, and it is a smaller change than a
-second query path:
-
-```go
-// LookupTunnel reports the tunnel this deployment owns. Read only: it never
-// creates. A zero Tunnel with a nil error means there is none.
-func (p *Provisioner) LookupTunnel(ctx context.Context) (Tunnel, error) {
-        var found []Tunnel
-        path := "/accounts/" + p.AccountID + "/cfd_tunnel?is_deleted=false&per_page=50&include_prefix=" +
-                url.QueryEscape(p.tunnelPrefix())
-        if err := p.Client.do(ctx, "GET", path, nil, &found); err != nil {
-                return Tunnel{}, err
-        }
-        for _, t := range found {
-                if t.Name == p.TunnelName() {
-                        return t, nil
-                }
-        }
-        if len(found) > 0 {
-                return Tunnel{}, fmt.Errorf("tunnel %q matches hostname %s but not this deployment's marker: %w",
-                        found[0].Name, p.Hostname, ErrRequiresReview)
-        }
-        return Tunnel{}, nil
-}
-```
-
-`ApplyTunnel` then becomes that call plus the existing POST. Do the same for `ApplyDNS`
-(`LookupRecord`, returning the record whose `Comment` carries the marker) and for the Access
-application (`LookupAccessApp`, wrapping the existing unexported `listAccessApps` and
-`covers`). The marker string for both is what `PlanDNS(...).Comment` returns, which
-`TestMarkerMatchesBothProviders` pins to `recover.Marker`.
-
-`is_deleted=false` matters: a deleted tunnel is still returned by a GET on its ID, with
-`deleted_at` set. Listing is what tells the truth. For a DNS record, a 404 is a genuine
-absence — `errors.As(err, &cloudflare.APIError{})` exposes `Status`.
+Nothing here keeps a second copy of which phase creates where. If a new phase starts creating
+at a provider, add it to `creators` in `internal/teardown/reconcile.go` and both teardown and
+recovery pick it up.
 
 ### Azure
 
-`azure/blob-prefix` has no Finder in the list above, so it is reported as review: one line
-asking the operator to confirm the storage account and container are still there. That is
-the correct default — recovery never creates or deletes remote backup storage. Wire an
-Azure Finder if you want the line to resolve by itself.
+`azure/blob-prefix` has no Finder, so it is reported as review: one line asking the operator
+to confirm the storage account and container are still there. That is the correct default —
+recovery never creates or deletes remote backup storage. Nothing journals an Azure creation
+intent today, so there is no obligation to go with it.
 
 ## 3. What must change on a replacement host
 
@@ -237,11 +209,21 @@ resource that is gone loses its stale identifier and gains an unfinished journal
 provisioning from `st.Pending()`**: an interruption mid-recovery then resumes instead of
 duplicating.
 
-The lost host's action journal is deliberately not carried over. Its unfinished intents
-describe attempts on a machine that no longer exists and could never resolve. Recorded
-setting changes *are* carried over: they were applied to pre-existing objects that outlived
-the host, and `internal/settings` drift-checks each one against the live value before it
-offers to restore anything.
+A resource the sweep found that the record was missing goes in too, with the identifier
+`state.EnsureResource` gives it and the ownership evidence the provider reported. **That is
+what keeps teardown honest later**: a resource nobody recorded is a resource nobody removes.
+
+The lost host's unfinished creation intents are carried over as answered entries, one per
+obligation, spelled `recover:reconciled:<intent>` with the original phase name inside and a
+detail saying what asking the provider found. They are neither dropped — that evidence is
+the only thing standing between a recovery and a duplicate — nor carried over unfinished,
+because the original phase did not succeed and a pending intent naming a dead machine can
+never resolve. Pending intents that create nothing at any provider are not carried over at
+all; the `recover:restore` entry records how many there were.
+
+Recorded setting changes *are* carried over: they were applied to pre-existing objects that
+outlived the host, and `internal/settings` drift-checks each one against the live value
+before it offers to restore anything.
 
 ## 5. Order of operations
 
@@ -264,11 +246,20 @@ Do not log it, journal it, or write it anywhere but the target database.
 back whole, refusal of an incompatible format, Guacamole version, record schema and
 truncated dump before anything is altered, an encrypted backup with no key, no passphrase,
 a wrong passphrase and a wrong key, each reconciliation outcome with the marker rules
-enforced, an unwired or failing lookup reviewed rather than recreated, no creation while a
-resource is still present, the DNS record following the tunnel actually in use, a sealed
-credential reported as unrecoverable rather than regenerated, and the exact set of things
-the operator must still supply. Thirteen mutations of the load-bearing logic were each
-checked to turn a test red.
+enforced, an unwired or failing provider reviewed rather than recreated, a renamed resource
+adopted rather than created beside itself, no creation while a resource is still present,
+the DNS record following the tunnel actually in use, a sealed credential reported as
+unrecoverable rather than regenerated, and the exact set of things the operator must still
+supply.
+
+The journal half has its own tests, built on the failure that happened in the lab: a phase
+that created an Entra application, its service principal and a group and failed before any
+of them reached the record. They cover all three being adopted rather than created a second
+time, the intent carried forward as evidence instead of dropped, a provider that cannot be
+asked stopping the recovery **even though no resource in the record mentions it**, a partial
+sweep returned with an error not being trusted as an answer, and a name-only match neither
+adopted nor recreated. Twenty-one mutations of the load-bearing logic were each checked to
+turn a test red.
 
 All of it runs through fakes. **No test has ever read a real Cloudflare or Graph API, built
 a VM, or restored a database.** A real replacement-VM recovery on the Rocky Linux test

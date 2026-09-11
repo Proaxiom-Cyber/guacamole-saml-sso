@@ -17,6 +17,7 @@ import (
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/entra"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recoverykey"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/teardown"
 )
 
 const (
@@ -76,10 +77,47 @@ func lostHost() *state.State {
 			Original: json.RawMessage(`null`), Applied: json.RawMessage(`"guacdeploy:` + depID + `"`),
 		}},
 		Actions: []state.Action{{
-			ID: "a1", Intent: "provision:cloudflare-tunnel", StartedAt: created,
-			// Deliberately unfinished: the host died mid-flight.
+			// A real phase intent, one internal/teardown's creators map knows
+			// creates at Cloudflare. Deliberately unfinished: the host died
+			// mid-flight, so what it created is unknown until Cloudflare is
+			// asked.
+			ID: "a1", Intent: "cloudflare-tunnel", StartedAt: created,
+			Detail: "will create in Cloudflare: tunnel, ingress configuration",
 		}},
 	}
+}
+
+// lostHostMidEntra is the failure that actually bit us in the lab: the Entra
+// phase created an application, its service principal and a group, then
+// failed before a single resource ID reached the record. Nothing in
+// st.Resources mentions any of them, and only the journal says they may
+// exist.
+func lostHostMidEntra() *state.State {
+	st := lostHost()
+	var kept []state.Resource
+	for _, r := range st.Resources {
+		if r.Provider != "entra" {
+			kept = append(kept, r)
+		}
+	}
+	st.Resources = kept
+	st.Actions = []state.Action{{
+		ID: "a2", Intent: "entra-signin", StartedAt: st.CreatedAt,
+		Detail: "will create in Entra: application, service principal, groups",
+	}}
+	return st
+}
+
+// entraOrphans is what a marker sweep finds after that failure.
+func entraOrphans() teardown.Found {
+	return teardown.Found{Owned: []state.Resource{
+		{Provider: "entra", Type: "application", ProviderID: "eapp-1", Name: "Guacamole " + hostname,
+			Ownership: "marker " + Marker(depID) + " in the application notes and tags"},
+		{Provider: "entra", Type: "service-principal", ProviderID: "esp-1", Name: "Guacamole " + hostname,
+			Ownership: "service principal of the marked application"},
+		{Provider: "entra", Type: "group", ProviderID: "grp-1", Name: "Guacamole Admins",
+			Ownership: "marker " + Marker(depID) + " in the group description"},
+	}}
 }
 
 // escapeCopy spells one value the way pg_dump writes a COPY text field.
@@ -174,33 +212,66 @@ func writeBackup(t *testing.T, dir string, o backupOpts) string {
 	return path
 }
 
-// finder returns a Finder that answers with one fixed Live value and counts
-// its calls.
-func finder(live Live, err error, calls *int) Finder {
-	return func(context.Context, state.Resource) (Live, error) {
+// sweeper returns a teardown.Finder answering with one fixed result and
+// counting its calls. It is the same seam teardown reconciliation uses: one
+// marker query per provider, never per resource.
+func sweeper(found teardown.Found, err error, calls *int) teardown.Finder {
+	return func(context.Context) (teardown.Found, error) {
 		if calls != nil {
 			*calls++
 		}
-		return live, err
+		return found, err
 	}
 }
 
-// allPresent wires every cloud lookup to "still there, marker verified".
-func allPresent(calls *int) Finders {
-	ours := Live{Present: true, Marker: Marker(depID)}
-	f := Finders{}
-	for key, id := range map[string]string{
-		"cloudflare/tunnel":             "tun-old",
-		"cloudflare/dns-record":         "rec-1",
-		"cloudflare/access-application": "app-1",
-		"entra/application":             "eapp-1",
-		"entra/group":                   "grp-1",
-	} {
-		l := ours
-		l.ProviderID = id
-		f[key] = finder(l, nil, calls)
+// cloudflarePresent is everything the lost host recorded at Cloudflare,
+// still there and marker-verified.
+func cloudflarePresent() teardown.Found {
+	return teardown.Found{Owned: []state.Resource{
+		{Provider: "cloudflare", Type: "tunnel", ProviderID: "tun-old",
+			Name: "guacdeploy-" + hostname + "-" + depID, Ownership: "deployment ID embedded in the tunnel name"},
+		{Provider: "cloudflare", Type: "dns-record", ProviderID: "rec-1", Name: hostname,
+			Ownership: "record comment carries this deployment's marker"},
+		{Provider: "cloudflare", Type: "access-application", ProviderID: "app-1",
+			Name:      "Guacamole " + hostname + " (guacdeploy:" + depID + ")",
+			Ownership: "deployment ID in the application name, verified against the hostname"},
+	}}
+}
+
+// allPresent wires both providers to "everything is still there, and every
+// ownership marker verifies".
+func allPresent(calls *int) teardown.Finders {
+	return teardown.Finders{
+		"cloudflare": sweeper(cloudflarePresent(), nil, calls),
+		"entra":      sweeper(entraOrphans(), nil, calls),
 	}
-	return f
+}
+
+// with returns a copy of f with one provider replaced.
+func with(f teardown.Finders, provider string, one teardown.Finder) teardown.Finders {
+	out := teardown.Finders{}
+	for k, v := range f {
+		out[k] = v
+	}
+	if one == nil {
+		delete(out, provider)
+	} else {
+		out[provider] = one
+	}
+	return out
+}
+
+// without drops one resource from a provider's answer, so the sweep reports
+// it as gone.
+func without(found teardown.Found, typ string) teardown.Found {
+	var out teardown.Found
+	for _, r := range found.Owned {
+		if r.Type != typ {
+			out.Owned = append(out.Owned, r)
+		}
+	}
+	out.Unowned = found.Unowned
+	return out
 }
 
 func loadFrom(t *testing.T, path string) Loaded {
@@ -425,35 +496,36 @@ func TestReconcileAppliesTheMarkerRules(t *testing.T) {
 	l := loadFrom(t, writeBackup(t, t.TempDir(), backupOpts{}))
 	base := allPresent(nil)
 
+	unowned := teardown.Found{Unowned: []state.Resource{
+		{Provider: "cloudflare", Type: "tunnel", ProviderID: "tun-x",
+			Name: "guacdeploy-" + hostname + "-" + depID},
+	}}
+
 	cases := []struct {
-		name string
-		live Live
-		err  error
-		want Disposition
-		says string
+		name  string
+		found teardown.Found
+		err   error
+		want  Disposition
+		says  string
 	}{
-		{"marker verified", Live{Present: true, ProviderID: "tun-new", Marker: Marker(depID)}, nil, Adopt, "not created again"},
-		{"gone", Live{}, nil, Recreate, "gone at the provider"},
-		{"name matches, no marker", Live{Present: true, ProviderID: "tun-x"}, nil, Review, "name alone never establishes ownership"},
-		{"someone else's marker", Live{Present: true, ProviderID: "tun-x", Marker: Marker("ffff")}, nil, Review, "name alone never establishes ownership"},
-		{"provider could not be asked", Live{}, errors.New("429 rate limited"), Review, "Nothing is recreated"},
+		{"marker verified", cloudflarePresent(), nil, Adopt, "not created again"},
+		{"gone", without(cloudflarePresent(), "tunnel"), nil, Recreate, "gone at the provider"},
+		{"name matches, no marker", unowned, nil, Review, "name alone never establishes ownership"},
+		{"provider could not be asked", teardown.Found{}, errors.New("429 rate limited"), Review, "Nothing is recreated"},
+		{"no query wired", teardown.Found{}, nil, Review, "neither recreated nor removed"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			f := Finders{}
-			for k, v := range base {
-				f[k] = v
+			one := sweeper(c.found, c.err, nil)
+			if c.name == "no query wired" {
+				one = nil
 			}
-			f["cloudflare/tunnel"] = finder(c.live, c.err, nil)
-			it := itemFor(t, Reconcile(context.Background(), l, f), "cloudflare/tunnel")
+			it := itemFor(t, Reconcile(context.Background(), l, with(base, "cloudflare", one)), "cloudflare/tunnel")
 			if it.Disposition != c.want {
 				t.Fatalf("disposition = %q, want %q (%s)", it.Disposition, c.want, it.Detail)
 			}
 			if !strings.Contains(it.Detail, c.says) {
 				t.Errorf("detail does not say %q: %s", c.says, it.Detail)
-			}
-			if c.want == Adopt && it.ProviderID != "tun-new" {
-				t.Errorf("adopted the recorded identifier %q, not the live one", it.ProviderID)
 			}
 			if c.want == Recreate && it.ProviderID != "" {
 				t.Errorf("a recreated resource kept the dead identifier %q", it.ProviderID)
@@ -462,11 +534,28 @@ func TestReconcileAppliesTheMarkerRules(t *testing.T) {
 	}
 }
 
-func TestUnwiredLookupIsReviewedNotRecreated(t *testing.T) {
+func TestRenamedResourceIsAdoptedNotRecreated(t *testing.T) {
 	l := loadFrom(t, writeBackup(t, t.TempDir(), backupOpts{}))
-	f := allPresent(nil)
-	delete(f, "entra/group")
-	it := itemFor(t, Reconcile(context.Background(), l, f), "entra/group")
+	// Same tunnel, same identifier, renamed at the provider. The marker is
+	// what proves ownership, so it must be recognised rather than recreated
+	// beside itself.
+	renamed := teardown.Found{Owned: []state.Resource{
+		{Provider: "cloudflare", Type: "tunnel", ProviderID: "tun-old",
+			Name: "guacdeploy-renamed-by-hand", Ownership: "deployment ID embedded in the tunnel name"},
+	}}
+	it := itemFor(t, Reconcile(context.Background(), l, with(allPresent(nil), "cloudflare",
+		sweeper(renamed, nil, nil))), "cloudflare/tunnel")
+	if it.Disposition != Adopt {
+		t.Fatalf("disposition = %q, want adopt; a renamed tunnel would be created twice", it.Disposition)
+	}
+	if it.ProviderID != "tun-old" {
+		t.Errorf("adopted identifier = %q", it.ProviderID)
+	}
+}
+
+func TestUnwiredProviderIsReviewedNotRecreated(t *testing.T) {
+	l := loadFrom(t, writeBackup(t, t.TempDir(), backupOpts{}))
+	it := itemFor(t, Reconcile(context.Background(), l, with(allPresent(nil), "entra", nil)), "entra/group")
 	if it.Disposition != Review {
 		t.Fatalf("disposition = %q, want review", it.Disposition)
 	}
@@ -480,8 +569,8 @@ func TestPresentResourcesAreNeverRecreated(t *testing.T) {
 	l := loadFrom(t, writeBackup(t, t.TempDir(), backupOpts{}))
 	rep := Reconcile(context.Background(), l, allPresent(&calls))
 
-	if calls != 5 {
-		t.Errorf("%d provider lookups, want one per cloud resource (5)", calls)
+	if calls != 2 {
+		t.Errorf("%d provider queries, want one marker sweep per provider (2)", calls)
 	}
 	if got := len(rep.Of(Recreate)); got != 0 {
 		t.Fatalf("%d resource(s) would be created again while still present", got)
@@ -510,13 +599,9 @@ func TestPresentResourcesAreNeverRecreated(t *testing.T) {
 	}
 }
 
-func TestChildResourcesAreNeverQueriedSeparately(t *testing.T) {
+func TestChildResourcesFollowTheirParent(t *testing.T) {
 	l := loadFrom(t, writeBackup(t, t.TempDir(), backupOpts{}))
-	f := allPresent(nil)
-	f["cloudflare/access-policy"] = finder(Live{}, errors.New("must not be called"), nil)
-	f["entra/service-principal"] = finder(Live{}, errors.New("must not be called"), nil)
-
-	rep := Reconcile(context.Background(), l, f)
+	rep := Reconcile(context.Background(), l, allPresent(nil))
 	for _, key := range []string{"cloudflare/access-policy", "entra/service-principal"} {
 		if it := itemFor(t, rep, key); it.Disposition != WithParent {
 			t.Errorf("%s disposition = %q, want with-parent", key, it.Disposition)
@@ -528,9 +613,8 @@ func TestDNSRecordFollowsTheTunnelActuallyInUse(t *testing.T) {
 	l := loadFrom(t, writeBackup(t, t.TempDir(), backupOpts{}))
 
 	t.Run("tunnel recreated, record re-pointed not duplicated", func(t *testing.T) {
-		f := allPresent(nil)
-		f["cloudflare/tunnel"] = finder(Live{}, nil, nil)
-		rep := Reconcile(context.Background(), l, f)
+		rep := Reconcile(context.Background(), l, with(allPresent(nil), "cloudflare",
+			sweeper(without(cloudflarePresent(), "tunnel"), nil, nil)))
 		it := itemFor(t, rep, "cloudflare/dns-record")
 		if it.Disposition != Adopt || !it.Retarget {
 			t.Fatalf("record disposition = %q, retarget = %v; want adopt and re-point", it.Disposition, it.Retarget)
@@ -545,6 +629,191 @@ func TestDNSRecordFollowsTheTunnelActuallyInUse(t *testing.T) {
 			t.Error("re-pointed a record at a tunnel that never changed")
 		}
 	})
+}
+
+// --- the journal's unfinished creation intents --------------------------
+
+// TestUnfinishedCloudIntentIsReconciledNotDropped is the lab failure: the
+// Entra phase created an application, its service principal and a group,
+// then failed before any of them reached the record. Only the journal knows
+// they may exist. Dropping it recreates them.
+func TestUnfinishedCloudIntentIsReconciledNotDropped(t *testing.T) {
+	l := loadFrom(t, writeBackup(t, t.TempDir(), backupOpts{rows: []metaRow{
+		{id: 1, schema: state.SchemaVersion, takenAt: "2026-09-10 01:02:03+00", st: lostHostMidEntra()}}}))
+	if got := len(l.Snapshot.State.Resources); got != 6 {
+		t.Fatalf("fixture records %d resources; it must record no Entra resource at all", got)
+	}
+
+	rep := Reconcile(context.Background(), l, allPresent(nil))
+
+	if len(rep.Obligations) != 1 || rep.Obligations[0].Intent != "entra-signin" {
+		t.Fatalf("obligations = %+v, want the unfinished entra-signin phase", rep.Obligations)
+	}
+	if !rep.Obligations[0].Answered {
+		t.Fatalf("the obligation is unanswered though Entra was asked: %s", rep.Obligations[0].Detail)
+	}
+
+	var recovered []string
+	for _, it := range rep.Items {
+		if it.Recovered {
+			if it.Disposition != Adopt {
+				t.Errorf("%s disposition = %q, want adopt", it, it.Disposition)
+			}
+			recovered = append(recovered, it.Resource.Type)
+		}
+	}
+	want := []string{"application", "service-principal", "group"}
+	if strings.Join(recovered, ",") != strings.Join(want, ",") {
+		t.Fatalf("recovered %v, want %v: a phase that failed before saving left all three", recovered, want)
+	}
+	if got := len(rep.Of(Recreate)); got != 0 {
+		t.Errorf("%d resource(s) would be created again beside the ones already in the tenant", got)
+	}
+	if err := rep.RequiresReview(); err != nil {
+		t.Fatalf("an answered obligation stops the recovery: %v", err)
+	}
+
+	st, err := Restore(l, rep, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, typ := range want {
+		var found bool
+		for _, r := range st.Resources {
+			if r.Provider == "entra" && r.Type == typ {
+				found = true
+				if r.ID == "" {
+					t.Errorf("recovered %s has no record identifier", typ)
+				}
+				if r.Ownership == "" {
+					t.Errorf("recovered %s has no ownership evidence", typ)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("recovered %s never reached the record; teardown would miss it", typ)
+		}
+	}
+
+	// The evidence is carried forward, and it is not carried forward as work
+	// that can never finish.
+	var reconciled bool
+	for _, a := range st.Actions {
+		if a.Intent == "recover:reconciled:entra-signin" {
+			reconciled = true
+			if a.FinishedAt == nil || a.Result != state.ResultOK {
+				t.Errorf("the reconciled intent is journalled unfinished: %+v", a)
+			}
+			if !strings.Contains(a.Detail, "entra") {
+				t.Errorf("the reconciled intent does not say what was found: %s", a.Detail)
+			}
+		}
+	}
+	if !reconciled {
+		t.Fatal("the unfinished entra-signin intent was dropped; the only evidence of the orphans is gone")
+	}
+	for _, a := range st.Pending() {
+		if a.Intent == "entra-signin" {
+			t.Error("the lost host's unfinished intent was carried over as pending; it could never resolve")
+		}
+	}
+}
+
+// TestUnqueryableProviderPreventsAnAllClear covers the intent that has no
+// state.Resources entry at all: nothing in the resource list would ever ask
+// about that provider, so only the journal can force the question, and an
+// unanswerable provider must stop the recovery.
+func TestUnqueryableProviderPreventsAnAllClear(t *testing.T) {
+	l := loadFrom(t, writeBackup(t, t.TempDir(), backupOpts{rows: []metaRow{
+		{id: 1, schema: state.SchemaVersion, takenAt: "2026-09-10 01:02:03+00", st: lostHostMidEntra()}}}))
+
+	for name, f := range map[string]teardown.Finders{
+		"provider errors":   with(allPresent(nil), "entra", sweeper(teardown.Found{}, errors.New("no Graph token on this host"), nil)),
+		"no query is wired": with(allPresent(nil), "entra", nil),
+	} {
+		t.Run(name, func(t *testing.T) {
+			rep := Reconcile(context.Background(), l, f)
+
+			// No Entra resource is in the record, so no item can raise the
+			// alarm. Only the journal can, which is the whole point.
+			if got := len(rep.Of(Review)); got != 0 {
+				t.Fatalf("%d review item(s); this case must be carried by the journal alone", got)
+			}
+
+			un := rep.Unanswered()
+			if len(un) != 1 || un[0].Intent != "entra-signin" {
+				t.Fatalf("unanswered = %+v, want the entra-signin phase", un)
+			}
+			if !strings.Contains(un[0].Detail, Marker(depID)) {
+				t.Errorf("the operator is not told what to look for: %s", un[0].Detail)
+			}
+
+			err := rep.RequiresReview()
+			if !errors.Is(err, ErrReviewRequired) {
+				t.Fatalf("RequiresReview = %v; an unreachable provider passed as an all-clear", err)
+			}
+			if !strings.Contains(err.Error(), "entra-signin") {
+				t.Errorf("the error does not name the unchecked intent: %v", err)
+			}
+			if got := len(rep.Of(Recreate)); got != 0 {
+				t.Errorf("%d resource(s) would be created on an unanswered question", got)
+			}
+			if _, err := Restore(l, rep, time.Now()); !errors.Is(err, ErrReviewRequired) {
+				t.Fatalf("Restore = %v, want ErrReviewRequired", err)
+			}
+		})
+	}
+}
+
+// TestPartialAnswerIsNotTreatedAsAnAnswer covers the shape
+// cloudflare.FindOwned really returns: some resources listed, then an error
+// on a later call. Half a sweep proves nothing about the half that failed,
+// so nothing is adopted from it and the recovery still stops.
+func TestPartialAnswerIsNotTreatedAsAnAnswer(t *testing.T) {
+	l := loadFrom(t, writeBackup(t, t.TempDir(), backupOpts{rows: []metaRow{
+		{id: 1, schema: state.SchemaVersion, takenAt: "2026-09-10 01:02:03+00", st: lostHostMidEntra()}}}))
+	partial := sweeper(entraOrphans(), errors.New("HTTP 503 on the second page"), nil)
+	rep := Reconcile(context.Background(), l, with(allPresent(nil), "entra", partial))
+
+	for _, it := range rep.Items {
+		if it.Recovered {
+			t.Errorf("adopted %s out of a query that failed partway", it)
+		}
+	}
+	if len(rep.Unanswered()) != 1 {
+		t.Fatalf("unanswered = %+v, want the entra-signin phase", rep.Unanswered())
+	}
+	if err := rep.RequiresReview(); !errors.Is(err, ErrReviewRequired) {
+		t.Fatalf("RequiresReview = %v, want ErrReviewRequired", err)
+	}
+}
+
+func TestNameOnlyOrphanIsNeitherAdoptedNorRecreated(t *testing.T) {
+	l := loadFrom(t, writeBackup(t, t.TempDir(), backupOpts{rows: []metaRow{
+		{id: 1, schema: state.SchemaVersion, takenAt: "2026-09-10 01:02:03+00", st: lostHostMidEntra()}}}))
+	strangers := teardown.Found{Unowned: []state.Resource{
+		{Provider: "entra", Type: "application", ProviderID: "eapp-9", Name: "Guacamole " + hostname},
+	}}
+	rep := Reconcile(context.Background(), l, with(allPresent(nil), "entra", sweeper(strangers, nil, nil)))
+
+	var seen int
+	for _, it := range rep.Items {
+		if it.Recovered {
+			seen++
+			if it.Disposition != Review {
+				t.Errorf("a name-only match was classified %q", it.Disposition)
+			}
+			if !strings.Contains(it.Detail, "name alone never establishes ownership") {
+				t.Errorf("detail = %s", it.Detail)
+			}
+		}
+	}
+	if seen != 1 {
+		t.Fatalf("%d orphans reported, want 1", seen)
+	}
+	if err := rep.RequiresReview(); !errors.Is(err, ErrReviewRequired) {
+		t.Fatalf("RequiresReview = %v; recovery would proceed onto a name something else holds", err)
+	}
 }
 
 // --- what cannot travel -------------------------------------------------
@@ -647,9 +916,9 @@ func TestRecordingsWithoutARemoteDestinationAreReportedGone(t *testing.T) {
 
 func TestRestoreKeepsIdentityAndJournalsIntent(t *testing.T) {
 	l := loadFrom(t, writeBackup(t, t.TempDir(), backupOpts{}))
-	f := allPresent(nil)
-	f["cloudflare/tunnel"] = finder(Live{}, nil, nil) // lost with the host
-	rep := Reconcile(context.Background(), l, f)
+	// The tunnel died with the host; everything else is still there.
+	rep := Reconcile(context.Background(), l, with(allPresent(nil), "cloudflare",
+		sweeper(without(cloudflarePresent(), "tunnel"), nil, nil)))
 
 	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	st, err := Restore(l, rep, now)
@@ -701,21 +970,31 @@ func TestRestoreKeepsIdentityAndJournalsIntent(t *testing.T) {
 	if st.Actions[0].Intent != "recover:restore" || st.Actions[0].Result != state.ResultOK {
 		t.Errorf("the restore itself is not journalled: %+v", st.Actions[0])
 	}
+	// The lost host's unfinished cloudflare-tunnel intent is evidence, not
+	// work: carried over answered, never as something still pending.
+	var reconciled bool
 	for _, a := range st.Actions {
-		if a.Intent == "provision:cloudflare-tunnel" {
-			t.Error("the lost host's unfinished journal was carried over; it would never resolve")
+		if a.Intent == "recover:reconciled:cloudflare-tunnel" {
+			reconciled = true
+		}
+		if a.Intent == "cloudflare-tunnel" {
+			t.Error("the lost host's unfinished intent was carried over as itself; it would never resolve")
 		}
 		if a.CorrelationID == "" {
 			t.Errorf("%s has no correlation identifier", a.Intent)
 		}
 	}
+	if !reconciled {
+		t.Error("the unfinished cloudflare-tunnel intent was dropped instead of reconciled")
+	}
 }
 
 func TestRestoreRefusesWhileAnythingNeedsReview(t *testing.T) {
 	l := loadFrom(t, writeBackup(t, t.TempDir(), backupOpts{}))
-	f := allPresent(nil)
-	f["entra/application"] = finder(Live{Present: true, ProviderID: "eapp-9"}, nil, nil)
-	rep := Reconcile(context.Background(), l, f)
+	strangers := teardown.Found{Unowned: []state.Resource{
+		{Provider: "entra", Type: "application", ProviderID: "eapp-9", Name: "Guacamole " + hostname},
+	}}
+	rep := Reconcile(context.Background(), l, with(allPresent(nil), "entra", sweeper(strangers, nil, nil)))
 
 	if err := rep.RequiresReview(); !errors.Is(err, ErrReviewRequired) {
 		t.Fatalf("RequiresReview = %v, want ErrReviewRequired", err)
