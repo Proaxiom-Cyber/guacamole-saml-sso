@@ -596,6 +596,21 @@ func Run(ctx context.Context, opts Options) error {
 		}
 
 	default:
+		// "Nothing pending" is not the same as "nothing left to do". A
+		// newer version of this tool can carry phases the deployment never
+		// ran, and refusing to run them would leave the host permanently
+		// short of work it needs -- reboot recovery, for instance. Running
+		// only the outstanding phases converges the deployment; it is not
+		// the overwrite of an existing deployment that the specification
+		// forbids, because every completed phase is left alone.
+		if outstanding := outstandingPhases(st, opts.phases()); len(outstanding) > 0 {
+			u.Say("A completed deployment exists, but this version adds work it has not run:")
+			for _, p := range outstanding {
+				u.Say("  - %s", p.Name)
+			}
+			u.Say("Completed work is left exactly as it is.")
+			return runPhases(ctx, store, st, u, &opts, opts.phases())
+		}
 		u.Say("A completed deployment already exists on this host (deployment %s, created %s).",
 			st.DeploymentID, st.CreatedAt.Format(time.RFC3339))
 		u.Say("This tool manages one deployment per host and does not overwrite it.")
@@ -630,6 +645,25 @@ func cleanup(store *state.Store, st *state.State, u *ui.UI) error {
 	}
 	u.Say("Deployment record removed. No created resources existed. Run setup again for a fresh start.")
 	return nil
+}
+
+// outstandingPhases returns registry phases with no successful journal
+// entry. Always-phases are excluded: they re-run on every session anyway,
+// so they never mean the deployment is unfinished.
+func outstandingPhases(st *state.State, phases []Phase) []Phase {
+	done := map[string]bool{}
+	for _, a := range st.Actions {
+		if a.FinishedAt != nil && a.Result == state.ResultOK {
+			done[a.Intent] = true
+		}
+	}
+	var out []Phase
+	for _, p := range phases {
+		if !done[p.Name] && !p.Always {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // runPhases executes the registry, skipping phases with a successful journal

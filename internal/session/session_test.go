@@ -187,10 +187,13 @@ func TestExistingCompleteDeploymentIsExplainedNotOverwritten(t *testing.T) {
 	dir := t.TempDir()
 	st := completeState()
 	seed(t, dir, st)
+	// A genuinely finished deployment: the only registry phase is one the
+	// state already records as done, so nothing is outstanding.
+	only := []Phase{{Name: "initialise-deployment", Run: initialiseDeployment}}
 
 	// Guided: explanation, exit clean, nothing changed.
 	u, out := testUI(true, "")
-	if err := Run(context.Background(), core(Options{StateDir: dir, UI: u, Host: fakeHost(t), CredentialMode: creds.ModeEnv, CredSpecs: []creds.Spec{}})); err != nil {
+	if err := Run(context.Background(), Options{StateDir: dir, UI: u, Phases: only}); err != nil {
 		t.Fatalf("guided on existing: %v", err)
 	}
 	if !strings.Contains(out.String(), "does not overwrite") {
@@ -203,8 +206,36 @@ func TestExistingCompleteDeploymentIsExplainedNotOverwritten(t *testing.T) {
 
 	// Unattended: nonzero with explanation, no prompt.
 	u2, _ := testUI(false, "")
-	if err := Run(context.Background(), core(Options{StateDir: dir, UI: u2, Host: fakeHost(t), CredentialMode: creds.ModeEnv, CredSpecs: []creds.Spec{}})); err == nil {
+	if err := Run(context.Background(), Options{StateDir: dir, UI: u2, Phases: only}); err == nil {
 		t.Fatal("unattended on existing deployment must fail")
+	}
+}
+
+// TestCompletedDeploymentRunsPhasesItNeverRan pins convergence. A newer
+// version can carry work an existing deployment never ran -- reboot
+// recovery is the case that bit us live -- and "nothing pending" must not
+// be mistaken for "nothing left to do". Completed phases stay untouched.
+func TestCompletedDeploymentRunsPhasesItNeverRan(t *testing.T) {
+	dir := t.TempDir()
+	seed(t, dir, completeState())
+
+	var ranOld, ranNew int
+	phases := []Phase{
+		{Name: "initialise-deployment", Run: func(context.Context, *state.State, *ui.UI) error { ranOld++; return nil }},
+		{Name: "boot-recovery", Run: func(context.Context, *state.State, *ui.UI) error { ranNew++; return nil }},
+	}
+	u, out := testUI(false, "")
+	if err := Run(context.Background(), Options{StateDir: dir, UI: u, Phases: phases}); err != nil {
+		t.Fatalf("convergence failed: %v\n%s", err, out.String())
+	}
+	if ranNew != 1 {
+		t.Fatalf("the phase the deployment never ran did not run: %d", ranNew)
+	}
+	if ranOld != 0 {
+		t.Fatalf("a completed phase was re-run: %d", ranOld)
+	}
+	if !strings.Contains(out.String(), "has not run") {
+		t.Fatalf("the operator was not told what would run:\n%s", out.String())
 	}
 }
 
