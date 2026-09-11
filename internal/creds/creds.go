@@ -1,11 +1,22 @@
-// Package creds selects and supplies deployment credentials. Values live in
-// process memory for the session only; the durable modes are hidden prompts,
-// environment input, and explicitly approved owner-only plaintext files.
-// Values never enter deployment state, logs, or command arguments.
-// Encrypted persistence across service restarts is a separate slice.
+// Package creds selects and supplies deployment credentials.
+//
+// Persistent modes: systemd-creds sealed against the TPM and the host key
+// (tpm), sealed against the host key alone (host), and explicitly approved
+// owner-only plaintext files (file). Session-only modes: hidden prompts
+// (prompt) and process environment input (env).
+//
+// Values live in process memory. They never enter deployment state, logs, or
+// command arguments: a command argument is visible in ps and in shell
+// history, so every value passed to systemd-creds or to Compose travels
+// through stdin.
+//
+// An unavailable mode is reported, never replaced. Nothing here answers "no
+// TPM on this host" by quietly writing plaintext instead. See sealed.go for
+// detection and encryption, and boot.go for reboot recovery.
 package creds
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -23,6 +34,11 @@ const (
 	ModeFile   = "file"
 )
 
+// Modes is the pre-encryption mode set, kept while the session still offers
+// only these three.
+//
+// ponytail: delete this once the session menu moves to AllModes (see
+// WIRING.md); AllModes is the complete list.
 var Modes = []string{ModePrompt, ModeEnv, ModeFile}
 
 // Spec describes one credential the deployment needs. The registry grows as
@@ -66,6 +82,10 @@ type Manager struct {
 	// UI layer in real runs.
 	ReadSecret func(prompt string) (string, error)
 
+	// Run executes systemd-creds for the encrypted modes; injectable for
+	// tests. Defaults to ExecRunner.
+	Run Runner
+
 	values map[string]string // session cache; never serialised
 }
 
@@ -87,6 +107,10 @@ func (m *Manager) Missing(specs []Spec) []string {
 		case ModeFile:
 			if _, err := os.Stat(m.path(s)); err != nil && !s.Generate {
 				out = append(out, fmt.Sprintf("%s: place the value in %s (owner-only permissions)", s.Name, m.path(s)))
+			}
+		case ModeTPM, ModeHostKey:
+			if _, err := os.Stat(m.sealPath(s)); err != nil && !s.Generate {
+				out = append(out, fmt.Sprintf("%s: no sealed credential at %s; run setup again to supply it", s.Name, m.sealPath(s)))
 			}
 		}
 	}
@@ -114,6 +138,17 @@ func (m *Manager) Get(s Spec) (string, error) {
 			return "", fmt.Errorf("credential %s is not available: %v", s.Name, err)
 		}
 		v = strings.TrimSpace(string(b))
+	case ModeTPM, ModeHostKey:
+		// Get has no context of its own: it is called from paths that
+		// predate this slice. The timeout is here so a TPM that stops
+		// answering fails the boot unit with a message instead of
+		// hanging it forever.
+		ctx, cancel := context.WithTimeout(context.Background(), unsealTimeout)
+		defer cancel()
+		var err error
+		if v, err = m.unseal(ctx, s); err != nil {
+			return "", err
+		}
 	case ModePrompt:
 		if m.ReadSecret == nil {
 			return "", ErrUnattendedPrompt
@@ -140,27 +175,11 @@ func (m *Manager) StoreFile(s Spec, value string) (createdDir bool, err error) {
 	if m.Mode != ModeFile {
 		return false, errors.New("StoreFile is only valid in file mode")
 	}
-	if _, err := os.Stat(m.Dir); os.IsNotExist(err) {
-		if err := os.MkdirAll(m.Dir, 0o700); err != nil {
-			return false, err
-		}
-		createdDir = true
+	if createdDir, err = m.ensureDir(); err != nil {
+		return false, err
 	}
 	if err := os.WriteFile(m.path(s), []byte(value+"\n"), 0o600); err != nil {
 		return createdDir, err
 	}
 	return createdDir, nil
-}
-
-// Explain describes a mode and its unattended-operation requirements.
-func Explain(mode string) string {
-	switch mode {
-	case ModePrompt:
-		return "Hidden interactive prompts. Nothing is stored on disk. Unattended operation is not possible in this mode."
-	case ModeEnv:
-		return "Values are read from GUACDEPLOY_CRED_* environment variables supplied to each invocation. Unattended operation works when the caller injects the variables; nothing is stored on disk."
-	case ModeFile:
-		return "Owner-only plaintext files under the credential directory. An approved exception for this project, never a silent fallback. Unattended operation works; protect the directory and prefer encrypted storage once available."
-	}
-	return "unknown mode"
 }
