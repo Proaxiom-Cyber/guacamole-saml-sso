@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 
 	"filippo.io/age"
@@ -86,8 +87,16 @@ func recordingsRestoreCmd(stateDir, file, out, identityFile string, u *ui.UI) er
 		return fmt.Errorf("no deployment exists in %s", stateDir)
 	}
 	dir, name := filepath.Split(file)
-	if out == "" {
+	switch fi, statErr := os.Stat(out); {
+	case out == "":
 		out = name + ".playback"
+	case statErr == nil && fi.IsDir():
+		// --out is documented as a directory to write the recovering
+		// recording into, and it is used here as the file to write. An
+		// operator who follows the help was told their directory "already
+		// exists", which is true and useless. Write inside it instead; the
+		// refusal to replace an existing file still applies to the result.
+		out = filepath.Join(out, name+".playback")
 	}
 	var id *age.X25519Identity
 	if filepath.Ext(name) == ".age" {

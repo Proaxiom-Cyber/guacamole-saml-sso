@@ -118,7 +118,7 @@ Flags for the recordings commands:
   --dest DIR               Backup destination root for recordings-run
   --connection NAME        recordings-enable: connection to record
   --file PATH              recordings-restore: backup file holding the recording
-  --out DIR                recordings-restore: where to write the recovered recording
+  --out PATH               recordings-restore: directory, or the file to write
 `
 
 func main() { os.Exit(run(os.Args[1:])) }
