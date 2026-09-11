@@ -162,6 +162,69 @@ it, and restart the stack afterwards so Guacamole reconnects:
 The database dump can contain sensitive application data, such as saved
 connection credentials. Treat plaintext backups accordingly.
 
+## Scheduled backups
+
+Setup can install a daily backup. It keeps the last seven successful
+backups. Both the schedule and the retention count are configurable.
+
+The schedule is a systemd timer, `guacdeploy-backup.timer`, and a service,
+`guacdeploy-backup.service`. The service runs `guacdeploy backup-run`.
+
+The scheduled backup does not need the binary you downloaded to install
+the deployment. Setup copies that binary to
+`/usr/local/lib/guacdeploy/guacdeploy` and the service calls the copy. You
+can delete the binary you downloaded. The backup continues to run after a
+reboot.
+
+A scheduled backup uses the backup public key only. It never needs the
+recovery passphrase.
+
+The timer is persistent. If the host is off at the scheduled time, the
+backup runs at the next start.
+
+Use these commands to examine the schedule:
+
+```
+systemctl list-timers guacdeploy-backup.timer
+systemctl status guacdeploy-backup.service
+journalctl -u guacdeploy-backup.service
+```
+
+### Retention
+
+Retention runs only after a backup is published. A failed backup deletes
+nothing. Earlier successful backups always stay.
+
+Retention counts only complete backups. It ignores a `.partial-` file from
+a failed export. For a plaintext backup it also checks the header and the
+completion marker. It never deletes a file it does not recognise as a
+backup from this tool, so other files in the destination directory are
+safe.
+
+Retention always keeps at least one backup. A retention count of zero is
+refused.
+
+### Results of the last run
+
+```
+guacdeploy backup-status
+```
+
+This shows the destination, the schedule, the retention count, the time
+and result of the last run, the published file or the reason for the
+failure, how many backups are held, and which files retention removed.
+It reads `/var/lib/guacdeploy/backup-status.json`, which contains no
+credentials.
+
+### Destinations on a mounted share
+
+Give `--dest` a directory on the share. The directory must exist.
+
+If the share is a mount point, also use `--require-mount`. The tool then
+fails when the share is not mounted. Without this option, a directory that
+exists but holds no mount accepts the backup into local storage, which
+fills the system disk and gives no warning.
+
 ## State
 
 The deployment record lives in `/var/lib/guacdeploy/`. It never contains
