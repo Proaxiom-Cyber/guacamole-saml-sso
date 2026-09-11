@@ -136,6 +136,15 @@ func TestChallengeAsksTheAuthorityNotTheLocalResolver(t *testing.T) {
 		"name_servers": []any{"ns1.example.invalid", "ns2.example.invalid"},
 	})
 
+	// Observe which servers the visibility lookup actually queries.
+	var askedServers []string
+	orig := lookupVia
+	lookupVia = func(servers []string) func(context.Context, string) ([]string, error) {
+		askedServers = servers
+		return func(context.Context, string) ([]string, error) { return nil, errors.New("unreachable") }
+	}
+	defer func() { lookupVia = orig }()
+
 	// No LookupTXT injected, so the solver must discover the authority.
 	d := &DNS01{P: f.prov(), Timeout: 10 * time.Millisecond, Interval: time.Millisecond}
 	err := d.Present(context.Background(), "token-value")
@@ -145,10 +154,10 @@ func TestChallengeAsksTheAuthorityNotTheLocalResolver(t *testing.T) {
 	if len(d.NameServers) != 2 || d.NameServers[0] != "ns1.example.invalid" {
 		t.Fatalf("the zone's authoritative nameservers were not discovered: %v", d.NameServers)
 	}
+	if len(askedServers) != 2 || askedServers[0] != "ns1.example.invalid" {
+		t.Fatalf("the visibility lookup did not query the authoritative nameservers: %v", askedServers)
+	}
 	if !strings.Contains(err.Error(), "ns1.example.invalid") {
 		t.Fatalf("the error does not name the servers that were asked: %v", err)
-	}
-	if strings.Contains(err.Error(), "could not be determined") {
-		t.Fatalf("it fell back to the host resolver despite knowing the authority: %v", err)
 	}
 }

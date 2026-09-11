@@ -178,8 +178,9 @@ func (d *DNS01) authoritativeNameServers(ctx context.Context) ([]string, error) 
 }
 
 // lookupVia asks the given nameservers directly, in order, until one
-// answers. Each is queried with the Go resolver so the dial is ours.
-func lookupVia(servers []string) func(context.Context, string) ([]string, error) {
+// answers. Each is queried with the Go resolver so the dial is ours. It is
+// a variable so a test can observe which servers were actually asked.
+var lookupVia = func(servers []string) func(context.Context, string) ([]string, error) {
 	return func(ctx context.Context, name string) ([]string, error) {
 		var lastErr error
 		for _, s := range servers {
