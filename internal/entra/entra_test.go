@@ -819,9 +819,9 @@ func TestServicePrincipalWaitsForTheApplicationToReplicate(t *testing.T) {
 
 // A genuinely wrong appId must still be reported, not retried for ever.
 func TestServicePrincipalGivesUpOnAnApplicationThatNeverAppears(t *testing.T) {
-	old := ReplicationWait
-	ReplicationWait = 10 * time.Millisecond
-	defer func() { ReplicationWait = old }()
+	old, oldPoll := ReplicationWait, replicationPoll
+	ReplicationWait, replicationPoll = 10*time.Millisecond, time.Millisecond
+	defer func() { ReplicationWait, replicationPoll = old, oldPoll }()
 
 	f := &fake{t: t, routes: map[string]func(*testing.T, *http.Request) *http.Response{
 		"GET /v1.0/applications": func(t *testing.T, r *http.Request) *http.Response {
@@ -850,7 +850,116 @@ func TestServicePrincipalGivesUpOnAnApplicationThatNeverAppears(t *testing.T) {
 	if err == nil {
 		t.Fatal("an appId that never resolves must be reported")
 	}
-	if !strings.Contains(err.Error(), "did not become usable within") {
+	if !strings.Contains(err.Error(), "still failed after waiting") {
 		t.Fatalf("the error does not explain the wait: %v", err)
+	}
+}
+
+// The second live failure, one step further on: the service principal was
+// created and read back successfully, and the very next PATCH was refused
+// with Request_ResourceNotFound. A read is answered by whichever replica has
+// the object; a write can still reach one that does not.
+func TestWritesToAFreshServicePrincipalWaitOutReplication(t *testing.T) {
+	old, oldPoll := ReplicationWait, replicationPoll
+	ReplicationWait, replicationPoll = time.Second, time.Millisecond
+	defer func() { ReplicationWait, replicationPoll = old, oldPoll }()
+
+	notFound, groups := 0, 0
+	f := &fake{t: t, routes: map[string]func(*testing.T, *http.Request) *http.Response{
+		"GET /v1.0/applications": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(200, map[string]any{"value": []any{}})
+		},
+		"GET /v1.0/groups": groupsByFilter(nil),
+		"GET /v1.0/organization": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(200, map[string]any{"value": []map[string]string{{"id": "tenant-1"}}})
+		},
+		"POST /v1.0/applications": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(201, map[string]string{"id": "obj-1", "appId": "app-1"})
+		},
+		"GET /v1.0/servicePrincipals": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(200, map[string]any{"value": []any{}})
+		},
+		"POST /v1.0/servicePrincipals": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(201, map[string]string{"id": "sp-1"})
+		},
+		// The read-back succeeds, exactly as it did in the lab.
+		"PATCH /v1.0/servicePrincipals/sp-1": func(t *testing.T, r *http.Request) *http.Response {
+			if notFound < 2 {
+				notFound++
+				return graphErr(404, "Request_ResourceNotFound",
+					"Resource 'sp-1' does not exist or one of its queried reference-property objects are not present.")
+			}
+			return jsonResp(204, map[string]any{})
+		},
+		"POST /v1.0/servicePrincipals/sp-1/addTokenSigningCertificate": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(200, map[string]any{"thumbprint": "AA11"})
+		},
+		"POST /v1.0/groups": func(t *testing.T, r *http.Request) *http.Response {
+			groups++
+			return jsonResp(201, map[string]string{"id": "grp-" + string(rune('0'+groups))})
+		},
+		"POST /v1.0/servicePrincipals/sp-1/appRoleAssignedTo": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(201, map[string]any{})
+		},
+		"GET /v1.0/servicePrincipals/sp-1/appRoleAssignedTo": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(200, map[string]any{"value": []any{}})
+		},
+	}}
+	c := newClient(f, jwt(t, map[string]any{"scp": "Application.ReadWrite.All"}))
+	cfg := Config{Hostname: "guac.example.com", DeploymentID: "dep1",
+		AdminGroup: "Guacamole Administrators", OperatorGroup: "Guacamole Operators"}
+	p, err := c.Plan(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Apply(context.Background(), p); err != nil {
+		t.Fatalf("a replication delay on a write must not fail the deployment: %v", err)
+	}
+	if notFound != 2 {
+		t.Fatalf("the test did not exercise the delay: %d refusals", notFound)
+	}
+}
+
+// A write to an object that was already there is not retried: a genuine
+// absence is reported at once rather than after the replication wait.
+func TestWritesToAnExistingServicePrincipalAreNotRetried(t *testing.T) {
+	old, oldPoll := ReplicationWait, replicationPoll
+	ReplicationWait, replicationPoll = time.Minute, time.Second
+	defer func() { ReplicationWait, replicationPoll = old, oldPoll }()
+
+	f := &fake{t: t, routes: map[string]func(*testing.T, *http.Request) *http.Response{
+		"GET /v1.0/applications": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(200, map[string]any{"value": []any{desiredApp()}})
+		},
+		"GET /v1.0/groups": groupsByFilter(nil),
+		"GET /v1.0/organization": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(200, map[string]any{"value": []map[string]string{{"id": "tenant-1"}}})
+		},
+		"GET /v1.0/servicePrincipals": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(200, map[string]any{"value": []any{map[string]any{"id": "sp-1"}}})
+		},
+		"PATCH /v1.0/servicePrincipals/sp-1": func(t *testing.T, r *http.Request) *http.Response {
+			return graphErr(404, "Request_ResourceNotFound", "Resource 'sp-1' does not exist.")
+		},
+	}}
+	c := newClient(f, jwt(t, map[string]any{"scp": "Application.ReadWrite.All"}))
+	cfg := Config{Hostname: "guac.example.com", DeploymentID: "dep1",
+		AdminGroup: "Guacamole Administrators", OperatorGroup: "Guacamole Operators"}
+	p, err := c.Plan(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := c.Apply(context.Background(), p); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a service principal that is genuinely gone must be reported")
+		}
+		if strings.Contains(err.Error(), "still failed after waiting") {
+			t.Fatalf("a pre-existing object was retried through the replication wait: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the call was retried instead of failing at once")
 	}
 }

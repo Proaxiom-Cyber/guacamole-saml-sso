@@ -545,8 +545,15 @@ func (c *Client) Apply(ctx context.Context, plan *Plan) (*Result, error) {
 		// Only the assigned groups may sign in.
 		spPatch["appRoleAssignmentRequired"] = true
 	}
+	// A service principal this run created may still be replicating, so its
+	// writes retry; one that was already there is written to directly, and a
+	// genuine absence is reported at once.
+	write := c.call
+	if res.App.CreatedSP {
+		write = c.callFresh
+	}
 	if len(spPatch) > 0 {
-		if _, err := c.call(ctx, http.MethodPatch, "/servicePrincipals/"+sp.ObjectID, spPatch); err != nil {
+		if _, err := write(ctx, http.MethodPatch, "/servicePrincipals/"+sp.ObjectID, spPatch); err != nil {
 			return nil, err
 		}
 	}
@@ -554,7 +561,7 @@ func (c *Client) Apply(ctx context.Context, plan *Plan) (*Result, error) {
 	// Token signing certificate: Entra signs SAML responses with it, and
 	// the federation metadata is not usable without one.
 	if sp.SigningKeyThumbprint == "" {
-		out, err := c.call(ctx, http.MethodPost, "/servicePrincipals/"+sp.ObjectID+"/addTokenSigningCertificate",
+		out, err := write(ctx, http.MethodPost, "/servicePrincipals/"+sp.ObjectID+"/addTokenSigningCertificate",
 			map[string]any{"displayName": "CN=" + cfg.Hostname})
 		if err != nil {
 			return nil, err
@@ -565,7 +572,7 @@ func (c *Client) Apply(ctx context.Context, plan *Plan) (*Result, error) {
 		if err := json.Unmarshal(out, &cert); err != nil || cert.Thumbprint == "" {
 			return nil, fmt.Errorf("token signing certificate was created but returned no thumbprint")
 		}
-		if _, err := c.call(ctx, http.MethodPatch, "/servicePrincipals/"+sp.ObjectID,
+		if _, err := write(ctx, http.MethodPatch, "/servicePrincipals/"+sp.ObjectID,
 			map[string]any{"preferredTokenSigningKeyThumbprint": cert.Thumbprint}); err != nil {
 			return nil, err
 		}
@@ -613,7 +620,9 @@ func (c *Client) Apply(ctx context.Context, plan *Plan) (*Result, error) {
 			}
 		}
 		if !assigned[ag.ObjectID] {
-			if _, err := c.call(ctx, http.MethodPost, "/servicePrincipals/"+sp.ObjectID+"/appRoleAssignedTo",
+			// The group may have been created moments ago, so this
+			// reference retries whether or not the service principal is new.
+			if _, err := c.callFresh(ctx, http.MethodPost, "/servicePrincipals/"+sp.ObjectID+"/appRoleAssignedTo",
 				map[string]any{"principalId": ag.ObjectID, "resourceId": sp.ObjectID, "appRoleId": sp.AppRoleID}); err != nil {
 				return nil, err
 			}
@@ -732,19 +741,54 @@ func (c *Client) CleanupGroup(ctx context.Context, cfg Config, groupObjectID str
 	return err
 }
 
-// appNotYetReplicated reports whether Graph refused a write because the
-// application this appId names has not replicated yet. The message is the
-// only thing that distinguishes it: Entra returns the generic
-// Request_BadRequest code for a genuinely wrong appId and for one that is
-// merely too new, so the code alone cannot be used, and a real typo would
-// exhaust the wait and then be reported.
-func appNotYetReplicated(err error) bool {
+// notYetReplicated reports whether Graph refused a write because an object
+// this deployment has just created has not replicated yet. Entra shows the
+// same delay in three different ways: the object itself is not found, an
+// appId does not resolve to an application, or a reference to it is not a
+// valid reference update. The first two carry generic codes that a genuinely
+// wrong identifier also carries, so the caller bounds the retry and reports
+// the error when the wait runs out.
+func notYetReplicated(err error) bool {
 	var ge *GraphError
 	if !errors.As(err, &ge) {
 		return false
 	}
-	return ge.Code == "Request_BadRequest" &&
-		strings.Contains(ge.Message, "does not reference a valid application object")
+	switch {
+	case ge.Code == "Request_ResourceNotFound":
+		return true
+	case strings.Contains(ge.Message, "does not reference a valid application object"):
+		return true
+	case strings.Contains(ge.Message, "Not a valid reference update"):
+		return true
+	}
+	return false
+}
+
+// callFresh is call for a write against an object this run has just created.
+//
+// Reading an object back is not proof that a write to it will land: a GET can
+// be answered by a replica that has the object while the write reaches one
+// that does not. A live run created a service principal, read it back
+// successfully, and then had the very next PATCH refused with
+// Request_ResourceNotFound. Retrying is safe for these refusals because they
+// changed nothing.
+func (c *Client) callFresh(ctx context.Context, method, path string, body any) (json.RawMessage, error) {
+	deadline := time.Now().Add(ReplicationWait)
+	for {
+		out, err := c.call(ctx, method, path, body)
+		if err == nil || !notYetReplicated(err) {
+			return out, err
+		}
+		if !time.Now().Before(deadline) {
+			return nil, fmt.Errorf("%s %s still failed after waiting %s for the directory to replicate what this deployment created: %w",
+				method, path, ReplicationWait, err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(replicationPoll):
+		}
+	}
 }
 
 // createSP creates the service principal for a freshly created application,
@@ -757,26 +801,8 @@ func appNotYetReplicated(err error) bool {
 // Retrying is safe for exactly this error because it is a rejection: Graph
 // created nothing, so there is no duplicate to make.
 func (c *Client) createSP(ctx context.Context, appID, marker string) (json.RawMessage, error) {
-	deadline := time.Now().Add(ReplicationWait)
-	for {
-		out, err := c.call(ctx, http.MethodPost, "/servicePrincipals", map[string]any{
-			"appId": appID,
-			"tags":  []string{spTagSSO, marker},
-		})
-		if err == nil {
-			return out, nil
-		}
-		if !appNotYetReplicated(err) {
-			return nil, err
-		}
-		if !time.Now().Before(deadline) {
-			return nil, fmt.Errorf("the application was created but its appId did not become usable within %s, so the directory has not replicated it: %w",
-				ReplicationWait, err)
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(replicationPoll):
-		}
-	}
+	return c.callFresh(ctx, http.MethodPost, "/servicePrincipals", map[string]any{
+		"appId": appID,
+		"tags":  []string{spTagSSO, marker},
+	})
 }
