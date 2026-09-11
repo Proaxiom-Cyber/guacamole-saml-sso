@@ -20,6 +20,8 @@ launcher verifies and which network destinations it uses.
 | `guacdeploy setup --non-interactive --resume` | Unattended consent to continue interrupted work |
 | `guacdeploy setup --non-interactive --install-dependencies` | Unattended consent to install missing dependencies |
 | `guacdeploy status` | Show the deployment record without changing anything |
+| `guacdeploy backup-key` | Generate the backup key pair and write the encrypted private-key export |
+| `guacdeploy backup-key --verify` | Prove the export decrypts and matches the recorded public key |
 | `guacdeploy version` | Print the tool version |
 
 ## Exit codes
@@ -77,6 +79,28 @@ what to supply when one is missing. Credential values never appear in
 deployment state, logs, or command arguments. Files written by the tool
 are recorded as material owned by this deployment, so teardown can offer
 their removal; files you placed yourself are pre-existing and stay.
+
+## Backup recovery key
+
+Backups are encrypted with a key pair. `guacdeploy backup-key` generates
+the pair in memory on the server. Only the public key is stored, in the
+deployment record; scheduled backups need nothing else. The private key is
+written once, as a passphrase-encrypted export with owner-only permissions:
+`/var/lib/guacdeploy/recovery/backup-key.age`.
+
+The command is guided only. It asks for the passphrase twice with hidden
+input and rejects an empty one. Unattended runs stop with exit code 3. A
+deployment record must exist first.
+
+Copy the export to a workstation with the shown `scp` command and store it
+away from the VM. Recovery needs both the file and the passphrase; keep
+them in separate places. The tool never deletes the export; remove it from
+the VM yourself once your copy is confirmed. The shown instructions do not
+prove that a copy was made.
+
+Run `guacdeploy backup-key --verify` to prove recovery: it decrypts the
+export with your passphrase and checks that the result matches the
+recorded public key.
 
 ## State
 
