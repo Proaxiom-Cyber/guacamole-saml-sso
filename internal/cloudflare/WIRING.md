@@ -121,10 +121,11 @@ only marker-owned records are ever eligible.
 
 | Condition | Meaning | Guided | Unattended |
 |---|---|---|---|
-| `ErrRequiresReview` | name-only tunnel match, or an Access application whose marker and hostname disagree | show and ask | nonzero exit |
+| `ErrRequiresReview` | name-only tunnel match, an Access application whose marker and hostname disagree, or a second policy found on our own Access application | show and ask | nonzero exit |
 | `ErrPreExisting` | foreign DNS record at hostname, or a foreign Access application covering it | show and ask | nonzero exit |
 | `ErrNotOwned` | delete target lacks marker | report, keep resource | same |
 | `ErrNoAllowList` | nobody was named in the Access allow-list | ask for groups or emails | nonzero exit |
+| `ErrAllowsEveryone` | the **stored** Access policy admits everyone | stop; never report as verified | nonzero exit |
 | `*APIError` 403 on Apply | missing Edit scope | name the scope, stop | same |
 
 # Phase 4: cloudflare-access (issue #8)
@@ -200,7 +201,13 @@ if idp, found := cloudflare.FindEntraIdP(idps, st.Config["entra-tenant-id"]); fo
 
 plan, err := p.PlanAccess(allow)         // contacts nothing; journal it first
 app, pol, err := p.ApplyAccess(ctx, plan)
-v, err := p.VerifyAccess(ctx, app.ID)    // configuration AND live enforcement
+
+// Verification compares what Cloudflare stored with what this deployment applied,
+// so it needs the same allow-list and the tenant its groups live in.
+v, err := p.VerifyAccess(ctx, app.ID, cloudflare.AccessExpectation{
+        Allow:         allow,
+        EntraTenantID: st.Config["entra-tenant-id"],
+})
 ```
 
 **Stack gap the parent must close:** issue #6's `entra-signin` phase records the group
@@ -269,24 +276,60 @@ st.EnsureResource(state.Resource{Provider: "cloudflare", Type: "access-app",
 Store `Config["cloudflare-access-app-id"] = app.ID`. Record the policy as **evidence
 on that resource** (`pol.ID`, `pol.Name`, `len(pol.Include)`), not as a resource of its
 own: it is scoped to the application and has no independent lifecycle. Also journal the
-verification evidence from `VerifyAccess` — `AppID`, `Domain`, `PolicyID`,
-`AllowRules`, `AuthDomain`, `Challenge`. None of it is secret.
+verification evidence from `VerifyAccess` — `AppID`, `Domain`, `AUD`, `PolicyID`,
+`AllowRules`, `IdPID`, `AuthDomain`, `Challenge`, the four `*Verified` booleans, and
+`v.String()`. None of it is secret.
 
 ## Verification
 
-`VerifyAccess` re-reads the application and its policies (marker, domain, an allow
-policy with a non-empty allow-list), then makes **one unauthenticated request to
-`https://<hostname>/`** through the same injectable HTTP seam, not following
-redirects. A protected hostname answers with a redirect to the account's team domain;
-a page from the origin means the request got past Access, and is a failure.
+**Change the parent must wire.** `VerifyAccess` now takes the expectation shown in the
+phase flow above:
+
+```go
+v, err := p.VerifyAccess(ctx, app.ID, cloudflare.AccessExpectation{
+        Allow:         allow,                          // the same Allow given to PlanAccess
+        EntraTenantID: st.Config["entra-tenant-id"],    // required when Allow.Groups is set
+})
+```
+
+The argument is variadic only so that an unwired caller still compiles. Without it the
+stored allow-list is never compared with the applied one, `v.PolicyMatchesAllowList`
+and `v.IdPBoundToTenant` stay false, and `v.String()` says so. Pass it.
+
+`VerifyAccess` proves four separate things, and `AccessVerification` keeps them
+separate so evidence for one is never read as evidence for another:
+
+| Field | What it means |
+|---|---|
+| `AppVerified` | the application read back carries this deployment's marker, still covers the hostname, and has an audience tag (`AUD`) |
+| `PolicyMatchesAllowList` | the application has **exactly one** policy, it is this deployment's, it decides `allow`, and its stored include rules are exactly the rules that were applied |
+| `IdPBoundToTenant` | the identity provider those group rules name is the account's `azureAD` provider for `Config["entra-tenant-id"]`, read back from the API. False for the email fallback, which has no binding |
+| `ChallengeVerified` | an anonymous request was redirected to **this application's own** Access login |
+
+The challenge check is exact, not a suffix match. The redirect must go to the team
+domain from the organization read, to the path `/cdn-cgi/access/login/<hostname>`, with
+`kid` equal to the application's own AUD, and its `meta` JWT must describe this
+hostname, this audience and `auth_status` `NONE`. The meta token's **signature is not
+verified and cannot be** — the probe is anonymous — so it is read as a description of
+the redirect and never as identity. A redirect to another Access application, which a
+bare `.cloudflareaccess.com` suffix match accepted, now fails.
 
 The probe sends no `Authorization` header — it must look exactly like an anonymous
-visitor's request. It works before the origin certificate exists (issue #9), because
-Access challenges the request before it is ever routed to the origin.
+visitor's request. It keeps honouring a configured proxy and full TLS verification, and
+still resolves through the zone's authoritative nameservers when the host's own
+resolver cannot see the zone. It works before the origin certificate exists (issue #9),
+because Access challenges the request before it is ever routed to the origin.
+
+**None of this is a sign-in.** A reachable login page proves configuration and
+enforcement, not that an allowed operator can get in or that a denied one cannot.
+`v.String()` ends with `cloudflare.SignInNotProven`, and the phase output must not
+claim more than that — say `u.Say("%s", v.String())` rather than composing a sentence
+of the parent's own. Demonstrating an allowed and a denied user login is a separate,
+manual acceptance step.
 
 A transport failure ("could not reach ...") is a timing problem — DNS or the tunnel is
 not up yet — and re-running the phase is the fix. "answered HTTP 200 with no Access
-challenge" is a security failure and must stop the run.
+challenge" is a security failure and must stop the run. So is `ErrAllowsEveryone`.
 
 ## Teardown
 
