@@ -9,14 +9,15 @@ import (
 	"time"
 )
 
-// Options configures one recording run: back up the completed recordings
-// to the selected destination.
+// Options configures one recording run: back up the completed recordings,
+// then delete the oldest ones while local usage is over budget.
 type Options struct {
 	Dir          string // local recordings directory, <install-dir>/recordings
 	Dest         string // backup destination root; "" backs nothing up
 	StateDir     string // where the last-run record is written
 	DeploymentID string
-	Plaintext    bool // explicit choice; encryption is the default
+	Budget       int64 // bytes; 0 means no local cleanup
+	Plaintext    bool  // explicit choice; encryption is the default
 	PublicKey    string
 
 	// Open decides which recordings are still being written. nil means
@@ -49,6 +50,7 @@ type Report struct {
 	Result     string    `json:"result"` // "ok" or "failed"
 	Dir        string    `json:"dir"`
 	Dest       string    `json:"dest,omitempty"`
+	Budget     int64     `json:"budget"`
 	UsedBefore int64     `json:"used_before"`
 	UsedAfter  int64     `json:"used_after"`
 
@@ -64,17 +66,32 @@ type Report struct {
 	// for these.
 	Failed []Failure `json:"failed,omitempty"`
 
+	// Deleted is every recording cleanup removed to stay within budget.
+	Deleted []string `json:"deleted,omitempty"`
+	// Lost is the subset of Deleted that had no confirmed remote copy.
+	// Deleting those can permanently lose a recording.
+	Lost []string `json:"lost,omitempty"`
+
 	Error      string `json:"error,omitempty"`
 	OnCalendar string `json:"on_calendar,omitempty"`
 }
 
-// Run is the whole run: scan once, then back up every completed recording
-// the destination does not already hold.
+// Run is the whole scheduled run, and the order is the coordination rule:
+// scan once, back up, then clean up.
 //
-// Scanning once, before anything is copied, is what keeps an active
-// recording active for the whole run.
+// Scanning once is what stops cleanup deleting a recording whose upload is
+// in flight: both steps work from the same list, in one process, one after
+// the other, so an active recording is active for both and a recording is
+// never deleted while its own copy is being written. The systemd service is
+// Type=oneshot, so a second run cannot start while this one is going.
+//
+// A failed backup does not stop cleanup. The budget takes priority over
+// preserving unbacked recordings (specification, "Local recording
+// retention"), so a recording whose upload failed is still deleted when the
+// directory is over budget — and reported in Lost, because that deletion can
+// permanently lose it.
 func Run(o Options) (Report, error) {
-	rep := Report{Ran: o.now().UTC(), Result: "ok", Dir: o.Dir, Dest: o.Dest}
+	rep := Report{Ran: o.now().UTC(), Result: "ok", Dir: o.Dir, Dest: o.Dest, Budget: o.Budget}
 	if o.DeploymentID == "" {
 		return rep, fmt.Errorf("a recording run needs the deployment ID to know which copies are its own")
 	}
@@ -91,10 +108,17 @@ func Run(o Options) (Report, error) {
 	}
 	rep.UsedAfter = rep.UsedBefore
 
+	backedUp := map[string]bool{}
+	var backupErr error
 	if o.Dest != "" {
-		if _, err := o.backUp(recs, &rep); err != nil {
-			return o.fail(rep, err)
-		}
+		backedUp, backupErr = o.backUp(recs, &rep)
+	}
+
+	if err := o.cleanUp(recs, backedUp, &rep); err != nil {
+		return o.fail(rep, err)
+	}
+	if backupErr != nil {
+		return o.fail(rep, backupErr)
 	}
 	if err := WriteReport(o.StateDir, rep); err != nil {
 		return rep, err
@@ -225,7 +249,11 @@ func (r Report) Summary() string {
 	} else {
 		fmt.Fprintf(&b, "Recording backups:    not configured\n")
 	}
-	fmt.Fprintf(&b, "Local usage:          %d bytes\n", r.UsedAfter)
+	if r.Budget > 0 {
+		fmt.Fprintf(&b, "Storage budget:       %s (in use: %s)\n", FormatBytes(r.Budget), FormatBytes(r.UsedAfter))
+	} else {
+		fmt.Fprintf(&b, "Storage budget:       not configured; nothing is deleted\n")
+	}
 	if r.OnCalendar != "" {
 		fmt.Fprintf(&b, "Schedule:             %s\n", r.OnCalendar)
 	}
@@ -235,9 +263,14 @@ func (r Report) Summary() string {
 	for _, f := range r.Failed {
 		fmt.Fprintf(&b, "Copy failed:          %s: %s\n", f.Name, strings.TrimSpace(f.Reason))
 	}
+	fmt.Fprintf(&b, "Deleted for budget:   %d\n", len(r.Deleted))
+	for _, n := range r.Lost {
+		fmt.Fprintf(&b, "LOST:                 %s was deleted to stay within the storage budget and has no confirmed backup copy; it cannot be recovered\n", n)
+	}
 	if r.Error != "" {
 		fmt.Fprintf(&b, "Reason:               %s\n", strings.TrimSpace(r.Error))
 	}
+	b.WriteString("Scheduled cleanup is not a hard filesystem quota: active recordings are never\ndeleted, and usage can exceed the budget between runs.\n")
 	return b.String()
 }
 

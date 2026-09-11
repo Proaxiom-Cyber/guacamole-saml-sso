@@ -13,13 +13,15 @@ import (
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/ui"
 )
 
-// recordingsRunCmd backs up the completed recordings and records the
-// outcome.
+// recordingsRunCmd is what the installed timer calls: back up the completed
+// recordings, then delete the oldest completed ones while local usage is
+// over budget, then record the outcome.
 //
 // It reads the deployment record without taking the mutation lock. It only
 // reads, and the nightly database backup holds that lock for its whole run;
-// competing for it would make one of the two runs fail for no reason.
-func recordingsRunCmd(stateDir, recordingsDir, dest string, plaintext bool, u *ui.UI) error {
+// competing for it would make one of the two timers fail for no reason. Two
+// recording runs cannot overlap because the service is Type=oneshot.
+func recordingsRunCmd(stateDir, recordingsDir, dest string, budget int64, plaintext bool, u *ui.UI) error {
 	st, err := state.Read(stateDir)
 	if err != nil {
 		return err
@@ -32,8 +34,8 @@ func recordingsRunCmd(stateDir, recordingsDir, dest string, plaintext bool, u *u
 	}
 	rep, err := recording.Run(recording.Options{
 		Dir: recordingsDir, Dest: dest, StateDir: stateDir,
-		DeploymentID: st.DeploymentID,
-		Plaintext:    plaintext, PublicKey: st.Config[backupPublicKeyConfig],
+		DeploymentID: st.DeploymentID, Budget: budget,
+		Plaintext: plaintext, PublicKey: st.Config[backupPublicKeyConfig],
 	})
 	u.Say("%s", rep.Summary())
 	return err
