@@ -7,3 +7,4 @@ data/
 data.failed-*/
 .DS_Store
 __pycache__/
+.scratch/

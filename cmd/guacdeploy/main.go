@@ -1,0 +1,114 @@
+// Command guacdeploy is the single entry point for the Guacamole deployment
+// lifecycle: guided setup, unattended setup, status, and (in later slices)
+// teardown, backup, and restore.
+//
+// Exit codes: 0 success, 1 failure, 2 usage, 3 interactive approval
+// required, 130 cancelled by the user.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
+	"time"
+
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/session"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/ui"
+)
+
+var version = "dev" // set with -ldflags "-X main.version=..."
+
+const usage = `Usage: guacdeploy [command] [flags]
+
+Commands:
+  setup    Start or resume the deployment (default)
+  status   Show the deployment record
+  version  Print the tool version
+
+Flags for setup:
+  --non-interactive   Never prompt; exit 3 where approval is required
+  --resume            Non-interactive only: consent to continue interrupted work
+  --state-dir DIR     Override the state directory (default ` + "/var/lib/guacdeploy" + `)
+`
+
+func main() { os.Exit(run(os.Args[1:])) }
+
+func run(args []string) int {
+	cmd := "setup"
+	if len(args) > 0 && args[0][0] != '-' {
+		cmd, args = args[0], args[1:]
+	}
+
+	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
+	nonInteractive := fs.Bool("non-interactive", false, "never prompt")
+	resume := fs.Bool("resume", false, "non-interactive: continue interrupted work")
+	stateDir := fs.String("state-dir", state.DefaultDir(), "state directory")
+	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	u := ui.New(!*nonInteractive)
+	defer u.RestoreTerminal()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sig // fires only on a real signal; leaks harmlessly on normal exit
+		cancel()
+		u.RestoreTerminal()
+		fmt.Fprintln(os.Stderr, "\nCancelled. Completed work is saved; run guacdeploy again to resume or clean up.")
+		os.Exit(130)
+	}()
+
+	var err error
+	switch cmd {
+	case "setup":
+		opts := session.Options{StateDir: *stateDir, UI: u, Resume: *resume}
+		if s := os.Getenv("GUACDEPLOY_TEST_SLEEP_PHASE"); s != "" {
+			// Test hook: append a slow phase so interruption behaviour can
+			// be exercised end to end. No effect unless the variable is set.
+			secs, _ := strconv.Atoi(s)
+			opts.Phases = append(append([]session.Phase{}, session.SetupPhases...), session.Phase{
+				Name: "test-sleep",
+				Run: func(ctx context.Context, _ *state.State, _ *ui.UI) error {
+					select {
+					case <-time.After(time.Duration(secs) * time.Second):
+						return nil
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				},
+			})
+		}
+		err = session.Run(ctx, opts)
+	case "status":
+		err = session.Status(*stateDir, u)
+	case "version":
+		u.Say("guacdeploy %s", version)
+	default:
+		fmt.Fprint(os.Stderr, usage)
+		return 2
+	}
+
+	switch {
+	case err == nil:
+		return 0
+	case errors.Is(err, session.ErrApprovalRequired), errors.Is(err, ui.ErrInputRequired):
+		fmt.Fprintf(os.Stderr, "guacdeploy: %v\n", err)
+		return 3
+	case errors.Is(err, context.Canceled):
+		return 130
+	default:
+		fmt.Fprintf(os.Stderr, "guacdeploy: %v\n", err)
+		return 1
+	}
+}
