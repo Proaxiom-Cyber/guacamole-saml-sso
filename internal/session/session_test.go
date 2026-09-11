@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/cloudflare"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/creds"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/entra"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/host"
@@ -951,5 +952,35 @@ func TestRecordingBudgetIsAnExplicitChoice(t *testing.T) {
 	u2, _ := testUI(false, "")
 	if err := bad.recordingSchedule(context.Background(), &state.State{DeploymentID: "d"}, u2); err == nil {
 		t.Fatal("a malformed budget must be rejected")
+	}
+}
+
+// TestCloudflareConditionsMapToTheSessionContract guards the distinction
+// automation depends on: "a person must decide" must surface as the
+// approval-required sentinel (exit 3), not as a generic failure (exit 1),
+// while a condition that needs a human to inspect the account is a plain
+// failure. Getting this wrong makes an unattended caller retry forever or
+// give up on something a person could approve in seconds.
+func TestCloudflareConditionsMapToTheSessionContract(t *testing.T) {
+	preExisting := cloudflareErr(fmt.Errorf("record already there: %w", cloudflare.ErrPreExisting), "DNS record")
+	if !errors.Is(preExisting, ErrApprovalRequired) {
+		t.Fatalf("a pre-existing resource must ask for approval, got %v", preExisting)
+	}
+	if !strings.Contains(preExisting.Error(), "never overwritten") {
+		t.Fatalf("the message does not say the resource is preserved: %v", preExisting)
+	}
+
+	review := cloudflareErr(fmt.Errorf("two matches: %w", cloudflare.ErrRequiresReview), "tunnel")
+	if errors.Is(review, ErrApprovalRequired) {
+		t.Fatal("a review condition must not be presented as a simple approval")
+	}
+	if !strings.Contains(review.Error(), "before anything is created") {
+		t.Fatalf("the message does not say nothing was created: %v", review)
+	}
+
+	// An ordinary API failure passes through unchanged.
+	plain := errors.New("500 from the API")
+	if got := cloudflareErr(plain, "tunnel"); got != plain {
+		t.Fatalf("an ordinary error was rewritten: %v", got)
 	}
 }
