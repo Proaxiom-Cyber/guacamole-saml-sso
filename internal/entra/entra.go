@@ -198,7 +198,6 @@ var RequiredPermissions = []string{
 	"Application.ReadWrite.All",       // create and configure the application and service principal
 	"Group.ReadWrite.All",             // create the administrator and operator groups
 	"AppRoleAssignment.ReadWrite.All", // assign the groups to the application
-	"Organization.Read.All",           // read the tenant ID for the metadata URL
 }
 
 // Preflight is the result of CheckPermissions. Read and mutation checks are
@@ -260,6 +259,29 @@ func (c *Client) CheckPermissions(ctx context.Context) (Preflight, error) {
 	p.MutationDetail = "token claims grant " + strings.Join(RequiredPermissions, ", ") +
 		" (advisory: claims cannot prove Conditional Access or directory-role limits)"
 	return p, nil
+}
+
+// tokenTenantID returns the `tid` claim: the tenant the token was issued
+// for. Reading it here means the tool does not need Organization.Read.All
+// merely to learn its own tenant, which is a permission an operator would
+// otherwise have to grant for nothing. Only the tenant ID, a non-secret
+// identifier, leaves this function.
+func tokenTenantID(tok string) (string, bool) {
+	parts := strings.Split(tok, ".")
+	if len(parts) != 3 {
+		return "", false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+	if err != nil {
+		return "", false
+	}
+	var claims struct {
+		TID string `json:"tid"`
+	}
+	if json.Unmarshal(payload, &claims) != nil || claims.TID == "" {
+		return "", false
+	}
+	return claims.TID, true
 }
 
 // tokenPermissions decodes the JWT payload and returns the union of `scp`

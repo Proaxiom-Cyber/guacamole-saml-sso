@@ -661,3 +661,27 @@ func TestTokenNeverInErrorsOrDetails(t *testing.T) {
 		}
 	}
 }
+
+// TestTenantIDComesFromTheTokenClaim keeps the tool from demanding a
+// permission it does not need. The tenant ID is in the token's own `tid`
+// claim, so reading it there means an operator never has to grant
+// Organization.Read.All just to let the tool learn its own tenant.
+func TestTenantIDComesFromTheTokenClaim(t *testing.T) {
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"tid":"3e1d3820-e8e4-467c-b404-8e9fe76e0d92","roles":["Application.ReadWrite.All"]}`))
+	tok := "header." + payload + ".signature"
+
+	got, ok := tokenTenantID(tok)
+	if !ok || got != "3e1d3820-e8e4-467c-b404-8e9fe76e0d92" {
+		t.Fatalf("tokenTenantID = %q, %v", got, ok)
+	}
+	// An opaque token has no claim to read; the caller falls back.
+	if _, ok := tokenTenantID("opaque-token"); ok {
+		t.Fatal("an opaque token must not yield a tenant ID")
+	}
+	// The permission that only existed for this lookup is no longer demanded.
+	for _, p := range RequiredPermissions {
+		if p == "Organization.Read.All" {
+			t.Fatal("Organization.Read.All is still required even though the tenant ID comes from the token")
+		}
+	}
+}

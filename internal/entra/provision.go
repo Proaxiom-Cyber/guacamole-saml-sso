@@ -422,19 +422,30 @@ func (c *Client) Apply(ctx context.Context, plan *Plan) (*Result, error) {
 	marker := Marker(cfg.DeploymentID)
 	res := &Result{}
 
-	out, err := c.call(ctx, http.MethodGet, "/organization?%24select=id", nil)
-	if err != nil {
-		return nil, err
+	// The tenant ID is in the token's own `tid` claim, so the ordinary
+	// path needs no directory read at all. /organization is the fallback
+	// for a token this tool cannot inspect, and it is the only reason
+	// Organization.Read.All would ever be required.
+	if tok, err := c.Token(ctx); err == nil {
+		if tid, ok := tokenTenantID(tok); ok {
+			res.TenantID = tid
+		}
 	}
-	var org struct {
-		Value []struct {
-			ID string `json:"id"`
-		} `json:"value"`
+	if res.TenantID == "" {
+		out, err := c.call(ctx, http.MethodGet, "/organization?%24select=id", nil)
+		if err != nil {
+			return nil, fmt.Errorf("could not read the tenant ID: the token carries no tid claim and reading /organization failed (that fallback needs Organization.Read.All): %w", err)
+		}
+		var org struct {
+			Value []struct {
+				ID string `json:"id"`
+			} `json:"value"`
+		}
+		if json.Unmarshal(out, &org) != nil || len(org.Value) == 0 {
+			return nil, fmt.Errorf("could not read the tenant ID from /organization")
+		}
+		res.TenantID = org.Value[0].ID
 	}
-	if err := json.Unmarshal(out, &org); err != nil || len(org.Value) == 0 {
-		return nil, fmt.Errorf("could not read the tenant ID from /organization")
-	}
-	res.TenantID = org.Value[0].ID
 
 	// Application. The marker travels in the creation body itself, so a
 	// lost response still leaves a marked application to reconcile against.
@@ -482,6 +493,7 @@ func (c *Client) Apply(ctx context.Context, plan *Plan) (*Result, error) {
 	// Service principal. Its appId links it to the marked application, so
 	// it needs no marker of its own; query-first keeps re-runs from
 	// creating a duplicate.
+	var err error
 	sp := plan.SP
 	if sp == nil {
 		sp, err = c.lookupSP(ctx, res.App.AppID)
