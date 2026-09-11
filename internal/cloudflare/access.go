@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/http"
 	"net/url"
 	"strings"
 )
@@ -476,130 +475,6 @@ func (p *Provisioner) applyAccessPolicy(ctx context.Context, appID string, plan 
 		return AccessPolicy{}, err
 	}
 	return created, nil
-}
-
-// AccessVerification is proof the hostname is protected, for the caller to
-// journal. It holds no secrets.
-type AccessVerification struct {
-	AppID      string
-	Domain     string // the domain read back from the API
-	PolicyID   string
-	AllowRules int    // how many include rules the stored allow-list has
-	AuthDomain string // the team domain the challenge pointed at
-	Challenge  string // the observed response, e.g. "HTTP 302 to example.cloudflareaccess.com"
-}
-
-// VerifyAccess proves the application is configured and actually enforcing.
-// It re-reads the application and its policies, and then makes one
-// unauthenticated request to https://<hostname>/ through the same injectable
-// HTTP seam. A protected hostname answers with a redirect to the account's
-// team domain; anything else — including a page from the origin — is a
-// failure, because it means the request reached past Access.
-//
-// No Authorization header is sent on the hostname request: it must look
-// exactly like an anonymous visitor's, and the API token has no business
-// leaving the API endpoint.
-//
-// This check works before the origin certificate exists (issue #9): Access
-// challenges the request before it is ever routed to the origin.
-func (p *Provisioner) VerifyAccess(ctx context.Context, appID string) (AccessVerification, error) {
-	var v AccessVerification
-	// Learn the zone's authority now rather than relying on an earlier
-	// phase having recorded it: a resumed run skips the phase that
-	// selected the zone, and the probe would then have no way to resolve a
-	// hostname this host's resolver cannot see.
-	p.ensureAuthority(ctx)
-	var app accessAppRecord
-	if err := p.Client.do(ctx, "GET", "/accounts/"+p.AccountID+"/access/apps/"+appID, nil, &app); err != nil {
-		return v, err
-	}
-	v.AppID, v.Domain = app.ID, app.Domain
-	if app.Name != p.AccessAppName() {
-		return v, fmt.Errorf("Access application %s is named %q, not this deployment's %q: %w",
-			appID, app.Name, p.AccessAppName(), ErrNotOwned)
-	}
-	if !p.covers(app) {
-		return v, fmt.Errorf("Access application %s secures %q, not %s: the hostname is not protected", appID, app.Domain, p.Hostname)
-	}
-
-	pols, err := p.accessPolicies(ctx, appID)
-	if err != nil {
-		return v, err
-	}
-	for _, pol := range pols {
-		if pol.Name == p.AccessPolicyName() && pol.Decision == "allow" {
-			v.PolicyID, v.AllowRules = pol.ID, len(pol.Include)
-		}
-	}
-	if v.PolicyID == "" {
-		return v, fmt.Errorf("Access application %s has no allow policy named %q: nobody can sign in", appID, p.AccessPolicyName())
-	}
-	if v.AllowRules == 0 {
-		return v, fmt.Errorf("Access policy %s has an empty allow-list: %w", v.PolicyID, ErrNoAllowList)
-	}
-
-	org, err := p.Client.AccessOrganization(ctx, p.AccountID)
-	if err != nil {
-		return v, err
-	}
-	v.AuthDomain = org.AuthDomain
-	challenge, err := p.Client.accessChallenge(ctx, p.Hostname, org.AuthDomain)
-	if err != nil {
-		return v, err
-	}
-	v.Challenge = challenge
-	return v, nil
-}
-
-// accessChallenge makes one unauthenticated request to the hostname and
-// reports the Access challenge it produced. Redirects are not followed: the
-// redirect itself is the evidence.
-func (c *Client) accessChallenge(ctx context.Context, hostname, authDomain string) (string, error) {
-	target := "https://" + hostname + "/"
-	req, err := http.NewRequestWithContext(ctx, "GET", target, nil)
-	if err != nil {
-		return "", err
-	}
-	httpc := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	}}
-	if c.HTTP != nil {
-		httpc.Transport, httpc.Timeout = c.HTTP.Transport, c.HTTP.Timeout
-	}
-	if httpc.Transport == nil {
-		// The deployment host's resolver may be authoritative for this
-		// domain internally and answer NXDOMAIN for a name published at
-		// Cloudflare. That is a split-horizon resolver, not an unprotected
-		// hostname, so fall back to the addresses the zone's own authority
-		// gives rather than reporting a verification failure.
-		// Proxy and certificate trust are deliberately left as the
-		// defaults: the specification requires configured proxies and the
-		// host's trust store to be respected, and TLS verification against
-		// the hostname is what makes this probe evidence at all. Only the
-		// address dialled changes, so the certificate is still checked for
-		// the hostname in the URL.
-		httpc.Transport = &http.Transport{
-			Proxy:       http.ProxyFromEnvironment,
-			DialContext: c.dialViaAuthority,
-		}
-	}
-	resp, err := httpc.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("could not reach %s to check that Access is enforcing: %v", target, err)
-	}
-	defer resp.Body.Close()
-	loc := resp.Header.Get("Location")
-	if resp.StatusCode < 300 || resp.StatusCode > 399 || loc == "" {
-		return "", fmt.Errorf("%s answered HTTP %d with no Access challenge: the hostname is not protected", target, resp.StatusCode)
-	}
-	u, err := url.Parse(loc)
-	if err != nil {
-		return "", fmt.Errorf("%s redirected to an unparsable location: %v", target, err)
-	}
-	if !strings.EqualFold(u.Host, authDomain) && !strings.HasSuffix(strings.ToLower(u.Host), ".cloudflareaccess.com") {
-		return "", fmt.Errorf("%s redirected to %s, not the Access login at %s: the hostname is not protected", target, u.Host, authDomain)
-	}
-	return fmt.Sprintf("HTTP %d to %s", resp.StatusCode, u.Host), nil
 }
 
 // DeleteAccessApp removes the Access application only after re-fetching it

@@ -19,37 +19,6 @@ const (
 	wantPolicyNam = "Guacamole operators (" + wantMarker + ")"
 )
 
-// hostnameRT routes the unauthenticated hostname probe to a handler, so the
-// enforcement check runs through the same injectable HTTP seam as the API.
-// Everything addressed elsewhere is a normal API call to the fake server.
-type hostnameRT struct {
-	t  *testing.T
-	fn func(*http.Request) *http.Response
-}
-
-func (rt hostnameRT) RoundTrip(r *http.Request) (*http.Response, error) {
-	if r.URL.Host != host {
-		return http.DefaultTransport.RoundTrip(r)
-	}
-	if got := r.Header.Get("Authorization"); got != "" {
-		rt.t.Errorf("the hostname probe must be unauthenticated, got Authorization %q", got)
-	}
-	return rt.fn(r), nil
-}
-
-// probeResponse builds a bare response for the hostname probe.
-func probeResponse(status int, location string) *http.Response {
-	h := http.Header{}
-	if location != "" {
-		h.Set("Location", location)
-	}
-	return &http.Response{StatusCode: status, Header: h, Body: http.NoBody}
-}
-
-func (f *fake) probe(fn func(*http.Request) *http.Response) {
-	f.client.HTTP = &http.Client{Transport: hostnameRT{t: f.t, fn: fn}}
-}
-
 func allowGroups() Allow {
 	return Allow{IdPID: idpID, Groups: []string{adminGroupID, operGroupID}}
 }
@@ -353,73 +322,6 @@ func TestApplyAccessPreExistingApp(t *testing.T) {
 	noSecret(t, err)
 }
 
-func TestVerifyAccess(t *testing.T) {
-	f := newFake(t)
-	p := f.prov()
-	f.mux["GET /accounts/acct1/access/apps/app1"] = ok(map[string]any{
-		"id": "app1", "name": wantAppName, "domain": host, "aud": "aud-tag",
-	})
-	f.mux["GET /accounts/acct1/access/apps/app1/policies"] = ok([]map[string]any{
-		{"id": "pol1", "name": wantPolicyNam, "decision": "allow", "include": []map[string]any{
-			{"azureAD": map[string]any{"id": adminGroupID, "identity_provider_id": idpID}},
-			{"azureAD": map[string]any{"id": operGroupID, "identity_provider_id": idpID}},
-		}},
-	})
-	f.mux["GET /accounts/acct1/access/organizations"] = ok(map[string]string{"auth_domain": authDomain})
-	f.probe(func(r *http.Request) *http.Response {
-		if r.URL.String() != "https://"+host+"/" {
-			t.Errorf("probe URL = %s", r.URL)
-		}
-		return probeResponse(302, "https://"+authDomain+"/cdn-cgi/access/login/"+host+"?kid=abc")
-	})
-
-	v, err := p.VerifyAccess(context.Background(), "app1")
-	if err != nil {
-		t.Fatalf("VerifyAccess: %v", err)
-	}
-	if v.PolicyID != "pol1" || v.AllowRules != 2 || v.AuthDomain != authDomain {
-		t.Fatalf("verification = %+v", v)
-	}
-	if !strings.Contains(v.Challenge, authDomain) || !strings.Contains(v.Challenge, "302") {
-		t.Fatalf("challenge evidence = %q", v.Challenge)
-	}
-
-	// The origin answering directly means Access is not enforcing.
-	f.probe(func(*http.Request) *http.Response { return probeResponse(200, "") })
-	_, err = p.VerifyAccess(context.Background(), "app1")
-	if err == nil || !strings.Contains(err.Error(), "not protected") {
-		t.Fatalf("want an unprotected-hostname failure, got %v", err)
-	}
-	noSecret(t, err)
-
-	// So does a redirect somewhere that is not the Access login.
-	f.probe(func(*http.Request) *http.Response { return probeResponse(302, "https://login.example.com/") })
-	_, err = p.VerifyAccess(context.Background(), "app1")
-	if err == nil || !strings.Contains(err.Error(), "not protected") {
-		t.Fatalf("want a wrong-redirect failure, got %v", err)
-	}
-	noSecret(t, err)
-
-	// An application with no allow policy leaves nobody able to sign in.
-	f.probe(func(*http.Request) *http.Response {
-		return probeResponse(302, "https://"+authDomain+"/cdn-cgi/access/login/"+host)
-	})
-	f.mux["GET /accounts/acct1/access/apps/app1/policies"] = ok([]any{})
-	if _, err := p.VerifyAccess(context.Background(), "app1"); err == nil ||
-		!strings.Contains(err.Error(), "no allow policy") {
-		t.Fatalf("want a missing-policy failure, got %v", err)
-	}
-
-	// An application that no longer covers the hostname fails verification.
-	f.mux["GET /accounts/acct1/access/apps/app1"] = ok(map[string]any{
-		"id": "app1", "name": wantAppName, "domain": "other.example.com",
-	})
-	if _, err := p.VerifyAccess(context.Background(), "app1"); err == nil ||
-		!strings.Contains(err.Error(), "not protected") {
-		t.Fatalf("want a domain-mismatch failure, got %v", err)
-	}
-}
-
 func TestDeleteAccessAppRefusesUnmarked(t *testing.T) {
 	f := newFake(t)
 	p := f.prov()
@@ -511,60 +413,4 @@ func applyPlan(t *testing.T, p *Provisioner, allow Allow) (AccessApp, AccessPoli
 		t.Fatalf("PlanAccess: %v", err)
 	}
 	return p.ApplyAccess(context.Background(), plan)
-}
-
-// TestChallengeProbeKeepsProxyAndTLSVerification pins two properties of
-// the verification probe. It must honour a configured proxy, because the
-// specification requires it and a deployment behind one would otherwise
-// fail for the wrong reason. And it must keep TLS verification against the
-// hostname: an unverified handshake would make the probe worthless as
-// evidence that the right hostname is protected.
-func TestChallengeProbeKeepsProxyAndTLSVerification(t *testing.T) {
-	c := &Client{}
-	httpc := &http.Client{}
-	httpc.Transport = &http.Transport{
-		Proxy:       http.ProxyFromEnvironment,
-		DialContext: c.dialViaAuthority,
-	}
-	tr := httpc.Transport.(*http.Transport)
-	if tr.Proxy == nil {
-		t.Fatal("the probe ignores a configured proxy")
-	}
-	if tr.TLSClientConfig != nil && tr.TLSClientConfig.InsecureSkipVerify {
-		t.Fatal("the probe disables certificate verification, so it proves nothing")
-	}
-
-	// With no authority known, the failure explains itself rather than
-	// silently succeeding.
-	_, err := c.resolveAtAuthority(context.Background(), "guac.example.com")
-	if err == nil || !strings.Contains(err.Error(), "no authoritative nameservers") {
-		t.Fatalf("want an explanatory error, got %v", err)
-	}
-}
-
-// TestVerifyLearnsTheAuthorityOnAResumedRun pins a live failure: on a
-// resumed deployment the phase that selected the zone is skipped, so
-// nothing had recorded the zone's nameservers and the probe had no way to
-// resolve a hostname this host's resolver cannot see. Verification must
-// learn the authority itself.
-func TestVerifyLearnsTheAuthorityOnAResumedRun(t *testing.T) {
-	f := newFake(t)
-	f.mux["GET /zones/zone1"] = ok(map[string]any{
-		"id": "zone1", "name": "example.com",
-		"name_servers": []any{"ns1.example.invalid", "ns2.example.invalid"},
-	})
-	p := f.prov()
-	if len(p.Client.AuthorityNameServers) != 0 {
-		t.Fatal("precondition: the authority should be unknown")
-	}
-	p.ensureAuthority(context.Background())
-	if len(p.Client.AuthorityNameServers) != 2 {
-		t.Fatalf("the authority was not learned: %v", p.Client.AuthorityNameServers)
-	}
-	// Already known: no second lookup, and the value is left alone.
-	p.Client.AuthorityNameServers = []string{"kept"}
-	p.ensureAuthority(context.Background())
-	if len(p.Client.AuthorityNameServers) != 1 || p.Client.AuthorityNameServers[0] != "kept" {
-		t.Fatalf("a known authority was overwritten: %v", p.Client.AuthorityNameServers)
-	}
 }
