@@ -17,8 +17,18 @@ const (
 	ServiceUnit = "guacdeploy-recordings.service"
 	TimerUnit   = "guacdeploy-recordings.timer"
 
-	DefaultUnitDir    = "/etc/systemd/system"
-	DefaultRuntimeDir = "/usr/local/lib/guacdeploy"
+	DefaultUnitDir = "/etc/systemd/system"
+	// /usr/local/sbin, not /usr/local/lib: SELinux labels /usr/local/lib
+	// as lib_t, and systemd will not transition a service whose executable
+	// is lib_t, so the unit runs as init_t and is denied outbound network.
+	// /usr/local/sbin is bin_t, which transitions correctly. The distinct
+	// file name keeps this deployment-owned copy separate from the
+	// provisioning binary the launcher installs as /usr/local/bin/guacdeploy.
+	DefaultRuntimeDir = "/usr/local/sbin"
+	// RuntimeBinaryName keeps the deployment-owned copy distinct from the
+	// provisioning binary at /usr/local/bin/guacdeploy, which the operator
+	// may delete at any time.
+	RuntimeBinaryName = "guacdeploy-runtime"
 
 	// DefaultOnCalendar is hourly, not daily. Scheduled cleanup is not a
 	// hard quota, and the interval is the size of the overshoot the
@@ -177,7 +187,7 @@ func (o *InstallOptions) defaults() error {
 // path internal/schedule installs, for the same reason: the provisioning
 // binary the administrator ran may be deleted the moment setup finishes, so
 // a unit that pointed at it would break on the next reboot.
-func (o InstallOptions) RuntimePath() string { return filepath.Join(o.RuntimeDir, "guacdeploy") }
+func (o InstallOptions) RuntimePath() string { return filepath.Join(o.RuntimeDir, RuntimeBinaryName) }
 
 // ServicePath and TimerPath are the installed unit files.
 func (o InstallOptions) ServicePath() string { return filepath.Join(o.UnitDir, ServiceUnit) }

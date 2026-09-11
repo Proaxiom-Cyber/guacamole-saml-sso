@@ -1149,3 +1149,36 @@ func TestBootRecoveryCoversEveryPersistentMode(t *testing.T) {
 		}
 	}
 }
+
+// TestRuntimeBinaryLivesWhereSystemdCanUseIt pins a lesson from the live
+// host. The deployment-owned copy of the tool used to sit in
+// /usr/local/lib, which SELinux labels lib_t. systemd will not transition
+// a service whose executable is lib_t, so the boot unit ran as init_t and
+// was denied outbound network: the stack never came back after a reboot,
+// and the only symptom was "connect: permission denied".
+//
+// /usr/local/sbin is bin_t, which transitions correctly. The name stays
+// distinct from /usr/local/bin/guacdeploy, which is the provisioning
+// binary the operator may delete.
+func TestRuntimeBinaryLivesWhereSystemdCanUseIt(t *testing.T) {
+	for name, dir := range map[string]string{
+		"certs":     certs.DefaultRuntimeDir,
+		"schedule":  schedule.DefaultRuntimeDir,
+		"recording": recording.DefaultRuntimeDir,
+		"creds":     creds.DefaultRuntimeDir,
+	} {
+		if dir != "/usr/local/sbin" {
+			t.Errorf("%s installs its runtime copy in %s; /usr/local/lib is lib_t and the unit would run as init_t with no network", name, dir)
+		}
+	}
+	for name, bin := range map[string]string{
+		"certs":     certs.RuntimeBinaryName,
+		"schedule":  schedule.RuntimeBinaryName,
+		"recording": recording.RuntimeBinaryName,
+		"creds":     creds.RuntimeBinaryName,
+	} {
+		if bin == "guacdeploy" {
+			t.Errorf("%s names its runtime copy %q, which collides with the provisioning binary", name, bin)
+		}
+	}
+}
