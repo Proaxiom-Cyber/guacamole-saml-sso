@@ -473,3 +473,51 @@ func TestIssueUsesTheProductionDirectoryByDefault(t *testing.T) {
 		t.Errorf("staging directory = %q", StagingDirectory)
 	}
 }
+
+// A live run created a Cloudflare tunnel and rendered the whole stack before
+// the certificate authority refused the contact it had been given. The check
+// costs nothing at the start, and a bare email address is what an operator
+// obviously means.
+func TestNormaliseContact(t *testing.T) {
+	for _, tc := range []struct {
+		name, in, want string
+		wantErr        string
+	}{
+		{name: "empty stays empty: the contact is optional", in: "", want: ""},
+		{name: "a bare address gets the scheme it needs",
+			in: "ops@example.com", want: "mailto:ops@example.com"},
+		{name: "an address that already has the scheme is kept",
+			in: "mailto:ops@example.com", want: "mailto:ops@example.com"},
+		{name: "surrounding space does not make it a different address",
+			in: "  ops@example.com  ", want: "mailto:ops@example.com"},
+		{name: "the scheme is matched without regard to case",
+			in: "MAILTO:ops@example.com", want: "mailto:ops@example.com"},
+		{name: "another scheme is refused, naming the one that works",
+			in: "tel:+61000", wantErr: "only mailto"},
+		{name: "something that is not an address at all is refused",
+			in: "ops", wantErr: "not an email address"},
+		{name: "an address with no local part is refused",
+			in: "@example.com", wantErr: "not an email address"},
+		{name: "an address with no domain is refused",
+			in: "ops@", wantErr: "not an email address"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := NormaliseContact(tc.in)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("%q was accepted, and would have failed at the certificate authority", tc.in)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("the error does not say %q: %v", tc.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

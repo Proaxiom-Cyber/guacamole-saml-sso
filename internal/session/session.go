@@ -214,6 +214,16 @@ func (o *Options) stackConfigure(ctx context.Context, st *state.State, u *ui.UI)
 		}
 		st.Config[it.key] = v
 	}
+	// The certificate account contact is checked here, before any provider
+	// resource exists. A live run reached the certificate authority only after
+	// creating a Cloudflare tunnel and rendering the stack, and was refused
+	// there for a contact the tool could have corrected at the start.
+	contact, err := certs.NormaliseContact(o.ACMEContact)
+	if err != nil {
+		return err
+	}
+	o.ACMEContact = contact
+
 	u.Say("Configuration: hostname %s, administrator group %q, operator group %q.",
 		st.Config["guac-hostname"], st.Config["admin-group"], st.Config["operator-group"])
 	return nil

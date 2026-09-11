@@ -429,3 +429,35 @@ func loadOrCreateAccountKey(path string) (crypto.Signer, error) {
 	}
 	return key, nil
 }
+
+// NormaliseContact turns an operator address into the form ACME accepts, or
+// explains why it cannot.
+//
+// ACME takes a URI, and Let's Encrypt supports only the mailto scheme. An
+// operator who passes a bare address means the obvious thing, so it is
+// accepted and given the scheme. Anything else is refused here, where it costs
+// nothing, rather than at account registration — a live run reached that
+// registration only after creating a Cloudflare tunnel and rendering the
+// stack, and failed with the CA's own wording:
+//
+//	400 urn:ietf:params:acme:error:unsupportedContact: Error validating
+//	contact(s) :: only contact scheme 'mailto:' is supported
+func NormaliseContact(contact string) (string, error) {
+	c := strings.TrimSpace(contact)
+	if c == "" {
+		return "", nil // optional: the account is registered without one
+	}
+	if scheme, rest, ok := strings.Cut(c, ":"); ok && !strings.Contains(scheme, "@") {
+		if !strings.EqualFold(scheme, "mailto") {
+			return "", fmt.Errorf("the certificate account contact %q uses the %q scheme; the certificate authority accepts only mailto, so pass an email address", contact, scheme)
+		}
+		c = "mailto:" + strings.TrimSpace(rest)
+	} else {
+		c = "mailto:" + c
+	}
+	addr := strings.TrimPrefix(c, "mailto:")
+	if at := strings.Index(addr, "@"); at <= 0 || at == len(addr)-1 || strings.ContainsAny(addr, " \t") {
+		return "", fmt.Errorf("the certificate account contact %q is not an email address; the certificate authority uses it to warn about expiry", contact)
+	}
+	return c, nil
+}
