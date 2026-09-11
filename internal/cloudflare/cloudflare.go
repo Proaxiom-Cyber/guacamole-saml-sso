@@ -1,5 +1,36 @@
-// Package cloudflare provisions the deployment's Cloudflare Tunnel and DNS
-// record through the v4 API.
+// Package cloudflare provisions the deployment's Cloudflare Tunnel, DNS
+// record and Cloudflare Access protection through the v4 API.
+//
+// # Cloudflare Access identity model
+//
+// Access sits in front of the deployment hostname, so an anonymous request
+// never reaches Guacamole at all. Guacamole still runs its own Entra SAML
+// sign-in behind it (issue #6), so an operator signs in twice: once to
+// Cloudflare Access, once to Guacamole. That is the point — the two are
+// independent gates, and the console is not exposed while either one is
+// being changed.
+//
+// This package discovers an Access identity provider; it never creates one.
+// The preferred identity model is the account's existing Entra-backed
+// ("azureAD") Access identity provider, matched by the tenant ID that
+// internal/entra recorded, with an allow-list naming the exact administrator
+// and operator group object IDs that internal/entra created. Reusing those
+// groups means Access and Guacamole authorise the same people from the same
+// directory objects, and adding an operator is one Entra group membership.
+//
+// Creating the identity provider was rejected, not overlooked. An Access
+// azureAD provider needs an OIDC client ID and client secret, which the SAML
+// application from issue #6 does not have: it would mean a second Entra
+// application registration and a new long-lived secret for this tool to
+// hold. Worse, an Access identity provider is account-wide, shared by every
+// application in the account, so ADR 0002 would forbid ever deleting it at
+// teardown — the tool would create a resource it could never clean up. So
+// when the account has no Entra-backed provider, the fallback is an explicit
+// list of operator email addresses instead, and setting up the identity
+// provider stays a one-off account decision for a person.
+//
+// Either way the allow-list is explicit. PlanAccess refuses an empty one
+// with ErrNoAllowList; this package has no "allow everyone" rule.
 //
 // # Ownership markers
 //
@@ -9,6 +40,15 @@
 // "guacdeploy-<hostname>-<deployment-id>". The deployment ID is 128 random
 // bits, so a name carrying it cannot match by accident. DNS records support
 // comments, so the record's marker is the comment "guacdeploy:<deployment-id>".
+//
+// The Access application has the same problem as the tunnel and no better
+// answer: its API has no writable comment, note or description field, and
+// its tags are a separate account-level resource with its own lifecycle. So
+// the marker is again in the name (AccessAppName), and because a name alone
+// is only half a proof, adoption and deletion also require the application's
+// domain to still cover this deployment's hostname. The Access policy lives
+// under the application, so its ownership follows the application's, and it
+// carries the marker in its own name as well.
 //
 // # Reconciliation
 //
@@ -25,7 +65,9 @@
 // Delete methods re-fetch the resource and refuse with ErrNotOwned unless the
 // marker is present. Zone preservation is structural: this package has no
 // zone deletion, so a zone that now carries unrelated records is preserved
-// because only marker-owned tunnels and records are ever eligible.
+// because only marker-owned tunnels, records and Access applications are
+// ever eligible. Unrelated Access applications in the same account are
+// preserved for the same structural reason.
 //
 // # Origin TLS
 //
