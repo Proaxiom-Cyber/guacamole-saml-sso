@@ -708,3 +708,34 @@ func TestAzureStorageIsKeptAndDoesNotBlockTeardown(t *testing.T) {
 		}
 	}
 }
+
+// A resource type nothing here knows about falls to "no removal is defined",
+// which is ActionReview — and one review item makes the whole teardown refuse
+// and remove nothing. That has now happened twice in one day, both times
+// because a phase started recording a new type. This pins every type the
+// deployment records, so the next one fails here instead of on a live host.
+func TestEveryRecordedResourceTypeHasARule(t *testing.T) {
+	recorded := []string{
+		"azure/blob-container", "azure/resource-group", "azure/role-assignment",
+		"azure/storage-account",
+		"cloudflare/access-application", "cloudflare/access-policy",
+		"cloudflare/dns-record", "cloudflare/tunnel",
+		"docker/container",
+		"entra/application", "entra/group", "entra/service-principal",
+		"host/config-directory", "host/credential-dir", "host/credential-file",
+		"host/credential-sealed", "host/data-directory", "host/package",
+		"host/recovery-key-export", "host/service-enablement", "host/systemd-unit",
+	}
+	for _, key := range recorded {
+		provider, typ, _ := strings.Cut(key, "/")
+		st := &state.State{DeploymentID: "d1", Resources: []state.Resource{{
+			ID: "r1", Provider: provider, Type: typ, Name: "example",
+			Ownership: "created by this deployment",
+		}}}
+		plan := BuildPlan(st, nil, false)
+		for _, it := range plan.Review() {
+			t.Errorf("%s has no rule, so a teardown recording it refuses everything: %q",
+				key, it.Detail)
+		}
+	}
+}
