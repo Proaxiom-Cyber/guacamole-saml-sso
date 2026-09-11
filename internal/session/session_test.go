@@ -1899,3 +1899,53 @@ func TestAdoptingAnExportRefusesAWrongPassphrase(t *testing.T) {
 		t.Fatal("a public key was recorded from a failed adoption")
 	}
 }
+
+// The dangerous half of a repeat setup. --require-mount is an approved
+// protection: the backup refuses unless the destination is on the mounted
+// share. A second run without the flag used to pass a fresh false straight
+// into the installer, rewriting the unit without its guard — so a backup
+// could land on local disk the moment the share dropped, silently undoing
+// what the operator asked for. The explicit plaintext choice is the same
+// shape and must not change by itself either.
+func TestRepeatSetupKeepsTheApprovedBackupProtections(t *testing.T) {
+	var got schedule.Options
+	o := &Options{
+		StateDir: t.TempDir(),
+		ScheduleInstall: func(_ context.Context, opts schedule.Options) (schedule.Installed, error) {
+			got = opts
+			return schedule.Installed{
+				OnCalendar: firstNonEmpty(opts.OnCalendar, "daily"),
+				Keep:       7, ServicePath: "/etc/systemd/system/guacdeploy-backup.service",
+			}, nil
+		},
+	}
+	// The first run approved both, and the record says so.
+	st := &state.State{DeploymentID: "d1", Config: map[string]string{
+		"backup-public-key":    "age1example",
+		"backup-require-mount": "true",
+		"backup-plaintext":     "true",
+		"backup-dest":          "/mnt/share/backups",
+	}}
+	u, _ := testUI(false, "")
+	if err := o.backupSchedule(context.Background(), st, u); err != nil {
+		t.Fatal(err)
+	}
+	if !got.RequireMount {
+		t.Fatal("the mount guard was dropped: a repeat run would let backups fall onto local disk")
+	}
+	if !got.Plaintext {
+		t.Fatal("the explicit plaintext choice changed by itself")
+	}
+	if got.Dest != "/mnt/share/backups" {
+		t.Fatalf("the recorded destination was lost: %q", got.Dest)
+	}
+	// And the effective values are recorded, defaults included, so status
+	// says what is installed and the next run reads the same thing back.
+	if st.Config["backup-schedule"] != "daily" || st.Config["backup-keep"] != "7" {
+		t.Fatalf("the installed schedule was not recorded: %q keep %q",
+			st.Config["backup-schedule"], st.Config["backup-keep"])
+	}
+	if st.Config["backup-require-mount"] != "true" || st.Config["backup-plaintext"] != "true" {
+		t.Fatalf("the approved booleans were not recorded back: %+v", st.Config)
+	}
+}

@@ -590,6 +590,10 @@ type Options struct {
 	// CredsRun executes systemd-creds for the sealed modes; nil means the
 	// real one.
 	CredsRun creds.Runner
+	// ScheduleInstall installs the backup timer; nil means the real one. A
+	// test replaces it to inspect the options without writing a unit onto
+	// the machine running the test.
+	ScheduleInstall func(context.Context, schedule.Options) (schedule.Installed, error)
 	// Azure asks for an Azure Blob destination during a guided run. The
 	// remaining fields answer the questions ahead of time; any one of them
 	// also turns the phase on.
@@ -1497,20 +1501,15 @@ func (o *Options) backupSchedule(ctx context.Context, st *state.State, u *ui.UI)
 	if o.BackupSchedule != "" {
 		st.Config["backup-schedule"] = o.BackupSchedule
 	}
-	if o.BackupKeep > 0 {
-		st.Config["backup-keep"] = strconv.Itoa(o.BackupKeep)
-	}
+	// The two approved booleans are the dangerous half of this. A repeat run
+	// without --require-mount would otherwise rewrite the unit without its
+	// missing-mount guard, so a backup could land on local disk the moment
+	// the share dropped — silently undoing a protection the operator asked
+	// for. An explicit flag still turns either on; nothing here turns one off.
+	o.BackupRequireMount = o.BackupRequireMount || st.Config["backup-require-mount"] == "true"
+	o.BackupPlaintext = o.BackupPlaintext || st.Config["backup-plaintext"] == "true"
 
-	in, err := schedule.Install(ctx, schedule.Options{
-		Run:          schedule.ExecRunner,
-		DeploymentID: st.DeploymentID,
-		StateDir:     o.StateDir,
-		Dest:         dest,
-		OnCalendar:   o.BackupSchedule,
-		Keep:         o.BackupKeep,
-		Plaintext:    o.BackupPlaintext,
-		RequireMount: o.BackupRequireMount,
-	})
+	in, err := o.installBackupSchedule(ctx, st, dest)
 	if err != nil {
 		return fmt.Errorf("installing the backup schedule failed: %w", err)
 	}
@@ -1914,4 +1913,41 @@ func (o *Options) askRecordingBudget(u *ui.UI) error {
 		o.RecordingBudget = answer
 		return nil
 	}
+}
+
+// installBackupSchedule installs the timer and records what was actually
+// installed, defaults included.
+//
+// Recording the effective values rather than only the flags matters twice
+// over: `status` then says what is really scheduled instead of leaving the
+// schedule blank, and the next run reads those values back, so a repeat setup
+// reinstalls the same thing rather than falling to defaults.
+//
+// ScheduleInstall is a seam so a test can see the options without writing a
+// unit onto the machine running it.
+func (o *Options) installBackupSchedule(ctx context.Context, st *state.State, dest string) (schedule.Installed, error) {
+	opts := schedule.Options{
+		Run:          schedule.ExecRunner,
+		DeploymentID: st.DeploymentID,
+		StateDir:     o.StateDir,
+		Dest:         dest,
+		OnCalendar:   o.BackupSchedule,
+		Keep:         o.BackupKeep,
+		Plaintext:    o.BackupPlaintext,
+		RequireMount: o.BackupRequireMount,
+	}
+	install := o.ScheduleInstall
+	if install == nil {
+		install = schedule.Install
+	}
+	in, err := install(ctx, opts)
+	if err != nil {
+		return in, err
+	}
+	// What is on disk is now the truth, so record that.
+	st.Config["backup-schedule"] = in.OnCalendar
+	st.Config["backup-keep"] = strconv.Itoa(in.Keep)
+	st.Config["backup-require-mount"] = strconv.FormatBool(o.BackupRequireMount)
+	st.Config["backup-plaintext"] = strconv.FormatBool(o.BackupPlaintext)
+	return in, nil
 }

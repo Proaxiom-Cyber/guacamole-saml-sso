@@ -293,3 +293,45 @@ func TestUninstallLeavesUnitsFromAnotherDeployment(t *testing.T) {
 		}
 	}
 }
+
+// The guard has to reach the unit, not just the options. A repeat setup that
+// dropped it would rewrite this ExecStart without --require-mount, and the
+// scheduled backup would then accept a destination that is no longer on the
+// share.
+func TestInstalledUnitCarriesTheMountGuard(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "guacdeploy")
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	install := func(requireMount bool) string {
+		name := "off"
+		if requireMount {
+			name = "on"
+		}
+		units := filepath.Join(dir, "units", name)
+		if err := os.MkdirAll(units, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		in, err := Install(context.Background(), Options{
+			Run:          func(context.Context, string, string, ...string) (string, string, error) { return "", "", nil },
+			DeploymentID: "d1", StateDir: dir, Dest: filepath.Join(dir, "backups"),
+			RequireMount: requireMount,
+			UnitDir:      units, RuntimeDir: filepath.Join(dir, "sbin"), Exe: exe,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := os.ReadFile(in.ServicePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	if !strings.Contains(install(true), "--require-mount") {
+		t.Error("the approved mount guard is not in the installed unit")
+	}
+	if strings.Contains(install(false), "--require-mount") {
+		t.Error("the guard appeared without being asked for")
+	}
+}
