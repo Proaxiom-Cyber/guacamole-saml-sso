@@ -15,6 +15,20 @@ services:
     image: guacamole/guacd:${GUAC_VERSION:?}
     networks: [guacnet]
     restart: always
+    volumes:
+      # guacd writes session recordings; the web application only reads them
+      # back. A connection's recording-path parameter is resolved here, in
+      # guacd, so it holds this container path and never a host path.
+      #
+      # The SELinux option is lowercase "z" (shared), not "Z" (private): the
+      # same host directory is mounted into two containers, and a private
+      # label relabels it per container, so the second mount would take the
+      # directory away from the first.
+      #
+      # guacdeploy creates ./recordings and gives it to the guacd container
+      # account. Docker would otherwise create it root-owned, guacd could not
+      # write, and sessions would run unrecorded without failing.
+      - ./recordings:/recordings:z
     healthcheck:
       test: ["CMD", "nc", "-z", "127.0.0.1", "4822"]
       interval: 5s
@@ -76,8 +90,16 @@ services:
       # nginx terminates TLS. Without this, Tomcat sees "http://", and SAML
       # response validation fails because the callback URL says "https://".
       REMOTE_IP_VALVE_ENABLED: "true"
+      # Where the web application looks for a finished recording when an
+      # operator plays one back from the session history. It must match
+      # guacd's recording-path, because guacd chose the file name.
+      RECORDING_SEARCH_PATH: /recordings
     networks: [guacnet]
     restart: always
+    volumes:
+      # Read-only: guacd owns these files, and the web application must never
+      # be able to alter or delete session evidence.
+      - ./recordings:/recordings:ro,z
 
   # Started only when COMPOSE_PROFILES in .env contains "cloudflare".
   cloudflared:
