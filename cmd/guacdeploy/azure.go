@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strconv"
 
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/azure"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/creds"
@@ -24,7 +25,28 @@ const (
 	azureBlobEndpointConfig  = "azure-blob-endpoint"
 	azureTenantConfig        = "azure-tenant-id"
 	azureClientIDConfig      = "azure-client-id"
+	azureScheduleConfig      = "azure-upload-schedule"
+	// azureRetentionDaysConfig is how many days this deployment's recordings
+	// are kept in Azure. The administrator is asked during setup; an absent
+	// value means no remote expiry, never a guessed default.
+	azureRetentionDaysConfig = "azure-recording-retention-days"
 )
+
+// azureRetentionDays reads the remote recording retention period from the
+// deployment record. An unreadable value fails the run rather than quietly
+// becoming "keep for ever": a retention policy that silently stopped applying
+// is exactly the failure an administrator would not notice.
+func azureRetentionDays(st *state.State) (int, error) {
+	v := st.Config[azureRetentionDaysConfig]
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("%s is %q, which is not a number of days of at least 1; fix the deployment record before recordings can expire in Azure", azureRetentionDaysConfig, v)
+	}
+	return n, nil
+}
 
 // azureDestinationFrom rebuilds the selected destination from the deployment
 // record. The account's ARM resource ID and blob endpoint are recorded at
@@ -72,6 +94,10 @@ func azureUploadCmd(ctx context.Context, stateDir, dest string, u *ui.UI) error 
 	if dest == "" {
 		return fmt.Errorf("an Azure upload needs --dest: the local backup destination it copies from")
 	}
+	days, err := azureRetentionDays(st)
+	if err != nil {
+		return err
+	}
 
 	m := &creds.Manager{Mode: st.Config["credential-mode"], Dir: filepath.Join(stateDir, "credentials")}
 	principal := &azure.ServicePrincipal{
@@ -91,7 +117,7 @@ func azureUploadCmd(ctx context.Context, stateDir, dest string, u *ui.UI) error 
 	rep, err := azure.Upload(ctx, c, azure.Options{
 		Dest: dest, StateDir: stateDir, DeploymentID: st.DeploymentID, Destination: d,
 		ClientID: st.Config[azureClientIDConfig], AuthMode: "service-principal",
-		OnCalendar: st.Config["azure-upload-schedule"],
+		OnCalendar: st.Config[azureScheduleConfig], RetentionDays: days,
 	})
 	u.Say("%s", rep.Summary())
 	return err
