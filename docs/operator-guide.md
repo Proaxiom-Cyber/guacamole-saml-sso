@@ -144,6 +144,13 @@ stack is running.
 
 ## Backup recovery key
 
+**Setup offers this.** A guided run asks whether to enable scheduled
+backups and, if you accept, generates the key and installs the schedule in
+the same session — you do not have to run another command and start setup
+again. It asks for the recording storage budget in the same run. Declining
+either is a supported answer and leaves nothing installed; an unattended
+run is never asked, and uses the flags instead.
+
 Backups are encrypted with a key pair. `guacdeploy backup-key` generates
 the pair in memory on the server. Only the public key is stored, in the
 deployment record; scheduled backups need nothing else. The private key is
