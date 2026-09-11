@@ -452,6 +452,9 @@ func TestStackPhasesFullPipelineUnattended(t *testing.T) {
 		StateDir: dir, UI: u, Host: fakeHost(t), CredentialMode: creds.ModeEnv,
 		Hostname: "guac.example.test", AdminGroup: "GuacAdmins", OperatorGroup: "GuacOperators",
 		InstallDir: install, StackRun: stackRunner(&calls),
+		StackRunOut: func(_ context.Context, name string, args ...string) (string, string, error) {
+			return "CREATE TABLE guacamole_entity (x int);\nCREATE TABLE guacamole_user_group (y int);\n", "", nil
+		},
 		ProbeCheck: func(context.Context, stack.Config) error { return nil },
 	}
 	if err := Run(context.Background(), opts); err != nil {
@@ -517,6 +520,9 @@ func TestUnattendedStackNeedsExplicitConfig(t *testing.T) {
 		StateDir: dir, UI: u, Host: fakeHost(t), CredentialMode: creds.ModeEnv,
 		InstallDir: filepath.Join(t.TempDir(), "opt"),
 		StackRun:   stackRunner(&[]stackCall{}),
+		StackRunOut: func(_ context.Context, name string, args ...string) (string, string, error) {
+			return "CREATE TABLE guacamole_entity (x int);\n", "", nil
+		},
 	}
 	err := Run(context.Background(), opts)
 	if err == nil || !strings.Contains(err.Error(), "--hostname") {

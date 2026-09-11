@@ -66,6 +66,24 @@ func (c *Config) defaults() {
 // Runner executes a command with optional stdin, returning combined output.
 type Runner func(ctx context.Context, stdin string, name string, args ...string) (string, error)
 
+// OutRunner executes a command capturing stdout and stderr separately.
+//
+// Schema generation must never use the combined-output Runner: docker
+// writes image pull progress and other notices to stderr, and combining
+// them prepends that text to the generated SQL, producing a file psql
+// cannot execute. That failure is silent, because the schema still
+// contains the expected CREATE TABLE statements further down.
+type OutRunner func(ctx context.Context, name string, args ...string) (stdout, stderr string, err error)
+
+// ExecOutRunner is the real stdout-only command seam.
+func ExecOutRunner(ctx context.Context, name string, args ...string) (string, string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	var out, errs strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &errs
+	err := cmd.Run()
+	return out.String(), errs.String(), err
+}
+
 // ExecRunner is the real command seam.
 func ExecRunner(ctx context.Context, stdin string, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
@@ -170,17 +188,26 @@ func selfSignedCert(hostname, certPath, keyPath string) error {
 // GenerateSchema produces init/001-initdb.sql from the pinned Guacamole
 // image and validates it before publishing, so a failed generation never
 // masquerades as a schema.
-func GenerateSchema(ctx context.Context, run Runner, cfg Config) error {
+func GenerateSchema(ctx context.Context, run OutRunner, cfg Config) error {
 	cfg.defaults()
 	schemaPath := filepath.Join(cfg.InstallDir, "init/001-initdb.sql")
 	marker := "-- Guacamole schema complete: " + GuacVersion
+	// A schema written by an earlier version can carry the completion
+	// marker and still be corrupt, because that version accepted combined
+	// output. Re-check the shape before trusting the cache, otherwise the
+	// corrupt file is never repaired.
 	if b, err := os.ReadFile(schemaPath); err == nil && strings.Contains(string(b), marker) {
-		return nil
+		if looksLikeSQL(string(b)) == nil {
+			return nil
+		}
 	}
-	out, err := run(ctx, "", "docker", "run", "--rm", "guacamole/guacamole:"+GuacVersion,
+	out, errOut, err := run(ctx, "docker", "run", "--rm", "guacamole/guacamole:"+GuacVersion,
 		"/opt/guacamole/bin/initdb.sh", "--postgresql")
 	if err != nil {
-		return fmt.Errorf("database schema generation failed: %v\n%s", err, tail(out))
+		return fmt.Errorf("database schema generation failed: %v\n%s", err, tail(errOut))
+	}
+	if err := looksLikeSQL(out); err != nil {
+		return err
 	}
 	for _, want := range []string{"CREATE TABLE guacamole_entity", "CREATE TABLE guacamole_user_group"} {
 		if !strings.Contains(out, want) {
@@ -300,6 +327,34 @@ func tail(s string) string {
 	s = strings.TrimSpace(s)
 	if lines := strings.Split(s, "\n"); len(lines) > 12 {
 		return strings.Join(lines[len(lines)-12:], "\n")
+	}
+	return s
+}
+
+// looksLikeSQL rejects a schema whose first meaningful line is not SQL.
+// Anything else means non-SQL text reached the file, which psql would fail
+// on at the first statement while the file still looks plausible further
+// down.
+func looksLikeSQL(s string) error {
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		upper := strings.ToUpper(line)
+		for _, ok := range []string{"--", "/*", "CREATE", "SET", "ALTER", "COMMENT", "SELECT", "BEGIN", "START"} {
+			if strings.HasPrefix(upper, ok) {
+				return nil
+			}
+		}
+		return fmt.Errorf("the generated schema starts with text that is not SQL (%q); refusing to publish it", truncate(line, 80))
+	}
+	return fmt.Errorf("the generated schema is empty; refusing to publish it")
+}
+
+func truncate(s string, n int) string {
+	if len(s) > n {
+		return s[:n] + "…"
 	}
 	return s
 }

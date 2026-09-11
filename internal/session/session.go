@@ -72,6 +72,13 @@ func (o *Options) stackRun() stack.Runner {
 	return stack.ExecRunner
 }
 
+func (o *Options) stackRunOut() stack.OutRunner {
+	if o.StackRunOut != nil {
+		return o.StackRunOut
+	}
+	return stack.ExecOutRunner
+}
+
 func (o *Options) stackConfig(st *state.State) stack.Config {
 	return stack.Config{
 		InstallDir:      o.installDir(),
@@ -140,7 +147,7 @@ func (o *Options) stackRender(ctx context.Context, st *state.State, u *ui.UI) er
 }
 
 func (o *Options) stackSchema(ctx context.Context, st *state.State, u *ui.UI) error {
-	if err := stack.GenerateSchema(ctx, o.stackRun(), o.stackConfig(st)); err != nil {
+	if err := stack.GenerateSchema(ctx, o.stackRunOut(), o.stackConfig(st)); err != nil {
 		return err
 	}
 	u.Say("Database schema generated from guacamole/guacamole:%s and validated.", stack.GuacVersion)
@@ -403,6 +410,7 @@ type Options struct {
 	CredSpecs           []creds.Spec
 	Host                *host.Probes
 	StackRun            stack.Runner                              // injectable for tests
+	StackRunOut         stack.OutRunner                           // injectable for tests
 	ProbeCheck          func(context.Context, stack.Config) error // injectable for tests
 	Phases              []Phase
 }
