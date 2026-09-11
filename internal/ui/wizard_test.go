@@ -11,6 +11,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"golang.org/x/term"
 )
 
 // The wizard is driven entirely through injected readers and writers: no
@@ -257,16 +259,24 @@ func TestFailedPhaseExplainsActionRetentionAndRecovery(t *testing.T) {
 	u.PhaseDone("host-preflight")
 	u.PhaseFailed("credential-check", errors.New("the postgres password is missing"))
 
-	lines := u.wiz.snapshot()
-	if !hasLineWith(lines, "Failed action:", "credential-check", "the postgres password is missing") {
-		t.Error("the error does not name the action that failed")
+	// The block wraps to the screen, so the assertion reads the presented
+	// text rather than one line of it.
+	flat := flatten(u.wiz.snapshot())
+	for _, want := range []string{
+		"Failed action: phase credential-check failed: the postgres password is missing",
+		"Retained work: completed work is retained; 2 of 20 phase(s) completed.",
+		"Recovery choices: resume, or clean up. Run setup again to choose.",
+	} {
+		if !strings.Contains(flat, want) {
+			t.Errorf("the error does not say %q\ngot: %s", want, flat)
+		}
 	}
-	if !hasLineWith(lines, "Retained work:", "completed work is retained", "2 of 20") {
-		t.Error("the error does not name the work that was retained")
-	}
-	if !hasLineWith(lines, "Recovery choices:", "resume", "clean up") {
-		t.Errorf("the error does not name the recovery choices:\n%s", strings.Join(lines, "\n"))
-	}
+}
+
+// flatten joins the frame and collapses the wrap, so an assertion can read a
+// sentence that the screen split across lines.
+func flatten(lines []string) string {
+	return strings.Join(strings.Fields(strings.Join(lines, " ")), " ")
 }
 
 func TestFrameIsPlainTextAndDistinguishesEveryState(t *testing.T) {
@@ -375,6 +385,67 @@ func TestWindowLinesCountsEverythingItHides(t *testing.T) {
 	}
 	if len(windowLines(lines[:4], 0, 5)) != 4 {
 		t.Error("a list that fits was windowed anyway")
+	}
+}
+
+func TestFrameFitsTheTerminal(t *testing.T) {
+	out := &bytes.Buffer{}
+	in := bufio.NewReader(strings.NewReader(""))
+	u := &UI{In: in, Out: out, Interactive: true}
+	u.wiz = newWizard(in, out, 24, 60, false)
+	u.PhaseList(twentyPhases)
+	u.PhaseStart("stack-up")
+	u.Say("Phase stack-up failed: the Cloudflare API rejected the request " +
+		"because the account does not hold the Zone:Edit permission on the " +
+		"zone example.com, so no tunnel route was created and nothing was published.")
+	u.Say("%s", strings.Repeat("x", 300)) // one unbroken word, longer than the screen
+
+	lines := u.wiz.frame([]string{
+		"Replace the database of this deployment from the backup file, " +
+			"discarding every connection and recording it holds now?",
+		"", "> [y] Yes", "  [n] No",
+	})
+	if len(lines) > 24 {
+		t.Errorf("frame is %d lines on a 24-row terminal", len(lines))
+	}
+	for _, l := range lines {
+		if n := len([]rune(l)); n > 60 {
+			t.Fatalf("frame line is %d columns wide on a 60-column terminal: %q", n, l)
+		}
+	}
+	// Wrapping is a display choice: the stored transcript keeps whole lines,
+	// so the replay after the wizard stops loses nothing.
+	if !strings.Contains(strings.Join(u.wiz.log, "\n"), "Zone:Edit permission on the zone example.com") {
+		t.Error("wrapping altered the stored transcript")
+	}
+}
+
+func TestWrapLine(t *testing.T) {
+	for _, tc := range []struct {
+		name, in string
+		width    int
+		want     []string
+	}{
+		{"short lines are untouched", "hello", 20, []string{"hello"}},
+		{"breaks at a space", "alpha beta gamma", 11, []string{"alpha beta", "gamma"}},
+		{"breaks a long word", "aaaaaaaaaa", 8, []string{"aaaaaaaa", "aa"}},
+		// Counted in runes: a byte-counting wrap would split "ä ö ü ñ"
+		// early, because each of those letters is two bytes.
+		{"keeps multi-byte runes whole", "ä ö ü ñ é è", 8, []string{"ä ö ü ñ", "é è"}},
+		// Absurd widths are clamped rather than looping one rune at a time.
+		{"a tiny width is clamped", "alpha beta gamma", 2, []string{"alpha", "beta", "gamma"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := wrapLine(tc.in, tc.width)
+			if strings.Join(got, "|") != strings.Join(tc.want, "|") {
+				t.Fatalf("wrapLine = %q, want %q", got, tc.want)
+			}
+			for _, l := range got {
+				if n := len([]rune(l)); n > tc.width && tc.width >= 8 {
+					t.Errorf("segment %q is %d runes wide, want at most %d", l, n, tc.width)
+				}
+			}
+		})
 	}
 }
 
@@ -539,6 +610,55 @@ func TestFullScreenCapableDegradesHonestly(t *testing.T) {
 				t.Fatalf("fullScreenCapable = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestTermSupportsControlCodes(t *testing.T) {
+	for _, tc := range []struct {
+		term string
+		want bool
+	}{
+		{"dumb", false},
+		{"", false},
+		{"xterm-256color", true},
+		{"screen", true},
+		{"vt100", true},
+	} {
+		t.Run("TERM="+tc.term, func(t *testing.T) {
+			t.Setenv("TERM", tc.term)
+			if got := termSupportsControlCodes(); got != tc.want {
+				t.Fatalf("termSupportsControlCodes = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFullScreenCapableNeedsBothATerminalAndAUsefulTerm(t *testing.T) {
+	// A pseudo-terminal is the only real terminal a test can obtain, and it
+	// is what proves the TERM rule still applies once the writer check
+	// passes. The Linux target reports the /dev/ptmx master as a terminal.
+	// macOS does not, and reaching its terminal side needs ptsname, so the
+	// test skips on a development Mac and runs on the supported platform.
+	pty, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
+	if err != nil {
+		t.Skipf("no pseudo-terminal available: %v", err)
+	}
+	t.Cleanup(func() { pty.Close() })
+	if !term.IsTerminal(int(pty.Fd())) {
+		t.Skip("/dev/ptmx is not reported as a terminal here")
+	}
+
+	t.Setenv("TERM", "xterm-256color")
+	if !fullScreenCapable(pty) {
+		t.Fatal("a real terminal with a usable TERM was refused")
+	}
+	t.Setenv("TERM", "dumb")
+	if fullScreenCapable(pty) {
+		t.Fatal("TERM=dumb was accepted because the writer is a terminal")
+	}
+	t.Setenv("TERM", "")
+	if fullScreenCapable(pty) {
+		t.Fatal("an unset TERM was accepted because the writer is a terminal")
 	}
 }
 

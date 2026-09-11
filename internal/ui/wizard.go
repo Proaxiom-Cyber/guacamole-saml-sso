@@ -121,12 +121,22 @@ func (u *UI) StartWizard() bool {
 // fullScreenCapable reports whether control codes may be written to out. A
 // pipe, a file, or a terminal that declares itself dumb gets plain lines.
 func fullScreenCapable(out io.Writer) bool {
-	switch os.Getenv("TERM") {
-	case "", "dumb":
+	if !termSupportsControlCodes() {
 		return false
 	}
 	f, ok := out.(*os.File)
 	return ok && term.IsTerminal(int(f.Fd()))
+}
+
+// termSupportsControlCodes reports what TERM claims. It is separate from the
+// writer check so each half can be tested on its own: a test cannot supply a
+// real terminal, and without the split an unset TERM would hide this rule.
+func termSupportsControlCodes() bool {
+	switch os.Getenv("TERM") {
+	case "", "dumb":
+		return false
+	}
+	return true
 }
 
 // wizard returns the running wizard, or nil when output is line-oriented.
@@ -175,10 +185,10 @@ func (w *Wizard) cancelled() error {
 }
 
 func (w *Wizard) say(s string) {
+	// Stored without indentation: the frame indents when it draws, and the
+	// replayed transcript reads like ordinary output.
 	w.mu.Lock()
-	for _, l := range strings.Split(s, "\n") {
-		w.log = append(w.log, "  "+l)
-	}
+	w.log = append(w.log, strings.Split(s, "\n")...)
 	if n := len(w.log) - logCap; n > 0 {
 		w.log = append([]string(nil), w.log[n:]...)
 	}
@@ -287,10 +297,21 @@ func (w *Wizard) frame(prompt []string) []string {
 		phases = append(phases, line)
 	}
 
+	// The prompt is wrapped before the budget is worked out, so a long
+	// question cannot push the top of the screen away.
+	var asked []string
+	for _, l := range prompt {
+		segs := wrapLine(l, w.width()-4)
+		asked = append(asked, segs[0])
+		for _, s := range segs[1:] {
+			asked = append(asked, "    "+s)
+		}
+	}
+
 	// Furniture: title, progress, three rules, the Output label, the prompt
 	// block and the cancel footer. The count only sizes the budget, so an
 	// approximation is enough.
-	budget := w.rows - (2 + 3 + 1 + len(prompt) + 1) - 1
+	budget := w.rows - (2 + 3 + 1 + len(asked) + 1) - 1
 	if budget < 6 {
 		budget = 6
 	}
@@ -306,17 +327,57 @@ func (w *Wizard) frame(prompt []string) []string {
 		out = append(out, phases...)
 	}
 	out = append(out, rule, "Output")
-	if len(w.log) > logRoom {
-		out = append(out, w.log[len(w.log)-logRoom:]...)
-	} else {
-		out = append(out, w.log...)
+	// Wrapped here rather than left to the terminal: a line the terminal
+	// wraps is taller than the frame expects and pushes the top off screen.
+	// The stored log keeps the whole line for the replayed transcript.
+	var shown []string
+	for _, l := range w.log {
+		for _, seg := range wrapLine(l, w.width()-2) {
+			shown = append(shown, "  "+seg)
+		}
 	}
+	if len(shown) > logRoom {
+		shown = shown[len(shown)-logRoom:]
+	}
+	out = append(out, shown...)
 	out = append(out, rule)
-	if len(prompt) > 0 {
-		out = append(out, prompt...)
+	if len(asked) > 0 {
+		out = append(out, asked...)
 		out = append(out, rule)
 	}
 	return append(out, "Ctrl-C  Cancel. Completed work is retained.")
+}
+
+// wrapLine breaks one line at spaces to fit the width, and breaks mid-word
+// only when a single word is longer than the line. It works in runes, so a
+// name outside ASCII cannot be cut in half.
+func wrapLine(s string, width int) []string {
+	if width < 8 {
+		width = 8
+	}
+	r := []rune(s)
+	if len(r) <= width {
+		return []string{s}
+	}
+	var out []string
+	for len(r) > width {
+		cut := 0
+		for i := width; i > 0; i-- {
+			if r[i] == ' ' {
+				cut = i
+				break
+			}
+		}
+		if cut == 0 {
+			cut = width
+		}
+		out = append(out, strings.TrimRight(string(r[:cut]), " "))
+		r = []rune(strings.TrimLeft(string(r[cut:]), " "))
+	}
+	if len(r) > 0 {
+		out = append(out, string(r))
+	}
+	return out
 }
 
 // windowLines keeps at most max lines around the active one. The elided
