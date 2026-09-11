@@ -1959,3 +1959,57 @@ func TestRecordingScheduleSurvivesAnEmptyRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A deployment approved as plaintext has no backup public key by definition.
+// The key gate was checked before the recorded protection mode was read back,
+// so a rerun without flags fell into the gate: guided, it offered to generate
+// a key the deployment deliberately does not use; unattended, it stopped
+// reinstalling the schedule it already had. The approved plaintext schedule
+// must simply be reinstalled, with its mount guard, and nothing asked.
+func TestRepeatSetupReinstallsAnApprovedPlaintextSchedule(t *testing.T) {
+	var got schedule.Options
+	installed := false
+	o := &Options{
+		StateDir: t.TempDir(),
+		ScheduleInstall: func(_ context.Context, opts schedule.Options) (schedule.Installed, error) {
+			got, installed = opts, true
+			return schedule.Installed{OnCalendar: "daily", Keep: 7,
+				ServicePath: "/etc/systemd/system/guacdeploy-backup.service"}, nil
+		},
+	}
+	st := &state.State{DeploymentID: "d1", Config: map[string]string{
+		// Approved plaintext: there is no public key, and that is correct.
+		"backup-plaintext":     "true",
+		"backup-require-mount": "true",
+		"backup-dest":          "/mnt/share/backups",
+	}}
+	// Interactive, and an answer is available — so if the phase does ask, it
+	// declines and carries on rather than failing on an empty buffer. That
+	// keeps the failure message about the behaviour rather than about EOF.
+	u, out := testUI(true, "n\n")
+	u.Secret = func(string) (string, error) {
+		t.Fatal("a plaintext deployment was asked for a backup key passphrase")
+		return "", nil
+	}
+	if err := o.backupSchedule(context.Background(), st, u); err != nil {
+		t.Fatal(err)
+	}
+	if !installed {
+		t.Fatal("the approved plaintext schedule was not reinstalled")
+	}
+	if !got.Plaintext {
+		t.Fatal("the approved plaintext choice was lost")
+	}
+	if !got.RequireMount {
+		t.Fatal("the mount guard was dropped from the plaintext schedule")
+	}
+	if got.Dest != "/mnt/share/backups" {
+		t.Fatalf("the recorded destination was lost: %q", got.Dest)
+	}
+	if strings.Contains(out.String(), "Generate the backup key now") {
+		t.Error("a plaintext deployment was offered a backup key")
+	}
+	if st.Config["backup-public-key"] != "" {
+		t.Error("a key was recorded for a plaintext deployment")
+	}
+}

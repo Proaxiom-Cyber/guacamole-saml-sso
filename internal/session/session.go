@@ -1468,6 +1468,19 @@ func (o *Options) backupSchedule(ctx context.Context, st *state.State, u *ui.UI)
 		u.Say("Scheduled backups were declined. Take backups with 'guacdeploy backup'.")
 		return nil
 	}
+	if st.Config == nil {
+		st.Config = map[string]string{}
+	}
+	// The protection mode has to be resolved before the key gate below, not
+	// after it. A deployment approved as plaintext has no public key by
+	// definition, so a rerun without the flags would otherwise fall into the
+	// gate, be asked to generate a key it deliberately does not use, and in
+	// an unattended run simply stop reinstalling the schedule it already has.
+	//
+	// An explicit flag still turns either on; nothing here turns one off.
+	o.BackupRequireMount = o.BackupRequireMount || st.Config["backup-require-mount"] == "true"
+	o.BackupPlaintext = o.BackupPlaintext || st.Config["backup-plaintext"] == "true"
+
 	if st.Config["backup-public-key"] == "" && !o.BackupPlaintext {
 		// The specification offers scheduled backups during setup, and the
 		// key is generated on the server. Asking here is what makes that
@@ -1484,9 +1497,6 @@ func (o *Options) backupSchedule(ctx context.Context, st *state.State, u *ui.UI)
 			return nil
 		}
 	}
-	if st.Config == nil {
-		st.Config = map[string]string{}
-	}
 	// A resumed or repeated setup is usually run without the flags again, so
 	// what the operator chose the first time has to survive it. Only an
 	// explicit flag changes a recorded value.
@@ -1501,13 +1511,6 @@ func (o *Options) backupSchedule(ctx context.Context, st *state.State, u *ui.UI)
 	if o.BackupSchedule != "" {
 		st.Config["backup-schedule"] = o.BackupSchedule
 	}
-	// The two approved booleans are the dangerous half of this. A repeat run
-	// without --require-mount would otherwise rewrite the unit without its
-	// missing-mount guard, so a backup could land on local disk the moment
-	// the share dropped — silently undoing a protection the operator asked
-	// for. An explicit flag still turns either on; nothing here turns one off.
-	o.BackupRequireMount = o.BackupRequireMount || st.Config["backup-require-mount"] == "true"
-	o.BackupPlaintext = o.BackupPlaintext || st.Config["backup-plaintext"] == "true"
 
 	in, err := o.installBackupSchedule(ctx, st, dest)
 	if err != nil {
