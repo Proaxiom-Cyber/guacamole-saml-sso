@@ -457,13 +457,14 @@ func TestStackPhasesFullPipelineUnattended(t *testing.T) {
 		StackRunOut: func(_ context.Context, name string, args ...string) (string, string, error) {
 			return "CREATE TABLE guacamole_entity (x int);\nCREATE TABLE guacamole_user_group (y int);\n", "", nil
 		},
-		ProbeCheck: func(context.Context, stack.Config) error { return nil },
+		ProbeCheck:          func(context.Context, stack.Config) error { return nil },
+		EnsureRecordingDirs: func(string) error { return nil }, // real one needs root
 	}
 	// Sign-in provisioning has its own tests; this one covers the local stack.
 	opts.Phases = withoutPhases(Phases(&opts),
 		"cloudflare-select", "cloudflare-tunnel", "cloudflare-dns",
 		"cloudflare-connect", "entra-signin", "cloudflare-access", "origin-certificate",
-		"backup-schedule")
+		"backup-schedule", "recording-schedule")
 	if err := Run(context.Background(), opts); err != nil {
 		t.Fatalf("full pipeline: %v\n%s", err, out.String())
 	}
@@ -918,5 +919,37 @@ func TestBackupScheduleNeverSilentlyUnencrypted(t *testing.T) {
 	}
 	if !strings.Contains(out2.String(), "guacdeploy backup") {
 		t.Fatalf("declining should still explain manual backups:\n%s", out2.String())
+	}
+}
+
+// TestRecordingBudgetIsAnExplicitChoice pins two things the specification
+// is firm about: no budget is invented for the operator, and when a budget
+// is set the consequence is stated plainly, because cleanup deletes
+// completed recordings even when their upload failed and that can lose a
+// recording permanently.
+func TestRecordingBudgetIsAnExplicitChoice(t *testing.T) {
+	o := &Options{StateDir: t.TempDir()}
+	st := &state.State{DeploymentID: "dep-1", Config: map[string]string{}}
+	u, out := testUI(false, "")
+	if err := o.recordingSchedule(context.Background(), st, u); err != nil {
+		t.Fatalf("an unset budget must not fail: %v", err)
+	}
+	if st.Config["recording-budget"] != "" {
+		t.Fatal("a budget was invented for the operator")
+	}
+	for _, r := range st.Resources {
+		if r.Type == "systemd-unit" {
+			t.Fatal("cleanup was installed without a budget")
+		}
+	}
+	if !strings.Contains(out.String(), "--recording-budget") {
+		t.Fatalf("the operator was not told how to set a budget:\n%s", out.String())
+	}
+
+	// A malformed budget is rejected rather than silently ignored.
+	bad := &Options{StateDir: t.TempDir(), RecordingBudget: "twenty gigs"}
+	u2, _ := testUI(false, "")
+	if err := bad.recordingSchedule(context.Background(), &state.State{DeploymentID: "d"}, u2); err == nil {
+		t.Fatal("a malformed budget must be rejected")
 	}
 }

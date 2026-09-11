@@ -19,6 +19,7 @@ import (
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/creds"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/entra"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/host"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recording"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/schedule"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/stack"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
@@ -80,6 +81,7 @@ func Phases(opts *Options) []Phase {
 		// Health is checked against the local origin before anything is
 		// published, so a failure later never leaves an exposed service.
 		{Name: "backup-schedule", Run: opts.backupSchedule},
+		{Name: "recording-schedule", Run: opts.recordingSchedule},
 		{Name: "stack-health", Run: opts.stackHealth},
 		{Name: "entra-signin", Run: opts.entraSignin},
 		// Access must follow entra-signin: its allow-list is built from the
@@ -107,6 +109,13 @@ func (o *Options) stackRun() stack.Runner {
 		return o.StackRun
 	}
 	return stack.ExecRunner
+}
+
+func (o *Options) ensureRecordingDirs() func(string) error {
+	if o.EnsureRecordingDirs != nil {
+		return o.EnsureRecordingDirs
+	}
+	return recording.EnsureDirs
 }
 
 func (o *Options) stackRunOut() stack.OutRunner {
@@ -183,6 +192,11 @@ func (o *Options) stackConfigure(ctx context.Context, st *state.State, u *ui.UI)
 func (o *Options) stackRender(ctx context.Context, st *state.State, u *ui.UI) error {
 	cfg := o.stackConfig(st)
 	if err := stack.Render(cfg); err != nil {
+		return err
+	}
+	// guacd writes recordings into a bind mount that must exist, and be
+	// owned by the container account, before the container starts.
+	if err := o.ensureRecordingDirs()(cfg.InstallDir); err != nil {
 		return err
 	}
 	now := time.Now().UTC()
@@ -483,6 +497,7 @@ type Options struct {
 	BackupPlaintext     bool   // explicit choice; encryption is the default
 	BackupRequireMount  bool   // destination must sit on an approved mounted share
 	NoBackupSchedule    bool   // do not install the timer
+	RecordingBudget     string // local recording storage budget, e.g. "20GiB"; "" declines cleanup
 	AccessEmails        string // comma-separated Access allow-list fallback
 
 	// journalIntent persists what the running phase is about to do, before
@@ -490,7 +505,10 @@ type Options struct {
 	// creation so a lost response can be reconciled on resume.
 	journalIntent func(detail string) error
 	ProbeCheck    func(context.Context, stack.Config) error // injectable for tests
-	Phases        []Phase
+	// EnsureRecordingDirs is injectable for tests: the real one changes
+	// directory ownership, which needs root.
+	EnsureRecordingDirs func(installDir string) error
+	Phases              []Phase
 }
 
 func (o *Options) phases() []Phase {
@@ -1225,5 +1243,51 @@ func (o *Options) backupSchedule(ctx context.Context, st *state.State, u *ui.UI)
 	}
 	u.Say("Scheduled backups installed: %s, keeping the last %d successful backups in %s.", in.OnCalendar, in.Keep, dest)
 	u.Say("The schedule runs without this binary present. A failed backup never expires an earlier good one.")
+	return nil
+}
+
+// recordingSchedule installs the local recording storage budget cleanup.
+//
+// The budget is a deliberate operator choice, so an unset budget declines
+// cleanup rather than inventing a limit. The specification is explicit
+// that cleanup deletes the oldest completed recordings even when their
+// upload failed, and that such a deletion can permanently lose a
+// recording, so setup says that plainly rather than burying it.
+func (o *Options) recordingSchedule(ctx context.Context, st *state.State, u *ui.UI) error {
+	if o.RecordingBudget == "" {
+		u.Say("No local recording budget was set, so scheduled recording cleanup is not installed.")
+		u.Say("Recordings will accumulate until the disk fills. Set --recording-budget to enforce a limit.")
+		return nil
+	}
+	budget, err := recording.ParseBytes(o.RecordingBudget)
+	if err != nil {
+		return fmt.Errorf("the recording budget %q is not a size: %w", o.RecordingBudget, err)
+	}
+	dest := st.Config["backup-dest"]
+	in, err := recording.Install(ctx, recording.InstallOptions{
+		DeploymentID: st.DeploymentID,
+		StateDir:     o.StateDir,
+		Dir:          filepath.Join(o.installDir(), "recordings"),
+		Dest:         dest,
+		Budget:       budget,
+		Plaintext:    o.BackupPlaintext,
+	})
+	if err != nil {
+		return fmt.Errorf("installing recording cleanup failed: %w", err)
+	}
+	st.Config["recording-budget"] = o.RecordingBudget
+	now := time.Now().UTC()
+	for _, unit := range []string{in.ServicePath, in.TimerPath, in.RuntimePath} {
+		if unit == "" {
+			continue
+		}
+		st.EnsureResource(state.Resource{
+			Provider: "host", Type: "systemd-unit", Name: unit,
+			Ownership: "installed by this deployment for recording cleanup", CreatedAt: now,
+		})
+	}
+	u.Say("Recording cleanup installed: %s, budget %s.", in.OnCalendar, recording.FormatBytes(in.Budget))
+	u.Say("When usage exceeds the budget the oldest completed recordings are deleted, even if their upload failed. A recording with no confirmed remote copy is then lost permanently, and each such deletion is reported.")
+	u.Say("Active recordings are never deleted, so usage can exceed the budget between runs.")
 	return nil
 }

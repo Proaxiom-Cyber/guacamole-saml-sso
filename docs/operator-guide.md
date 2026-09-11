@@ -385,3 +385,34 @@ binary is gone. A failed backup never expires an earlier good one.
 
 `guacdeploy backup-status` shows the destination and the last result.
 `guacdeploy backup-run` performs the scheduled backup immediately.
+
+## Session recordings
+
+guacd writes session recordings into `/opt/guacamole/recordings`, which
+setup creates and gives to the guacd container account before the
+containers start. Without that step guacd cannot write and sessions would
+run unrecorded without failing. The web application mounts the same
+directory read-only, so it can play a recording back but can never alter
+or delete session evidence.
+
+Turn recording on for a connection with
+`guacdeploy recordings-enable --connection NAME`.
+
+A recording is complete only when no process still holds it open. An
+active recording is never copied and never deleted.
+
+`--recording-budget` sets the local storage budget, for example
+`--recording-budget 20GiB`, and installs scheduled cleanup. Setup does
+not invent a budget: without the flag no cleanup is installed and
+recordings accumulate until the disk fills.
+
+When usage exceeds the budget, cleanup deletes the oldest completed
+recordings until usage is back within it. **Upload success is not a
+condition for deletion**: the budget takes priority, so a recording with
+no confirmed remote copy can be lost permanently. Every such deletion is
+reported. Cleanup is not a hard quota — active recordings and the gap
+between runs can take usage over the budget temporarily.
+
+`guacdeploy recordings-status` shows the last backup and cleanup result.
+`guacdeploy recordings-run` performs both immediately.
+`guacdeploy recordings-restore` recovers one recording from a backup.

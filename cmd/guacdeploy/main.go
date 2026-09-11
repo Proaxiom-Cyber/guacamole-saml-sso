@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/backup"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recording"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/schedule"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/session"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
@@ -34,6 +35,10 @@ Commands:
   backup-key  Generate the backup recovery key (guided only); --verify demonstrates recovery
   backup   Export the database, encrypted with the backup key, into a directory
   restore  Replace the database from a backup file (asks for consent)
+  recordings-run    Back up completed recordings, then enforce the storage budget
+  recordings-status Show recording backup and cleanup results
+  recordings-enable Turn on recording for a connection
+  recordings-restore Recover one recording from a backup
   backup-run  Take the scheduled backup, then expire old backups
   backup-status Show the scheduled backup destination and last-run result
   renew-cert  Renew the origin certificate now (used by the installed timer)
@@ -88,6 +93,10 @@ func run(args []string) int {
 	requireMount := fs.Bool("require-mount", false, "the backup destination must sit on an approved mounted share")
 	noBackupSchedule := fs.Bool("no-backup-schedule", false, "do not install the scheduled backup timer")
 	keep := fs.Int("keep", 0, "backup-run: successful backups to retain (default 7)")
+	recordingBudget := fs.String("recording-budget", "", "local recording storage budget, e.g. 20GiB")
+	recordingsDir := fs.String("recordings-dir", "", "recordings directory (default <install-dir>/recordings)")
+	connection := fs.String("connection", "", "recordings-enable: connection name to record")
+	out := fs.String("out", "", "recordings-restore: directory to write the recovered recording into")
 	verify := fs.Bool("verify", false, "backup-key: demonstrate recovery from the existing export")
 	dest := fs.String("dest", "", "backup: destination directory (default <state-dir>/backups)")
 	plaintext := fs.Bool("plaintext", false, "backup: explicitly write an unencrypted backup")
@@ -125,7 +134,7 @@ func run(args []string) int {
 			Zone: *zone, AccessEmails: *accessEmails, ACMEContact: *acmeContact,
 			BackupDest: *backupDest, BackupSchedule: *backupSchedule, BackupKeep: *backupKeep,
 			BackupPlaintext: *plaintext, BackupRequireMount: *requireMount,
-			NoBackupSchedule: *noBackupSchedule,
+			NoBackupSchedule: *noBackupSchedule, RecordingBudget: *recordingBudget,
 		}
 		if s := os.Getenv("GUACDEPLOY_TEST_SLEEP_PHASE"); s != "" {
 			// Test hook: replace the registry with a slow phase so session
@@ -160,6 +169,20 @@ func run(args []string) int {
 		}, u)
 	case "backup-status":
 		err = backupStatusCmd(*stateDir, u)
+	case "recordings-run":
+		var budget int64
+		if *recordingBudget != "" {
+			if budget, err = recording.ParseBytes(*recordingBudget); err != nil {
+				break
+			}
+		}
+		err = recordingsRunCmd(*stateDir, *recordingsDir, *dest, budget, *plaintext, u)
+	case "recordings-status":
+		err = recordingsStatusCmd(*stateDir, u)
+	case "recordings-enable":
+		err = recordingsEnableCmd(ctx, backup.ExecRunner, *stateDir, *connection, u)
+	case "recordings-restore":
+		err = recordingsRestoreCmd(*stateDir, *file, *out, *identityFile, u)
 	case "renew-cert":
 		err = renewCertCmd(ctx, *stateDir, u)
 	case "cert-status":
