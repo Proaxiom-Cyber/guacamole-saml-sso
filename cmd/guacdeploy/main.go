@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/backup"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/schedule"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/session"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/ui"
@@ -33,6 +34,8 @@ Commands:
   backup-key  Generate the backup recovery key (guided only); --verify demonstrates recovery
   backup   Export the database, encrypted with the backup key, into a directory
   restore  Replace the database from a backup file (asks for consent)
+  backup-run  Take the scheduled backup, then expire old backups
+  backup-status Show the scheduled backup destination and last-run result
   renew-cert  Renew the origin certificate now (used by the installed timer)
   cert-status Show the origin certificate and its last renewal result
   version  Print the tool version
@@ -79,6 +82,12 @@ func run(args []string) int {
 	zone := fs.String("zone", "", "Cloudflare zone name (default: the hostname's apex)")
 	accessEmails := fs.String("access-emails", "", "comma-separated Cloudflare Access allow-list, used when Entra groups are unavailable")
 	acmeContact := fs.String("acme-contact", "", "operator address for the certificate account, e.g. mailto:ops@example.com")
+	backupSchedule := fs.String("backup-schedule", "", "systemd OnCalendar expression for scheduled backups (default daily)")
+	backupKeep := fs.Int("backup-keep", 0, "successful backups to retain (default 7)")
+	backupDest := fs.String("backup-dest", "", "scheduled backup destination directory")
+	requireMount := fs.Bool("require-mount", false, "the backup destination must sit on an approved mounted share")
+	noBackupSchedule := fs.Bool("no-backup-schedule", false, "do not install the scheduled backup timer")
+	keep := fs.Int("keep", 0, "backup-run: successful backups to retain (default 7)")
 	verify := fs.Bool("verify", false, "backup-key: demonstrate recovery from the existing export")
 	dest := fs.String("dest", "", "backup: destination directory (default <state-dir>/backups)")
 	plaintext := fs.Bool("plaintext", false, "backup: explicitly write an unencrypted backup")
@@ -114,6 +123,9 @@ func run(args []string) int {
 			InstallDependencies: *installDeps, CredentialMode: *credMode,
 			Hostname: *hostname, AdminGroup: *adminGroup, OperatorGroup: *operatorGroup,
 			Zone: *zone, AccessEmails: *accessEmails, ACMEContact: *acmeContact,
+			BackupDest: *backupDest, BackupSchedule: *backupSchedule, BackupKeep: *backupKeep,
+			BackupPlaintext: *plaintext, BackupRequireMount: *requireMount,
+			NoBackupSchedule: *noBackupSchedule,
 		}
 		if s := os.Getenv("GUACDEPLOY_TEST_SLEEP_PHASE"); s != "" {
 			// Test hook: replace the registry with a slow phase so session
@@ -141,6 +153,13 @@ func run(args []string) int {
 		err = backupCmd(ctx, backup.ExecRunner, *stateDir, *dest, *plaintext, u)
 	case "restore":
 		err = restoreCmd(ctx, backup.ExecRunner, *stateDir, *file, *identityFile, *yes, u)
+	case "backup-run":
+		err = backupRunCmd(ctx, backup.ExecRunner, schedule.Options{
+			StateDir: *stateDir, Dest: *dest, Keep: *keep,
+			Plaintext: *plaintext, RequireMount: *requireMount,
+		}, u)
+	case "backup-status":
+		err = backupStatusCmd(*stateDir, u)
 	case "renew-cert":
 		err = renewCertCmd(ctx, *stateDir, u)
 	case "cert-status":

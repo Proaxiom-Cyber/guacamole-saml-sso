@@ -363,3 +363,25 @@ result. `guacdeploy renew-cert` renews immediately.
 If the deployment uses prompt-mode credentials, setup does not install
 the timer: a timer has no terminal to ask for a passphrase. Renew
 manually, or deploy with the env or file credential mode.
+
+## Scheduled backups
+
+Setup installs a daily backup timer after the stack is running. Change
+the schedule with `--backup-schedule`, how many successful backups to
+keep with `--backup-keep` (seven by default), and where they go with
+`--backup-dest`. Use `--require-mount` when the destination must sit on a
+mounted share: a missing or replaced mount then fails visibly instead of
+writing to local disk. `--no-backup-schedule` declines scheduling; manual
+backups still work.
+
+Scheduled backups encrypt with the recorded backup public key. If no key
+exists yet, setup does not install the timer and says so, rather than
+installing one that would write unencrypted backups. Generate a key with
+`guacdeploy backup-key`, then run setup again.
+
+Like certificate renewal, the timer calls a copy of the tool kept under
+`/usr/local/lib/guacdeploy`, so it keeps working after the downloaded
+binary is gone. A failed backup never expires an earlier good one.
+
+`guacdeploy backup-status` shows the destination and the last result.
+`guacdeploy backup-run` performs the scheduled backup immediately.

@@ -462,7 +462,8 @@ func TestStackPhasesFullPipelineUnattended(t *testing.T) {
 	// Sign-in provisioning has its own tests; this one covers the local stack.
 	opts.Phases = withoutPhases(Phases(&opts),
 		"cloudflare-select", "cloudflare-tunnel", "cloudflare-dns",
-		"cloudflare-connect", "entra-signin", "cloudflare-access", "origin-certificate")
+		"cloudflare-connect", "entra-signin", "cloudflare-access", "origin-certificate",
+		"backup-schedule")
 	if err := Run(context.Background(), opts); err != nil {
 		t.Fatalf("full pipeline: %v\n%s", err, out.String())
 	}
@@ -883,5 +884,39 @@ func TestCertificatePrecedesStackStart(t *testing.T) {
 	// The zone must be selected before the certificate can be validated.
 	if pos("cloudflare-select") > pos("origin-certificate") {
 		t.Fatal("DNS-01 validation needs the zone selected first")
+	}
+}
+
+// TestBackupScheduleNeverSilentlyUnencrypted pins the rule that a missing
+// backup key stops the schedule rather than installing one that would
+// write unencrypted backups. Encryption is the default and plaintext is
+// only ever an explicit choice.
+func TestBackupScheduleNeverSilentlyUnencrypted(t *testing.T) {
+	dir := t.TempDir()
+	o := &Options{StateDir: dir}
+	st := &state.State{DeploymentID: "dep-1", Config: map[string]string{}}
+	u, out := testUI(false, "")
+
+	// No key recorded and no explicit plaintext choice: install nothing.
+	if err := o.backupSchedule(context.Background(), st, u); err != nil {
+		t.Fatalf("a missing backup key must not be an error: %v", err)
+	}
+	if !strings.Contains(out.String(), "backup-key") {
+		t.Fatalf("the operator was not told how to fix it:\n%s", out.String())
+	}
+	for _, r := range st.Resources {
+		if r.Type == "systemd-unit" {
+			t.Fatal("a backup timer was installed without a backup key")
+		}
+	}
+
+	// Declining scheduling is a supported choice, not a failure.
+	o2 := &Options{StateDir: dir, NoBackupSchedule: true}
+	u2, out2 := testUI(false, "")
+	if err := o2.backupSchedule(context.Background(), &state.State{DeploymentID: "d"}, u2); err != nil {
+		t.Fatalf("declining the schedule must not fail: %v", err)
+	}
+	if !strings.Contains(out2.String(), "guacdeploy backup") {
+		t.Fatalf("declining should still explain manual backups:\n%s", out2.String())
 	}
 }

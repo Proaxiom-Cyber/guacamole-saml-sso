@@ -19,6 +19,7 @@ import (
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/creds"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/entra"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/host"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/schedule"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/stack"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/ui"
@@ -78,6 +79,7 @@ func Phases(opts *Options) []Phase {
 		{Name: "stack-up", Run: opts.stackUp},
 		// Health is checked against the local origin before anything is
 		// published, so a failure later never leaves an exposed service.
+		{Name: "backup-schedule", Run: opts.backupSchedule},
 		{Name: "stack-health", Run: opts.stackHealth},
 		{Name: "entra-signin", Run: opts.entraSignin},
 		// Access must follow entra-signin: its allow-list is built from the
@@ -475,6 +477,12 @@ type Options struct {
 	Cloudflare          *cloudflare.Client
 	Zone                string // explicit Cloudflare zone name
 	ACMEContact         string // optional operator address for the ACME account
+	BackupDest          string // scheduled backup destination; default <state-dir>/backups
+	BackupSchedule      string // systemd OnCalendar expression; "" means daily
+	BackupKeep          int    // successful backups to retain; 0 means 7
+	BackupPlaintext     bool   // explicit choice; encryption is the default
+	BackupRequireMount  bool   // destination must sit on an approved mounted share
+	NoBackupSchedule    bool   // do not install the timer
 	AccessEmails        string // comma-separated Access allow-list fallback
 
 	// journalIntent persists what the running phase is about to do, before
@@ -1161,5 +1169,61 @@ func (o *Options) originCertificate(ctx context.Context, st *state.State, u *ui.
 		})
 	}
 	u.Say("Certificate renewal installed; it runs without this binary present.")
+	return nil
+}
+
+// backupSchedule installs the scheduled backup timer.
+//
+// It runs after the stack is up, because the timer's first run needs a
+// running database, and after the backup key exists, because scheduled
+// backups encrypt with the recorded public key. Scheduling is optional:
+// the specification offers manual backups and *optional* scheduled ones,
+// so declining it is a supported choice, not a failure.
+func (o *Options) backupSchedule(ctx context.Context, st *state.State, u *ui.UI) error {
+	if o.NoBackupSchedule {
+		u.Say("Scheduled backups were declined. Take backups with 'guacdeploy backup'.")
+		return nil
+	}
+	if st.Config["backup-public-key"] == "" && !o.BackupPlaintext {
+		// Never silently downgrade to an unencrypted backup.
+		u.Say("No backup key is recorded, so scheduled backups are not installed.")
+		u.Say("Run 'guacdeploy backup-key' to generate one, then run setup again to install the schedule.")
+		return nil
+	}
+	dest := o.BackupDest
+	if dest == "" {
+		dest = filepath.Join(o.StateDir, "backups")
+	}
+	if st.Config == nil {
+		st.Config = map[string]string{}
+	}
+	st.Config["backup-dest"] = dest
+	st.Config["backup-schedule"] = o.BackupSchedule
+
+	in, err := schedule.Install(ctx, schedule.Options{
+		Run:          schedule.ExecRunner,
+		DeploymentID: st.DeploymentID,
+		StateDir:     o.StateDir,
+		Dest:         dest,
+		OnCalendar:   o.BackupSchedule,
+		Keep:         o.BackupKeep,
+		Plaintext:    o.BackupPlaintext,
+		RequireMount: o.BackupRequireMount,
+	})
+	if err != nil {
+		return fmt.Errorf("installing the backup schedule failed: %w", err)
+	}
+	now := time.Now().UTC()
+	for _, unit := range []string{in.ServicePath, in.TimerPath, in.RuntimePath} {
+		if unit == "" {
+			continue
+		}
+		st.EnsureResource(state.Resource{
+			Provider: "host", Type: "systemd-unit", Name: unit,
+			Ownership: "installed by this deployment for scheduled backups", CreatedAt: now,
+		})
+	}
+	u.Say("Scheduled backups installed: %s, keeping the last %d successful backups in %s.", in.OnCalendar, in.Keep, dest)
+	u.Say("The schedule runs without this binary present. A failed backup never expires an earlier good one.")
 	return nil
 }
