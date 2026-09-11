@@ -11,6 +11,10 @@
 //     written to it — and every provider delete re-verifies its ownership
 //     marker at deletion time. A refusal is reported as retained, never as
 //     success.
+//   - The recorded resources are not the whole truth, so the journal is read
+//     as well: a phase that intended to create things and did not succeed is
+//     reconciled against its provider by this deployment's ownership marker
+//     before anything is reported. See reconcile.go.
 //   - Preserve created resources that now support unrelated use. This tool
 //     creates no DNS zone, no Access organisation and no Entra tenant, so
 //     the specification's worked example — a created zone holding unrelated
@@ -35,6 +39,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -144,6 +149,11 @@ type Plan struct {
 	// Settings are the pre-existing settings this deployment changed that
 	// have not been restored yet, already classified by internal/settings.
 	Settings []settings.Entry
+	// Reconciled is what asking the providers about the journal's failed
+	// creation phases produced. Its adopted resources are already in the
+	// record, and so already in Items; its name-only matches and its
+	// uncertain work are reported and never acted on. See reconcile.go.
+	Reconciled Reconciliation
 }
 
 func (p Plan) filter(a Action) []Item {
@@ -219,7 +229,7 @@ func classify(r state.Resource) (Kind, Action, string) {
 		return KindContainer, ActionRemove, "stop and remove the container with the rest of the stack"
 	case "host/credential-dir":
 		return KindCredential, ActionRemove, "remove the credential files this deployment wrote, and the directory if nothing else is in it"
-	case "host/credential-file":
+	case "host/credential-file", "host/credential-sealed":
 		return KindCredential, ActionWithParent, "removed with the credential directory that holds it"
 	case "host/config-directory":
 		return KindConfigDir, ActionRemove, "remove the files this deployment rendered; the directory itself stays if anything else is still in it"
@@ -376,6 +386,8 @@ func (p Plan) Report(u *ui.UI) {
 		}
 	}
 
+	p.Reconciled.report(u.Say)
+
 	u.Say("")
 	u.Say("Pre-existing resources are never offered here: this deployment records only what it created.")
 	settings.Report(u, p.Settings)
@@ -397,6 +409,11 @@ type Ops struct {
 	RemoveHostUnits func(ctx context.Context) (removed []string, err error)
 	// RemoveContainers takes the whole stack down in one call.
 	RemoveContainers func(ctx context.Context) error
+	// ContainersPresent reports which of these container names still exist
+	// after that call. A nil seam leaves the removal step's own account of
+	// itself as the only evidence, which is how a still-present path was
+	// once reported as removed; see hostUnitOutcomes.
+	ContainersPresent func(ctx context.Context, names []string) (present []string, err error)
 	// RemoveRendered removes what this deployment rendered into dir and
 	// returns whatever else is still there, so a directory that now holds
 	// unrelated content is preserved rather than deleted.
@@ -421,6 +438,11 @@ const (
 	// StatusFailed: the delete was attempted and errored. Residue. The
 	// resource stays in the record so a later run can try again.
 	StatusFailed = "failed"
+	// StatusUncertain: a phase that intended to create resources did not
+	// succeed, and its provider could not be asked what it left behind.
+	// Residue by construction — nothing proves there is nothing there — so
+	// the teardown is not reported complete and the record is kept.
+	StatusUncertain = "uncertain"
 )
 
 // Outcome is what happened to one item.
@@ -438,6 +460,11 @@ type Result struct {
 	Notes []string
 	// Unrestored are pre-existing settings still waiting for a person.
 	Unrestored []settings.Entry
+	// Unowned are resources found at a provider that match this
+	// deployment's naming but carry no ownership marker. Nothing was done
+	// to them and nothing will be; they are reported for review. They are
+	// not residue: they were never this deployment's.
+	Unowned []state.Resource
 }
 
 func (r Result) with(status string) []Outcome {
@@ -450,9 +477,13 @@ func (r Result) with(status string) []Outcome {
 	return out
 }
 
-// Residue is everything eligible that is still there.
+// Residue is everything eligible that is still there, and everything that
+// could not be shown to be gone. Uncertain work counts: the specification
+// forbids reporting a complete teardown with unexplained residue, and work
+// nobody could check is exactly that.
 func (r Result) Residue() []Outcome {
-	return append(r.with(StatusRetained), r.with(StatusFailed)...)
+	out := append(r.with(StatusRetained), r.with(StatusFailed)...)
+	return append(out, r.with(StatusUncertain)...)
 }
 
 // Complete reports whether the teardown left no residue. Items preserved on
@@ -479,12 +510,18 @@ func (r Result) Report(u *ui.UI) {
 	for _, n := range r.Notes {
 		u.Say("Note: %s", n)
 	}
+	if len(r.Unowned) > 0 {
+		u.Say("Found by name only and left untouched, because nothing proves they are this deployment's:")
+		for _, res := range r.Unowned {
+			u.Say("  %s %s %s — review by hand", res.Provider, res.Type, res.Name)
+		}
+	}
 	if res := r.Residue(); len(res) > 0 {
-		u.Say("Still present, and not removed:")
+		u.Say("Still present, or not shown to be gone:")
 		for _, o := range res {
 			u.Say("  %s (%s) — %s", o.Item, o.Status, o.Detail)
 		}
-		u.Say("Each is still in the deployment record, so running teardown again retries it.")
+		u.Say("The deployment record is kept, so running teardown again retries each of them.")
 	}
 	for _, e := range r.Unrestored {
 		u.Say("Not restored: %s — restoring a pre-existing setting needs interactive approval.", e.Change.Target)
@@ -529,7 +566,15 @@ func Run(ctx context.Context, st *state.State, plan Plan, ops Ops, u *ui.UI, o O
 	if len(plan.Removable()) == 0 {
 		u.Say("")
 		u.Say("There is nothing to remove.")
-		return Result{}, nil
+		// "Nothing recorded" is not the same as "nothing there". Work a
+		// provider could not confirm is still outstanding, and saying the
+		// teardown is complete here is the defect this guards against.
+		res := plan.Reconciled.seed()
+		res.Report(u)
+		if !res.Complete() {
+			return res, incomplete(res)
+		}
+		return res, nil
 	}
 
 	switch {
@@ -562,7 +607,7 @@ func Run(ctx context.Context, st *state.State, plan Plan, ops Ops, u *ui.UI, o O
 
 	// Restoring a changed pre-existing setting comes before any delete: the
 	// restore writes to the object, so the object has to still exist.
-	res := Result{}
+	res := plan.Reconciled.seed()
 	if len(plan.Settings) > 0 {
 		if u.Interactive {
 			if err := settings.Restore(ctx, st, o.Registry, u, o.Save); err != nil {
@@ -619,10 +664,15 @@ func Run(ctx context.Context, st *state.State, plan Plan, ops Ops, u *ui.UI, o O
 
 	res.Report(u)
 	if !res.Complete() {
-		return res, fmt.Errorf("%w: %d item(s) are still present and %d pre-existing setting(s) are not restored",
-			ErrIncomplete, len(res.Residue()), len(res.Unrestored))
+		return res, incomplete(res)
 	}
 	return res, nil
+}
+
+// incomplete is the one error a run with residue ends with.
+func incomplete(res Result) error {
+	return fmt.Errorf("%w: %d item(s) are still present or could not be checked, and %d pre-existing setting(s) are not restored",
+		ErrIncomplete, len(res.Residue()), len(res.Unrestored))
 }
 
 // runStep removes everything in one step of the order, and then accounts
@@ -661,7 +711,7 @@ func removeStep(ctx context.Context, k Kind, plan Plan, ops Ops) []Outcome {
 	case KindHostUnit:
 		return hostUnitOutcomes(ctx, items, ops)
 	case KindContainer:
-		return bulk(items, call0(ctx, ops.RemoveContainers))
+		return containerOutcomes(ctx, items, ops)
 	case KindCredential:
 		if ops.RemoveCredentials == nil {
 			return bulk(items, errNotImplemented)
@@ -712,29 +762,112 @@ func removeStep(ctx context.Context, k Kind, plan Plan, ops Ops) []Outcome {
 
 // hostUnitOutcomes removes every unit in one call, because they share one
 // binary copy that must outlive all of them.
+//
+// Every path is then re-checked on disk, and that check — not the removal
+// step's own account of itself — decides what is reported as removed. A live
+// teardown listed the shared binary /usr/local/lib/guacdeploy/guacdeploy
+// under "Removed" while it was still on the host, because a nil error was
+// read as "all of them went": each package here removes only what still
+// carries this deployment's marker, and each leaves the shared binary alone
+// while another unit still calls it, both without an error. The filesystem
+// is the only thing that knows.
 func hostUnitOutcomes(ctx context.Context, items []Item, ops Ops) []Outcome {
 	if ops.RemoveHostUnits == nil {
 		return bulk(items, errNotImplemented)
 	}
 	removed, err := ops.RemoveHostUnits(ctx)
-	if err == nil {
-		// A missing unit file is success, not a failure, so a unit that is
-		// absent from removed is already gone.
-		return bulk(items, nil)
-	}
 	gone := map[string]bool{}
 	for _, p := range removed {
 		gone[p] = true
 	}
 	var out []Outcome
 	for _, it := range items {
-		if gone[it.Resource.Name] {
+		path := it.Resource.Name
+		switch {
+		case !onDisk(path):
+			// Absent is removed, whether this run took it or an earlier one
+			// did. That is what makes a second run safe.
 			out = append(out, Outcome{Item: it, Status: StatusRemoved})
-			continue
+		case err != nil:
+			out = append(out, outcome(it, err))
+		case gone[path]:
+			out = append(out, Outcome{Item: it, Status: StatusRetained,
+				Detail: "the removal step reported removing it, but " + path + " is still on this host"})
+		default:
+			out = append(out, Outcome{Item: it, Status: StatusRetained,
+				Detail: "the removal step reported no error, but " + path + " is still on this host"})
 		}
-		out = append(out, outcome(it, err))
 	}
 	return out
+}
+
+// containerOutcomes takes the stack down in one call and then asks the
+// container runtime which of the recorded names are still there, on the same
+// rule as hostUnitOutcomes: the removal step's own account of itself is not
+// evidence. "docker compose down" exits 0 for a project it can see, so a
+// container this deployment created under a project name the current
+// configuration no longer produces — an installation directory renamed
+// between runs — is left running and reported as removed.
+func containerOutcomes(ctx context.Context, items []Item, ops Ops) []Outcome {
+	if ops.RemoveContainers == nil {
+		return bulk(items, errNotImplemented)
+	}
+	err := ops.RemoveContainers(ctx)
+	if ops.ContainersPresent == nil {
+		return bulk(items, err)
+	}
+	names := make([]string, 0, len(items))
+	for _, it := range items {
+		names = append(names, it.Resource.Name)
+	}
+	present, checkErr := ops.ContainersPresent(ctx, names)
+	if checkErr != nil {
+		// Unanswerable is never evidence of removal. It is residue, so the
+		// run reports what to check instead of claiming completeness.
+		var out []Outcome
+		for _, it := range items {
+			out = append(out, Outcome{Item: it, Status: StatusUncertain,
+				Detail: fmt.Sprintf("the removal step reported %v, but whether %s is still running could not be checked: %v",
+					result(err), it.Resource.Name, checkErr)})
+		}
+		return out
+	}
+	still := map[string]bool{}
+	for _, n := range present {
+		still[n] = true
+	}
+	var out []Outcome
+	for _, it := range items {
+		switch {
+		case !still[it.Resource.Name]:
+			// Gone is removed, whether this run took it or an earlier one
+			// did. That is what makes a second run safe.
+			out = append(out, Outcome{Item: it, Status: StatusRemoved})
+		case err != nil:
+			out = append(out, outcome(it, err))
+		default:
+			out = append(out, Outcome{Item: it, Status: StatusRetained,
+				Detail: "the removal step reported no error, but container " + it.Resource.Name + " is still on this host"})
+		}
+	}
+	return out
+}
+
+// result words a removal step's own outcome for a report that cannot rely on
+// it either way.
+func result(err error) string {
+	if err == nil {
+		return "no error"
+	}
+	return err.Error()
+}
+
+// onDisk reports whether the path is still there. Anything other than a
+// plain "it is not there" counts as still there: a stat this process cannot
+// answer is never evidence that something was removed.
+func onDisk(path string) bool {
+	_, err := os.Lstat(path)
+	return !errors.Is(err, os.ErrNotExist)
 }
 
 // credentialNames is the credential files recorded under the credential
@@ -743,7 +876,8 @@ func hostUnitOutcomes(ctx context.Context, items []Item, ops Ops) []Outcome {
 func credentialNames(plan Plan) []string {
 	var out []string
 	for _, it := range plan.Items {
-		if it.Resource.Provider == "host" && it.Resource.Type == "credential-file" {
+		if it.Resource.Provider == "host" &&
+			(it.Resource.Type == "credential-file" || it.Resource.Type == "credential-sealed") {
 			out = append(out, it.Resource.Name)
 		}
 	}
@@ -770,6 +904,9 @@ func dirOutcomes(items []Item, remove func(dir string) ([]string, error)) []Outc
 				Detail: fmt.Sprintf("the rendered files are gone; %s stays because it still holds %s",
 					it.Resource.Name, strings.Join(leftover, ", "))})
 		default:
+			// Removal is taken from the operation that performed it:
+			// removeIfEmpty removes the directory itself and returns that
+			// os.Remove's error, so a directory reported gone here is gone.
 			out = append(out, Outcome{Item: it, Status: StatusRemoved})
 		}
 	}

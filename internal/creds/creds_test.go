@@ -67,7 +67,7 @@ func TestPromptModeWithoutTerminal(t *testing.T) {
 }
 
 func TestExplainCoversAllModes(t *testing.T) {
-	for _, m := range Modes {
+	for _, m := range AllModes {
 		if e := Explain(m); e == "" || e == "unknown mode" {
 			t.Fatalf("no explanation for %s", m)
 		}

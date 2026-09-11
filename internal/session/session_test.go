@@ -1323,3 +1323,168 @@ func TestConnectorRefusesWhenAccessIsNotVerifiableNow(t *testing.T) {
 		t.Fatalf("want a clear refusal with nothing recorded, got %v", err)
 	}
 }
+
+// sealingHost is a host that can seal: systemd-creds is present, new enough,
+// and reports a usable TPM. The encrypt call is faked so the test needs no
+// TPM, and it records its arguments so the test can prove the value never
+// travels in one.
+func sealingHost(t *testing.T, args *[]string) (creds.Detector, creds.Runner) {
+	t.Helper()
+	run := func(_ context.Context, stdin, name string, a ...string) (string, string, error) {
+		*args = append(*args, name+" "+strings.Join(a, " "))
+		switch {
+		case len(a) > 0 && a[0] == "--version":
+			return "systemd 257 (257.4)\n", "", nil
+		case len(a) > 0 && a[0] == "has-tpm2":
+			return "yes\n+firmware\n", "", nil
+		case len(a) > 0 && a[0] == "encrypt":
+			if stdin == "" {
+				return "", "", errors.New("nothing on stdin to encrypt")
+			}
+			return "-----BEGIN CREDENTIAL-----\nsealed-" + fmt.Sprint(len(stdin)) + "\n-----END CREDENTIAL-----\n", "", nil
+		}
+		return "", "", fmt.Errorf("unexpected command %s %v", name, a)
+	}
+	return creds.Detector{Run: run, TPMDevices: func() []string { return []string{"/dev/tpm0"} }}, run
+}
+
+// The specification's encrypted storage has to be reachable from setup, and
+// what lands on disk has to be the sealed blob and nothing else.
+func TestTPMModeStoresSealedBlobsAndNoPlaintext(t *testing.T) {
+	dir := t.TempDir()
+	// The credentials a person has to supply are read through the hidden
+	// prompt, so this is an interactive run with the mode already chosen.
+	u, out := testUI(true, "y\ny\n")
+	const secret = "sekret-value-1234"
+	u.Secret = func(string) (string, error) { return secret, nil }
+	var calls []string
+	d, run := sealingHost(t, &calls)
+
+	o := Options{StateDir: dir, UI: u, Host: fakeHost(t), CredentialMode: creds.ModeTPM,
+		CredDetector: d, CredsRun: run}
+	if err := Run(context.Background(), core(o)); err != nil {
+		t.Fatalf("tpm-mode setup: %v", err)
+	}
+	st, _ := state.Read(dir)
+	if st.Config["credential-mode"] != creds.ModeTPM {
+		t.Fatalf("mode not recorded: %+v", st.Config)
+	}
+
+	// The sealed blob is there, owner-only, and no plaintext file is beside it.
+	blob := filepath.Join(dir, "credentials", "postgres-password.cred")
+	info, err := os.Stat(blob)
+	if err != nil {
+		t.Fatalf("sealed credential missing: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("sealed credential mode %v, want 0600", info.Mode().Perm())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "credentials", "postgres-password")); err == nil {
+		t.Fatal("a plaintext copy was written beside the sealed credential")
+	}
+	entries, _ := os.ReadDir(filepath.Join(dir, "credentials"))
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".cred") {
+			t.Fatalf("%s is not a sealed credential; sealed mode must write nothing else", e.Name())
+		}
+		b, _ := os.ReadFile(filepath.Join(dir, "credentials", e.Name()))
+		if strings.Contains(string(b), secret) {
+			t.Fatalf("%s holds the plaintext value", e.Name())
+		}
+	}
+
+	// The value reaches systemd-creds on stdin only: never an argument, and
+	// never the state file or the transcript.
+	for _, c := range calls {
+		if strings.Contains(c, secret) {
+			t.Fatalf("the value travelled in a command argument: %s", c)
+		}
+	}
+	raw, _ := os.ReadFile(filepath.Join(dir, "state.json"))
+	if strings.Contains(string(raw), secret) || strings.Contains(out.String(), secret) {
+		t.Fatal("secret value leaked into state or output")
+	}
+
+	// Teardown has to be able to tell a sealed credential from a plaintext
+	// one, and has to know the name of the file that is actually on disk.
+	var sealed bool
+	for _, r := range st.Resources {
+		if r.Type == "credential-file" {
+			t.Fatalf("a sealed credential was recorded as a plaintext file: %+v", r)
+		}
+		if r.Type == "credential-sealed" && r.Name == "postgres-password.cred" {
+			sealed = true
+		}
+	}
+	if !sealed {
+		t.Fatalf("sealed credential not recorded for teardown: %+v", st.Resources)
+	}
+}
+
+// No silent downgrade: a host that cannot seal must stop the run with the
+// reason, never quietly write the value in plaintext instead.
+func TestUnavailableSealedModeIsRefusedWithoutDowngrade(t *testing.T) {
+	dir := t.TempDir()
+	u, out := testUI(false, "")
+	u.Secret = func(string) (string, error) { return "sekret-value-1234", nil }
+	// systemd-creds works, but this host has no TPM device at all.
+	d := creds.Detector{
+		Run: func(_ context.Context, _, _ string, a ...string) (string, string, error) {
+			if len(a) > 0 && a[0] == "--version" {
+				return "systemd 257 (257.4)\n", "", nil
+			}
+			return "", "", errors.New("should not be reached")
+		},
+		TPMDevices: func() []string { return nil },
+	}
+	o := Options{StateDir: dir, UI: u, Host: fakeHost(t), CredentialMode: creds.ModeTPM, CredDetector: d}
+	err := Run(context.Background(), core(o))
+	if err == nil {
+		t.Fatal("a host with no TPM accepted tpm mode")
+	}
+	if !strings.Contains(err.Error(), "not available on this host") || !strings.Contains(err.Error(), "vTPM") {
+		t.Fatalf("the refusal does not name the reason: %v", err)
+	}
+	st, _ := state.Read(dir)
+	if st != nil && st.Config["credential-mode"] != "" {
+		t.Fatalf("an unavailable mode was recorded anyway: %q", st.Config["credential-mode"])
+	}
+	if _, err := os.Stat(filepath.Join(dir, "credentials")); err == nil {
+		t.Fatal("credentials were written despite the refusal")
+	}
+	if strings.Contains(out.String(), "Credential storage method: file") {
+		t.Fatal("the run downgraded to plaintext on its own")
+	}
+}
+
+// The menu shows why an encrypted mode is unavailable rather than hiding it,
+// so the operator can see the choice was considered.
+func TestMenuExplainsWhySealedModesAreUnavailable(t *testing.T) {
+	dir := t.TempDir()
+	// y = fresh setup, f = file mode, y = approve the plaintext exception.
+	u, out := testUI(true, "y\nf\ny\n")
+	u.Secret = func(string) (string, error) { return "sekret-value-1234", nil }
+	d := creds.Detector{
+		Run: func(_ context.Context, _, _ string, _ ...string) (string, string, error) {
+			return "", "no such file", errors.New("exec: systemd-creds")
+		},
+		TPMDevices: func() []string { return nil },
+	}
+	o := Options{StateDir: dir, UI: u, Host: fakeHost(t), CredDetector: d}
+	if err := Run(context.Background(), core(o)); err != nil {
+		t.Fatalf("guided setup: %v", err)
+	}
+	for _, want := range []string{
+		"tpm — not available on this host",
+		"host — not available on this host",
+		"systemd-creds is not available on this host",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("missing %q in:\n%s", want, out.String())
+		}
+	}
+	st, _ := state.Read(dir)
+	if st.Config["credential-mode"] != creds.ModeFile {
+		t.Fatalf("the operator's choice was not honoured: %+v", st.Config)
+	}
+}

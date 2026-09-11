@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -77,6 +78,7 @@ type blobStore struct {
 	truncate   map[string]int  // store only this many bytes of these blobs
 	corruptMD5 map[string]bool // report a different Content-MD5 on read-back
 	omitMD5    map[string]bool // report no Content-MD5 at all, as a blob written in blocks does
+	badDate    map[string]bool // report a Last-Modified that cannot be parsed
 	denyDelete bool
 }
 
@@ -84,12 +86,41 @@ type storedBlob struct {
 	content []byte
 	md5     string
 	meta    map[string]string
+	// modified is what the service reports as Last-Modified. Zero means "just
+	// now", which is what a real write produces; ageBlob sets it back so
+	// retention by age can be tested without waiting a month.
+	modified time.Time
+}
+
+func (b storedBlob) lastModified() time.Time {
+	if b.modified.IsZero() {
+		return time.Now().UTC()
+	}
+	return b.modified
+}
+
+// ageBlob backdates one stored blob and its completion manifest, the way a
+// copy that has been in the container for a while looks.
+func ageBlob(t *testing.T, s *blobStore, name string, at time.Time) {
+	t.Helper()
+	for _, n := range []string{name, name + backup.ManifestSuffix} {
+		b, ok := s.blobs[n]
+		if !ok {
+			continue
+		}
+		b.modified = at.UTC()
+		s.blobs[n] = b
+	}
+	if _, ok := s.blobs[name]; !ok {
+		t.Fatalf("cannot age %s: it is not in the container", name)
+	}
 }
 
 func newBlobStore(t *testing.T) *blobStore {
 	return &blobStore{t: t, blobs: map[string]storedBlob{},
 		failPut: map[string]bool{}, truncate: map[string]int{},
-		corruptMD5: map[string]bool{}, omitMD5: map[string]bool{}}
+		corruptMD5: map[string]bool{}, omitMD5: map[string]bool{},
+		badDate: map[string]bool{}}
 }
 
 // blobName extracts the blob name from a data-plane URL: the path after the
@@ -170,17 +201,41 @@ func (s *blobStore) list(req *http.Request) (*http.Response, error) {
 			`<?xml version="1.0"?><Error><Code>AuthorizationPermissionMismatch</Code><Message>This request is not authorized to perform this operation using this permission.</Message></Error>`,
 			http.Header{"X-Ms-Error-Code": {"AuthorizationPermissionMismatch"}}), nil
 	}
-	prefix := req.URL.Query().Get("prefix")
+	q := req.URL.Query()
+	prefix, marker := q.Get("prefix"), q.Get("marker")
+	max, err := strconv.Atoi(q.Get("maxresults"))
+	if err != nil || max < 1 {
+		s.t.Errorf("List Blobs sent maxresults %q", q.Get("maxresults"))
+		max = 1
+	}
+
+	// The service pages in name order and continues from the marker, so the
+	// fake does too: a listing that walked a Go map would hide the paging bug
+	// this exists to catch.
+	var names []string
+	for name := range s.blobs {
+		if strings.HasPrefix(name, prefix) && name > marker {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	next := ""
+	if len(names) > max {
+		names, next = names[:max], names[max-1]
+	}
+
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?><EnumerationResults><Blobs>`)
-	for name, blob := range s.blobs {
-		if !strings.HasPrefix(name, prefix) {
-			continue
+	for _, name := range names {
+		blob := s.blobs[name]
+		modified := blob.lastModified().Format(http.TimeFormat)
+		if s.badDate[name] {
+			modified = "whenever"
 		}
-		fmt.Fprintf(&b, `<Blob><Name>%s</Name><Properties><Content-Length>%d</Content-Length><Content-MD5>%s</Content-MD5></Properties></Blob>`,
-			name, len(blob.content), blob.md5)
+		fmt.Fprintf(&b, `<Blob><Name>%s</Name><Properties><Content-Length>%d</Content-Length><Content-MD5>%s</Content-MD5><Last-Modified>%s</Last-Modified></Properties></Blob>`,
+			name, len(blob.content), blob.md5, modified)
 	}
-	b.WriteString(`</Blobs></EnumerationResults>`)
+	fmt.Fprintf(&b, `</Blobs><NextMarker>%s</NextMarker></EnumerationResults>`, next)
 	return httpResponse(http.StatusOK, b.String(), nil), nil
 }
 
@@ -229,7 +284,7 @@ func (s *blobStore) head(name string) (*http.Response, error) {
 	hdr := http.Header{
 		"Content-Length": {fmt.Sprint(len(blob.content))},
 		"Content-Md5":    {blob.md5},
-		"Last-Modified":  {time.Now().UTC().Format(http.TimeFormat)},
+		"Last-Modified":  {blob.lastModified().Format(http.TimeFormat)},
 	}
 	if s.corruptMD5[name] {
 		hdr.Set("Content-Md5", md5Base64([]byte("something else entirely")))

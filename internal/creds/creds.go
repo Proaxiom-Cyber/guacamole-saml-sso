@@ -37,10 +37,6 @@ const (
 // Modes is the pre-encryption mode set, kept while the session still offers
 // only these three.
 //
-// ponytail: delete this once the session menu moves to AllModes (see
-// WIRING.md); AllModes is the complete list.
-var Modes = []string{ModePrompt, ModeEnv, ModeFile}
-
 // Spec describes one credential the deployment needs. The registry grows as
 // integration slices land.
 type Spec struct {

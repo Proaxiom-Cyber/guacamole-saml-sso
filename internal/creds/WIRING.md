@@ -1,4 +1,10 @@
-# Wiring encrypted credentials into the session
+# Encrypted credentials: wired into the session on 11 September 2026
+
+Everything below is **done**. `internal/session` now offers `creds.AllModes`, checks
+`Detector.Available` before recording any mode (including one named with `--credentials`),
+stores with `Manager.Store` under `creds.Persistent`, and records `credential-sealed`
+resources by their on-disk filename so teardown removes the right file. `creds.Modes` is
+deleted. The document is kept as the record of what the contract is and why.
 
 This package now offers five credential modes. Two are new and both are encrypted by
 `systemd-creds`:

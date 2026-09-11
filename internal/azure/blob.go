@@ -196,32 +196,74 @@ func (c *Client) GetBlob(ctx context.Context, d Destination, name string) ([]byt
 	return body, err
 }
 
-// ListBlobs returns the names of this deployment's blobs under prefix,
+// ListBlobs returns one page of this deployment's blobs under prefix,
 // newest-first ordering being irrelevant here because callers match by name.
-// It lists at most max entries and does not follow continuation markers: the
-// callers are a permission check and a "what is already there" lookup, and
-// neither needs the whole container.
+// It lists at most max entries and stops at the end of the first page: its
+// caller is a permission probe, which needs one object, not the container.
 //
-// ponytail: no pagination. Add marker following when remote retention (issue
-// #20) needs to walk every recording.
+// Retention must not use this. Use listAll, which follows the continuation
+// marker: an object hidden behind one would silently never expire.
 func (c *Client) ListBlobs(ctx context.Context, d Destination, prefix string, max int) ([]BlobProperties, error) {
+	page, _, err := c.listPage(ctx, d, prefix, "", max)
+	return page, err
+}
+
+// listPageSize is how many entries one List Blobs call asks for. The service
+// caps a page at 5000; 1000 keeps one response small enough to read whole.
+const listPageSize = 1000
+
+// maxListPages bounds a walk at five million objects. A service that ever
+// returned the same marker twice would otherwise loop forever, and a retention
+// run that never returns is a retention run that never expires anything.
+const maxListPages = 5000
+
+// listAll walks every page under prefix, following the continuation marker.
+//
+// Retention needs this and the single-page listing will not do: a container
+// holding more than one page of recordings would hide the oldest ones —
+// exactly the objects retention exists to remove — behind a marker, and they
+// would be kept for ever without anything reporting a failure.
+func (c *Client) listAll(ctx context.Context, d Destination, prefix string) ([]BlobProperties, error) {
+	var out []BlobProperties
+	marker := ""
+	for page := 0; page < maxListPages; page++ {
+		got, next, err := c.listPage(ctx, d, prefix, marker, listPageSize)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, got...)
+		if next == "" || next == marker {
+			return out, nil
+		}
+		marker = next
+	}
+	return nil, fmt.Errorf("listing %s did not end after %d pages; nothing was expired", prefix, maxListPages)
+}
+
+// listPage returns one page of the listing and the marker that continues it,
+// empty when the page is the last one.
+func (c *Client) listPage(ctx context.Context, d Destination, prefix, marker string, max int) ([]BlobProperties, string, error) {
 	q := url.Values{
 		"restype":    {"container"},
 		"comp":       {"list"},
 		"prefix":     {prefix},
 		"maxresults": {strconv.Itoa(max)},
 	}
+	if marker != "" {
+		q.Set("marker", marker)
+	}
 	rawURL := d.BlobEndpoint + "/" + url.PathEscape(d.Container) + "?" + q.Encode()
 	req, err := c.blobRequest(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	body, _, err := c.blobDo(req)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	var doc struct {
-		Blobs struct {
+		NextMarker string `xml:"NextMarker"`
+		Blobs      struct {
 			Blob []struct {
 				Name       string `xml:"Name"`
 				Properties struct {
@@ -233,7 +275,7 @@ func (c *Client) ListBlobs(ctx context.Context, d Destination, prefix string, ma
 		} `xml:"Blobs"`
 	}
 	if err := xml.Unmarshal(body, &doc); err != nil {
-		return nil, fmt.Errorf("the blob listing is not readable XML: %w", err)
+		return nil, "", fmt.Errorf("the blob listing is not readable XML: %w", err)
 	}
 	out := make([]BlobProperties, 0, len(doc.Blobs.Blob))
 	for _, b := range doc.Blobs.Blob {
@@ -242,7 +284,7 @@ func (c *Client) ListBlobs(ctx context.Context, d Destination, prefix string, ma
 			ContentMD5: b.Properties.ContentMD5, LastModified: b.Properties.LastModified,
 		})
 	}
-	return out, nil
+	return out, strings.TrimSpace(doc.NextMarker), nil
 }
 
 // deleteBlob removes one blob, and only after reading its ownership marker

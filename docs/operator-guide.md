@@ -86,8 +86,18 @@ and only an explicit deletion request removes it.
 
 ## Credentials
 
-Setup asks how the deployment receives credentials and shows the choice:
+Setup asks how the deployment receives credentials, shows what each choice
+protects them with, and lists a mode this host cannot do with the reason:
 
+- **tpm** — sealed by `systemd-creds` with the host key and the TPM together
+  (`--with-key=host+tpm2`), so both the TPM and a root-only host secret are
+  needed to read the value back. Preferred where a TPM exists. On a virtual
+  machine the hypervisor holds the TPM's secrets, so a compromised hypervisor
+  can read them, and a sealed credential cannot be decrypted on a replacement
+  host.
+- **host** — sealed by `systemd-creds` with the host key alone
+  (`--with-key=host`), for a host with no usable TPM. Also bound to this
+  machine.
 - **prompt** — hidden interactive prompts at the moment of use. Nothing is
   stored on disk. This mode cannot support unattended operation.
 - **env** — `GUACDEPLOY_CRED_*` environment variables supplied to each
@@ -97,7 +107,11 @@ Setup asks how the deployment receives credentials and shows the choice:
   and is never chosen silently: selecting it requires explicit approval
   (guided confirmation or the explicit `--credentials file` flag).
 
-Unattended runs select the mode with `--credentials prompt|env|file`.
+Unattended runs select the mode with `--credentials tpm|host|env|prompt|file`.
+A mode this host cannot do is refused with the reason — no TPM device, systemd
+older than 250, or a TPM the firmware or driver cannot use — and setup stops
+there. It never answers an unavailable encrypted mode by writing the value in
+plaintext instead. Choose another mode yourself.
 Setup checks that required credentials are available and names exactly
 what to supply when one is missing. Credential values never appear in
 deployment state, logs, or command arguments. Files written by the tool
@@ -407,3 +421,30 @@ exactly what would go.
 Anything that could not be removed is listed at the end and stays in the
 record, so a later run can try again. Teardown is never reported complete
 while residue remains.
+
+## Azure Blob as a backup destination
+
+Azure Blob is an optional destination alongside a local directory and an
+existing mounted share. The deployment can reuse storage you already have
+or create it, and scheduled uploads authenticate as a service principal
+so they do not depend on your interactive session.
+
+`guacdeploy azure-upload --dest DIR` copies the published backups and the
+completed recordings from that local directory to the configured
+container. It reports the database and the recordings separately, and it
+never counts a partial upload as complete: a copy is only complete once
+its length and hash have been read back and its completion manifest
+written.
+
+`guacdeploy azure-status` shows the configured destination and the last
+upload result.
+
+Remote recordings are expired by age when a retention period is
+configured. Database backups are not covered by that rule: they keep
+their own retention. Ordinary teardown removes nothing from Azure and
+never deletes a container or a storage account.
+
+**Not yet reachable from setup.** Choosing an Azure destination during a
+guided run is not wired in yet, so the destination has to be configured
+before these commands are useful. The steps are written up in
+`internal/azure/WIRING.md`.
