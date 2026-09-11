@@ -22,6 +22,7 @@ import (
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/entra"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/host"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recording"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recoverykey"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/schedule"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/stack"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
@@ -1463,10 +1464,20 @@ func (o *Options) backupSchedule(ctx context.Context, st *state.State, u *ui.UI)
 		return nil
 	}
 	if st.Config["backup-public-key"] == "" && !o.BackupPlaintext {
-		// Never silently downgrade to an unencrypted backup.
-		u.Say("No backup key is recorded, so scheduled backups are not installed.")
-		u.Say("Run 'guacdeploy backup-key' to generate one, then run setup again to install the schedule.")
-		return nil
+		// The specification offers scheduled backups during setup, and the
+		// key is generated on the server. Asking here is what makes that
+		// real: telling the operator to run another command and start setup
+		// again left every guided deployment with no scheduled backups.
+		made, err := o.offerBackupKey(st, u)
+		if err != nil {
+			return err
+		}
+		if !made {
+			// Never silently downgrade to an unencrypted backup.
+			u.Say("No backup key is recorded, so scheduled backups are not installed.")
+			u.Say("Run 'guacdeploy backup-key' to generate one, then run setup again to install the schedule.")
+			return nil
+		}
 	}
 	dest := o.BackupDest
 	if dest == "" {
@@ -1514,6 +1525,14 @@ func (o *Options) backupSchedule(ctx context.Context, st *state.State, u *ui.UI)
 // upload failed, and that such a deletion can permanently lose a
 // recording, so setup says that plainly rather than burying it.
 func (o *Options) recordingSchedule(ctx context.Context, st *state.State, u *ui.UI) error {
+	if o.RecordingBudget == "" {
+		// The specification asks for the budget during setup. Without this,
+		// a guided deployment silently ended with recordings accumulating
+		// until the disk filled.
+		if err := o.askRecordingBudget(u); err != nil {
+			return err
+		}
+	}
 	if o.RecordingBudget == "" {
 		u.Say("No local recording budget was set, so scheduled recording cleanup is not installed.")
 		u.Say("Recordings will accumulate until the disk fills. Set --recording-budget to enforce a limit.")
@@ -1729,4 +1748,101 @@ func describeCreations(cs []azure.Creation) string {
 		parts = append(parts, c.Type+" "+c.Name)
 	}
 	return strings.Join(parts, ", ")
+}
+
+// offerBackupKey asks whether to protect scheduled backups, and generates the
+// key pair on the server when the answer is yes.
+//
+// It reports whether a key now exists. It never writes the private key into
+// deployment state: only the public key is recorded, and the private key
+// leaves as a passphrase-encrypted export the operator is told to copy off
+// the host.
+//
+// It generates the key here rather than calling the backup-key command,
+// because the session already holds the deployment lock and that command
+// takes it for itself. Declining is a supported answer, not a failure, and an
+// unattended run is never asked: it has nobody to answer, and a prompt there
+// would hang the deployment.
+func (o *Options) offerBackupKey(st *state.State, u *ui.UI) (bool, error) {
+	if !u.Interactive {
+		return false, nil
+	}
+	u.Say("Scheduled backups are encrypted with a key generated here on the server.")
+	u.Say("The private key leaves as one passphrase-encrypted file, which you copy off this host and keep with its passphrase, separately.")
+	want, err := u.Confirm("Generate the backup key now and install the schedule?")
+	if err != nil || !want {
+		return false, err
+	}
+	secret := u.SecretReader()
+	if secret == nil {
+		return false, nil
+	}
+	pass, err := secret("Backup key passphrase")
+	if err != nil {
+		return false, err
+	}
+	if pass == "" {
+		return false, errors.New("empty passphrase rejected: recovery would depend on an unprotected export")
+	}
+	confirm, err := secret("Confirm passphrase")
+	if err != nil {
+		return false, err
+	}
+	if confirm != pass {
+		return false, errors.New("passphrases do not match; no key was generated and no schedule was installed")
+	}
+	id, err := recoverykey.Generate()
+	if err != nil {
+		return false, err
+	}
+	path := filepath.Join(o.StateDir, "recovery", "backup-key.age")
+	if err := recoverykey.ExportEncrypted(id, pass, path); err != nil {
+		return false, err
+	}
+	if st.Config == nil {
+		st.Config = map[string]string{}
+	}
+	st.Config["backup-public-key"] = id.Recipient().String()
+	st.EnsureResource(state.Resource{
+		Provider: "host", Type: "recovery-key-export", Name: path,
+		Ownership: "written by this deployment", CreatedAt: time.Now().UTC(),
+	})
+	u.Say("Backup key generated. The encrypted export is at %s.", path)
+	u.Say("Copy it off this host and store it apart from its passphrase. Neither alone recovers a backup.")
+	u.Say("Showing this does not prove a copy was made: run 'guacdeploy backup-key --verify' to prove the export decrypts.")
+	return true, nil
+}
+
+// askRecordingBudget asks for the local recording storage budget, which the
+// specification requires to be asked for during setup.
+//
+// An empty answer is an explicit decline and leaves cleanup uninstalled, with
+// the consequence stated. An unattended run is never asked.
+func (o *Options) askRecordingBudget(u *ui.UI) error {
+	if !u.Interactive {
+		return nil
+	}
+	u.Say("Session recordings accumulate on this host until something removes them.")
+	u.Say("A storage budget installs a cleanup that backs up completed recordings and then deletes the oldest to stay within it.")
+	u.Say("Cleanup is not a hard quota: a recording in progress is never deleted, so usage can exceed the budget between runs.")
+	u.Say("Deleting the oldest completed recording can lose it permanently if its backup did not succeed.")
+	for {
+		// "none" is the default so that pressing Enter is a decline: an
+		// empty answer cannot express one, because Line re-asks until it
+		// gets a value when there is no default.
+		answer, err := u.Line("Local recording storage budget, for example 20GiB, or none", "none")
+		if err != nil {
+			return err
+		}
+		answer = strings.TrimSpace(answer)
+		if answer == "" || strings.EqualFold(answer, "none") {
+			return nil
+		}
+		if _, err := recording.ParseBytes(answer); err != nil {
+			u.Say("%q is not a size: %v. Try something like 20GiB.", answer, err)
+			continue
+		}
+		o.RecordingBudget = answer
+		return nil
+	}
 }

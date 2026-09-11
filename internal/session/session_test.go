@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1609,5 +1610,192 @@ func TestAzureDestinationRunsAfterIdentityAndAfterPublication(t *testing.T) {
 	}
 	if idx["azure-destination"] < idx["cloudflare-connect"] {
 		t.Fatal("the Azure phase runs before publication, so a storage failure would leave a working deployment unpublished")
+	}
+}
+
+// The specification asks for scheduled backups and a recording budget during
+// setup. Both phases used to finish by telling the operator to run another
+// command and start setup again, so a guided deployment ended with neither.
+func TestGuidedSetupAsksForTheBackupKeyAndInstallsTheSchedule(t *testing.T) {
+	dir := t.TempDir()
+	u, out := testUI(true, "y\nsecret-pass\nsecret-pass\n")
+	u.Secret = func(string) (string, error) { return "secret-pass", nil }
+	o := &Options{StateDir: dir}
+	st := &state.State{DeploymentID: "d1", Config: map[string]string{}}
+
+	made, err := o.offerBackupKey(st, u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !made {
+		t.Fatal("a guided run that answered yes got no key")
+	}
+	if st.Config["backup-public-key"] == "" {
+		t.Fatal("the public key was not recorded, so scheduled backups still cannot encrypt")
+	}
+	export := filepath.Join(dir, "recovery", "backup-key.age")
+	if _, err := os.Stat(export); err != nil {
+		t.Fatalf("the passphrase-encrypted export was not written: %v", err)
+	}
+	// The private key must never reach deployment state.
+	raw, _ := json.Marshal(st)
+	if strings.Contains(string(raw), "AGE-SECRET-KEY") || strings.Contains(string(raw), "secret-pass") {
+		t.Fatal("private key material or the passphrase reached the deployment record")
+	}
+	if !strings.Contains(out.String(), "Copy it off this host") {
+		t.Errorf("the operator was not told the export is theirs to keep:\n%s", out.String())
+	}
+	var recorded bool
+	for _, r := range st.Resources {
+		if r.Type == "recovery-key-export" {
+			recorded = true
+		}
+	}
+	if !recorded {
+		t.Error("the export was not recorded, so teardown cannot account for it")
+	}
+}
+
+// Declining is a supported answer, and it must not produce a key or an
+// unencrypted fallback.
+func TestGuidedSetupAcceptsDecliningTheBackupKey(t *testing.T) {
+	dir := t.TempDir()
+	u, _ := testUI(true, "n\n")
+	o := &Options{StateDir: dir}
+	st := &state.State{DeploymentID: "d1", Config: map[string]string{}}
+	made, err := o.offerBackupKey(st, u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if made {
+		t.Fatal("declining produced a key anyway")
+	}
+	if st.Config["backup-public-key"] != "" {
+		t.Fatal("a key was recorded despite the decline")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "recovery", "backup-key.age")); err == nil {
+		t.Fatal("an export was written despite the decline")
+	}
+}
+
+// Mismatched passphrases must generate nothing: an export nobody can open is
+// worse than no export.
+func TestGuidedBackupKeyRefusesMismatchedPassphrases(t *testing.T) {
+	dir := t.TempDir()
+	u, _ := testUI(true, "y\n")
+	answers := []string{"one", "two"}
+	u.Secret = func(string) (string, error) {
+		v := answers[0]
+		answers = answers[1:]
+		return v, nil
+	}
+	o := &Options{StateDir: dir}
+	st := &state.State{DeploymentID: "d1", Config: map[string]string{}}
+	if _, err := o.offerBackupKey(st, u); err == nil {
+		t.Fatal("mismatched passphrases were accepted")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "recovery", "backup-key.age")); err == nil {
+		t.Fatal("an export was written from mismatched passphrases")
+	}
+}
+
+// An unattended run has nobody to answer, so it must not ask — a prompt there
+// would hang the deployment rather than fail it.
+func TestUnattendedSetupIsNeverAskedForAKeyOrABudget(t *testing.T) {
+	dir := t.TempDir()
+	u, out := testUI(false, "")
+	u.Secret = func(string) (string, error) {
+		t.Fatal("an unattended run must never wait on a hidden prompt")
+		return "", nil
+	}
+	o := &Options{StateDir: dir}
+	st := &state.State{DeploymentID: "d1", Config: map[string]string{}}
+	made, err := o.offerBackupKey(st, u)
+	if err != nil || made {
+		t.Fatalf("unattended offer: made=%v err=%v", made, err)
+	}
+	if err := o.askRecordingBudget(u); err != nil {
+		t.Fatal(err)
+	}
+	if o.RecordingBudget != "" {
+		t.Fatal("an unattended run invented a recording budget")
+	}
+	if strings.Contains(out.String(), "Generate the backup key now") {
+		t.Error("an unattended run put a question to nobody")
+	}
+}
+
+// The budget question takes a size, says why it matters, and treats an empty
+// answer as an explicit decline.
+func TestGuidedSetupAsksForTheRecordingBudget(t *testing.T) {
+	u, out := testUI(true, "not-a-size\n20GiB\n")
+	o := &Options{}
+	if err := o.askRecordingBudget(u); err != nil {
+		t.Fatal(err)
+	}
+	if o.RecordingBudget != "20GiB" {
+		t.Fatalf("budget = %q, want 20GiB", o.RecordingBudget)
+	}
+	if !strings.Contains(out.String(), "is not a size") {
+		t.Error("an unparseable answer was accepted without complaint")
+	}
+	for _, want := range []string{"never deleted", "permanently"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("the consequence was not stated (%q):\n%s", want, out.String())
+		}
+	}
+
+	// Pressing Enter takes the default, which is an explicit decline.
+	u2, _ := testUI(true, "\n")
+	o2 := &Options{}
+	if err := o2.askRecordingBudget(u2); err != nil {
+		t.Fatal(err)
+	}
+	if o2.RecordingBudget != "" {
+		t.Fatalf("pressing Enter was not treated as a decline: %q", o2.RecordingBudget)
+	}
+	// And so is saying so.
+	u3, _ := testUI(true, "none\n")
+	o3 := &Options{}
+	if err := o3.askRecordingBudget(u3); err != nil {
+		t.Fatal(err)
+	}
+	if o3.RecordingBudget != "" {
+		t.Fatalf("\"none\" was not treated as a decline: %q", o3.RecordingBudget)
+	}
+}
+
+// The questions have to be reached from the phases, not merely exist. Both
+// tests decline, so the phase returns before it installs anything and nothing
+// on this machine is touched.
+func TestBackupSchedulePhaseAsksWhenNoKeyIsRecorded(t *testing.T) {
+	dir := t.TempDir()
+	u, out := testUI(true, "n\n")
+	o := &Options{StateDir: dir}
+	st := &state.State{DeploymentID: "d1", Config: map[string]string{}}
+	if err := o.backupSchedule(context.Background(), st, u); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "Generate the backup key now") {
+		t.Fatalf("the phase did not offer to generate the key:\n%s", out.String())
+	}
+	if st.Config["backup-public-key"] != "" {
+		t.Fatal("declining recorded a key anyway")
+	}
+}
+
+func TestRecordingSchedulePhaseAsksWhenNoBudgetIsSet(t *testing.T) {
+	dir := t.TempDir()
+	u, out := testUI(true, "none\n")
+	o := &Options{StateDir: dir}
+	st := &state.State{DeploymentID: "d1", Config: map[string]string{}}
+	if err := o.recordingSchedule(context.Background(), st, u); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "Local recording storage budget") {
+		t.Fatalf("the phase did not ask for a budget:\n%s", out.String())
+	}
+	if st.Config["recording-budget"] != "" {
+		t.Fatal("declining recorded a budget anyway")
 	}
 }
