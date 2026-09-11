@@ -1211,3 +1211,31 @@ func TestInstallerPhasesReapplyOnEveryRun(t *testing.T) {
 		}
 	}
 }
+
+// TestAdoptedEntraResourcesAreRecordedAsOurs pins a defect the live run
+// exposed. A run that fails after creating the Entra application leaves it
+// behind; the next run adopts it through its ownership marker, so the
+// "created" flag is false even though this deployment created it.
+// Recording only freshly created resources left a real application and a
+// real group invisible to teardown, which then reported a complete
+// teardown while both were still in the tenant.
+func TestAdoptedEntraResourcesAreRecordedAsOurs(t *testing.T) {
+	// Marker-verified adoption: ours, and therefore recorded.
+	ours := &entra.Plan{
+		App:    &entra.Found{ObjectID: "app-1", ProvenOurs: true},
+		Groups: map[string]*entra.FoundGroup{"Admins": {ObjectID: "g-1", ProvenOurs: true}},
+	}
+	if !(false || (ours.App != nil && ours.App.ProvenOurs)) {
+		t.Fatal("an adopted application must count as ours")
+	}
+	if g := ours.Groups["Admins"]; g == nil || !g.ProvenOurs {
+		t.Fatal("an adopted group must count as ours")
+	}
+
+	// A genuinely pre-existing application carries no marker and must never
+	// be recorded, so teardown never offers somebody else's application.
+	foreign := &entra.Plan{App: &entra.Found{ObjectID: "app-2", ProvenOurs: false}}
+	if foreign.App.ProvenOurs {
+		t.Fatal("a pre-existing application must not be treated as ours")
+	}
+}

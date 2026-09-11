@@ -857,22 +857,31 @@ func (o *Options) entraSignin(ctx context.Context, st *state.State, u *ui.UI) er
 	}
 
 	now := time.Now().UTC()
-	if res.App.CreatedApp {
+	// Record what this deployment owns, not only what this attempt created.
+	// A run that fails after creating the application leaves it behind; the
+	// next run adopts it through the ownership marker, so CreatedApp is
+	// false even though the deployment created it. Recording only the
+	// freshly created ones left real resources invisible to teardown, which
+	// then reported a complete teardown while they were still in the
+	// tenant. A genuinely pre-existing application is still never recorded.
+	ownsApp := res.App.CreatedApp || (plan.App != nil && plan.App.ProvenOurs)
+	if ownsApp {
 		st.EnsureResource(state.Resource{
 			Provider: "entra", Type: "application", ProviderID: res.App.ObjectID,
 			Name: res.App.DisplayName, Ownership: res.App.Evidence,
 			CorrelationID: cfg.DeploymentID, CreatedAt: now,
 		})
 	}
-	if res.App.CreatedSP {
+	if res.App.CreatedSP || (ownsApp && res.App.SPObjectID != "") {
 		st.EnsureResource(state.Resource{
 			Provider: "entra", Type: "service-principal", ProviderID: res.App.SPObjectID,
 			Name: res.App.DisplayName, Ownership: res.App.Evidence, CreatedAt: now,
 		})
 	}
 	for _, g := range res.Groups {
-		if !g.Created {
-			continue // pre-existing: never recorded, never offered at teardown
+		found := plan.Groups[g.Name]
+		if !g.Created && (found == nil || !found.ProvenOurs) {
+			continue // genuinely pre-existing: never recorded, never offered
 		}
 		st.EnsureResource(state.Resource{
 			Provider: "entra", Type: "group", ProviderID: g.ObjectID,
