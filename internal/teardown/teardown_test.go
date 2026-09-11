@@ -676,3 +676,35 @@ func TestRecoveryKeyExportIsKeptAndDoesNotBlockTeardown(t *testing.T) {
 		}
 	}
 }
+
+// setup --azure records what it created in Azure. The specification preserves
+// remote backup storage at teardown, and without a rule these resources fell
+// to "no removal is defined" — review, which makes the whole run refuse.
+func TestAzureStorageIsKeptAndDoesNotBlockTeardown(t *testing.T) {
+	st := &state.State{DeploymentID: "d1", Resources: []state.Resource{
+		{ID: "r-rg", Provider: "azure", Type: "resource-group", Name: "guac-rg", Ownership: "tag"},
+		{ID: "r-sa", Provider: "azure", Type: "storage-account", Name: "guacsa", Ownership: "tag"},
+		{ID: "r-bc", Provider: "azure", Type: "blob-container", Name: "backups", Ownership: "metadata"},
+		{ID: "r-ra", Provider: "azure", Type: "role-assignment", Name: "uploader", Ownership: "scope"},
+		{ID: "r-rec", Provider: "cloudflare", Type: "dns-record", ProviderID: "rec1",
+			Name: "guac.example.com", Ownership: "marker comment"},
+	}}
+	plan := BuildPlan(st, nil, true) // even with explicit deletion intent
+	if rv := plan.Review(); len(rv) > 0 {
+		t.Fatalf("Azure storage forced the whole teardown into review: %+v", rv)
+	}
+	kept := map[string]bool{}
+	for _, it := range plan.Preserved() {
+		kept[it.Resource.ID] = true
+	}
+	for _, id := range []string{"r-rg", "r-sa", "r-bc", "r-ra"} {
+		if !kept[id] {
+			t.Errorf("%s was not kept", id)
+		}
+	}
+	for _, it := range plan.Removable() {
+		if it.Resource.Provider == "azure" {
+			t.Fatalf("teardown offered to remove remote storage: %s", it)
+		}
+	}
+}

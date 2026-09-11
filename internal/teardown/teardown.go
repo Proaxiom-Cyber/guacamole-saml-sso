@@ -233,6 +233,13 @@ func classify(r state.Resource) (Kind, Action, string) {
 		return KindCredential, ActionWithParent, "removed with the credential directory that holds it"
 	case "host/config-directory":
 		return KindConfigDir, ActionRemove, "remove the files this deployment rendered; the directory itself stays if anything else is still in it"
+	case "azure/resource-group", "azure/storage-account", "azure/blob-container",
+		"azure/role-assignment":
+		// "Preserve remote backups and their supporting storage resources
+		// during ordinary teardown" (specification). Without a rule these
+		// fell to "no removal is defined", which is review, and one review
+		// item makes the whole teardown refuse and remove nothing.
+		return KindHostChange, ActionPreserve, "kept: remote backup storage and its supporting resources outlive the deployment, and teardown never removes them. Remove it in Azure yourself once no backup needs it"
 	case "host/recovery-key-export":
 		// Never deleted, and never merely "unknown". It is the only thing
 		// that can read this deployment's encrypted backups, and those
