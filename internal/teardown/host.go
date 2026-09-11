@@ -213,6 +213,28 @@ func DefaultOps(o HostOptions) Ops {
 			// rather than waiting for a reboot to clear the tmpfs.
 			return stack.RemoveRuntimeSecrets(stack.Config{InstallDir: o.InstallDir})
 		},
+		ContainersPresent: func(ctx context.Context, names []string) ([]string, error) {
+			// Ask by name rather than by project: the point of the check is
+			// to catch a container this deployment created that the current
+			// compose project no longer covers.
+			stdout, stderr, err := o.Run(ctx, "", "docker", "ps", "--all", "--format", "{{.Names}}")
+			if err != nil {
+				return nil, fmt.Errorf("%v: %s", err, strings.TrimSpace(stderr))
+			}
+			running := map[string]bool{}
+			for _, line := range strings.Split(stdout, "\n") {
+				if n := strings.TrimSpace(line); n != "" {
+					running[n] = true
+				}
+			}
+			var present []string
+			for _, n := range names {
+				if running[n] {
+					present = append(present, n)
+				}
+			}
+			return present, nil
+		},
 		RemoveRendered:    RemoveRendered,
 		RemoveCredentials: RemoveCredentials,
 		RemoveTree:        RemoveTree,
