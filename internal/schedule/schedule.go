@@ -8,7 +8,7 @@
 // finishes. A unit pointing at that path would break on the next reboot.
 //
 // So Install copies the running executable to a deployment-owned runtime
-// path (/usr/local/lib/guacdeploy/guacdeploy by default) and the unit calls
+// path (/usr/local/sbin/guacdeploy-runtime by default) and the unit calls
 // that copy. The installed routine then depends on nothing but itself, the
 // state directory, and Docker. The copy, the service, and the timer are all
 // created resources and Uninstall removes them.
@@ -77,7 +77,7 @@ type Options struct {
 	RequireMount bool   // destination must be on an approved mounted share
 
 	UnitDir    string // default /etc/systemd/system
-	RuntimeDir string // deployment-owned; default /usr/local/lib/guacdeploy
+	RuntimeDir string // deployment-owned; default /usr/local/sbin
 	Exe        string // source binary, default the running executable
 }
 

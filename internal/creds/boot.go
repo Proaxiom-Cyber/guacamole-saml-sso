@@ -56,7 +56,7 @@ type BootOptions struct {
 	StateDir     string // passed to the boot command
 
 	UnitDir    string // default /etc/systemd/system
-	RuntimeDir string // deployment-owned; default /usr/local/lib/guacdeploy
+	RuntimeDir string // deployment-owned; default /usr/local/sbin
 	Exe        string // source binary, default the running executable
 }
 

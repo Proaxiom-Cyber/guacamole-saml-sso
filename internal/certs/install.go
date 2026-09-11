@@ -55,7 +55,7 @@ type InstallOptions struct {
 	OnCalendar   string // systemd calendar expression, default "daily"
 
 	UnitDir    string // default /etc/systemd/system
-	RuntimeDir string // deployment-owned; default /usr/local/lib/guacdeploy
+	RuntimeDir string // deployment-owned; default /usr/local/sbin
 	Exe        string // source binary, default the running executable
 }
 
