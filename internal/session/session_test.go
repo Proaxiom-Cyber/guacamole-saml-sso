@@ -1182,3 +1182,32 @@ func TestRuntimeBinaryLivesWhereSystemdCanUseIt(t *testing.T) {
 		}
 	}
 }
+
+// TestInstallerPhasesReapplyOnEveryRun pins why the installer phases are
+// marked Always. They write units, timers and the deployment-owned binary
+// copy. When a newer version corrects any of those — as it did when the
+// runtime binary had to move out of a lib_t directory — the repair must
+// actually reach an existing host, and a phase marked complete never runs
+// again.
+func TestInstallerPhasesReapplyOnEveryRun(t *testing.T) {
+	want := map[string]bool{
+		"origin-certificate": true,
+		"boot-recovery":      true,
+		"backup-schedule":    true,
+		"recording-schedule": true,
+		"stack-render":       true,
+		"stack-schema":       true,
+	}
+	for _, p := range Phases(&Options{}) {
+		if want[p.Name] && !p.Always {
+			t.Errorf("%s does not re-run, so a repair in a newer version could never reach an existing host", p.Name)
+		}
+	}
+	// Phases that create cloud resources must NOT re-run blindly.
+	mustNotAlways := map[string]bool{"cloudflare-tunnel": true, "cloudflare-dns": true, "entra-signin": true}
+	for _, p := range Phases(&Options{}) {
+		if mustNotAlways[p.Name] && p.Always {
+			t.Errorf("%s re-runs unconditionally, which risks acting on cloud resources every session", p.Name)
+		}
+	}
+}

@@ -77,13 +77,18 @@ func Phases(opts *Options) []Phase {
 		// The real certificate replaces the temporary self-signed one
 		// before nginx starts, so the tunnel never has to accept an
 		// unverified origin.
-		{Name: "origin-certificate", Run: opts.originCertificate},
+		// The installer phases below write desired state: units, timers and
+		// the deployment-owned binary copy. They re-run so a repair in a
+		// newer version actually reaches an existing host, which is how a
+		// wrongly located runtime binary was fixed. Each one is idempotent
+		// and rewrites nothing when it is already correct.
+		{Name: "origin-certificate", Run: opts.originCertificate, Always: true},
 		{Name: "stack-up", Run: opts.stackUp},
 		// Health is checked against the local origin before anything is
 		// published, so a failure later never leaves an exposed service.
-		{Name: "boot-recovery", Run: opts.bootRecovery},
-		{Name: "backup-schedule", Run: opts.backupSchedule},
-		{Name: "recording-schedule", Run: opts.recordingSchedule},
+		{Name: "boot-recovery", Run: opts.bootRecovery, Always: true},
+		{Name: "backup-schedule", Run: opts.backupSchedule, Always: true},
+		{Name: "recording-schedule", Run: opts.recordingSchedule, Always: true},
 		{Name: "stack-health", Run: opts.stackHealth},
 		{Name: "entra-signin", Run: opts.entraSignin},
 		// The DNS record comes before Access so that Access can be
