@@ -795,13 +795,18 @@ func TestNoPublicConnectorWhenProtectionIsIncomplete(t *testing.T) {
 		t.Fatalf("phase %q missing from the registry: %v", name, order)
 		return -1
 	}
-	// Everything that protects the service must come before publication.
+	// Starting the connector is what makes the deployment reachable, so
+	// everything that protects it must come first. The DNS record is not
+	// publication: it points at a tunnel with no connector running, so
+	// nothing reaches the origin, and Access needs it in place to be
+	// verified against the hostname it protects.
 	for _, protector := range []string{"entra-signin", "cloudflare-access"} {
-		for _, publisher := range []string{"cloudflare-dns", "cloudflare-connect"} {
-			if idx(protector) > idx(publisher) {
-				t.Fatalf("%s runs after %s: a failure would leave an unprotected origin reachable", protector, publisher)
-			}
+		if idx(protector) > idx("cloudflare-connect") {
+			t.Fatalf("%s runs after the connector starts: a failure would leave an unprotected origin reachable", protector)
 		}
+	}
+	if idx("cloudflare-dns") > idx("cloudflare-access") {
+		t.Fatal("Access cannot be verified against a hostname that does not resolve yet")
 	}
 
 	// A failure in sign-in must stop before any publication phase runs.
@@ -816,7 +821,7 @@ func TestNoPublicConnectorWhenProtectionIsIncomplete(t *testing.T) {
 				ran[name] = true
 				return errors.New("no Graph token")
 			}})
-		case "cloudflare-dns", "cloudflare-connect":
+		case "cloudflare-connect":
 			phases = append(phases, Phase{Name: name, Run: func(context.Context, *state.State, *ui.UI) error {
 				ran[name] = true
 				return nil
@@ -835,8 +840,8 @@ func TestNoPublicConnectorWhenProtectionIsIncomplete(t *testing.T) {
 	if !ran["entra-signin"] {
 		t.Fatal("the sign-in phase never ran")
 	}
-	if ran["cloudflare-dns"] || ran["cloudflare-connect"] {
-		t.Fatal("the deployment was published despite sign-in failing")
+	if ran["cloudflare-connect"] {
+		t.Fatal("the connector was started despite sign-in failing")
 	}
 	st, _ := state.Read(dir)
 	if strings.Contains(st.Config["compose-profiles"], "cloudflare") {

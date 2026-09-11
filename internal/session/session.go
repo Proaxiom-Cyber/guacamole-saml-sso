@@ -85,15 +85,20 @@ func Phases(opts *Options) []Phase {
 		{Name: "recording-schedule", Run: opts.recordingSchedule},
 		{Name: "stack-health", Run: opts.stackHealth},
 		{Name: "entra-signin", Run: opts.entraSignin},
+		// The DNS record comes before Access so that Access can be
+		// verified against the hostname it protects. This publishes no
+		// service: the record points at a tunnel with no connector
+		// running, so the edge answers "tunnel unavailable" and nothing
+		// reaches the origin.
+		{Name: "cloudflare-dns", Run: opts.cloudflareDNS},
 		// Access must follow entra-signin: its allow-list is built from the
 		// tenant and group object IDs that phase produces.
 		{Name: "cloudflare-access", Run: opts.cloudflareAccess},
-		// Only now is the deployment published: the DNS record is created
-		// and the connector started. Everything that protects the service
-		// -- SAML sign-in and a verified Access policy -- already exists,
-		// so a failure in an earlier phase can never leave a reachable
-		// origin without protection.
-		{Name: "cloudflare-dns", Run: opts.cloudflareDNS},
+		// Starting the connector is what actually publishes the
+		// deployment, and it happens only after sign-in and a verified
+		// Access policy exist. A failure in any earlier phase therefore
+		// leaves the origin unreachable rather than reachable and
+		// unprotected.
 		{Name: "cloudflare-connect", Run: opts.cloudflareConnect},
 	}
 }
