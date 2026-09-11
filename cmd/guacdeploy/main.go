@@ -43,6 +43,7 @@ Commands:
   settings    Show (--list) or restore (--restore) changes made to pre-existing settings
   backup-run  Take the scheduled backup, then expire old backups
   backup-status Show the scheduled backup destination and last-run result
+  stack-start Start the stack after a reboot (used by the installed boot unit)
   renew-cert  Renew the origin certificate now (used by the installed timer)
   cert-status Show the origin certificate and its last renewal result
   version  Print the tool version
@@ -217,6 +218,8 @@ func run(args []string) int {
 			return 2
 		}
 		err = settingsCmd(ctx, *stateDir, *restore, u)
+	case "stack-start":
+		err = stackStartCmd(ctx, *stateDir, u)
 	case "renew-cert":
 		err = renewCertCmd(ctx, *stateDir, u)
 	case "cert-status":

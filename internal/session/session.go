@@ -1325,3 +1325,33 @@ func (o *Options) recordingSchedule(ctx context.Context, st *state.State, u *ui.
 	u.Say("Active recordings are never deleted, so usage can exceed the budget between runs.")
 	return nil
 }
+
+// StartStack brings an existing deployment's stack up without running
+// setup. The boot unit calls it after a reboot, because credentials reach
+// the containers as files on memory-backed storage, which is empty after a
+// cold boot: Docker would restart the containers on its own, but their
+// secret files would be gone.
+//
+// It changes no cloud resource and asks for no approval. It refuses rather
+// than prompts when the credential mode needs a person, because a boot unit
+// has no terminal.
+func StartStack(ctx context.Context, stateDir string, u *ui.UI) error {
+	st, err := state.Read(stateDir)
+	if err != nil {
+		return err
+	}
+	if st == nil {
+		return errors.New("no deployment exists on this host, so there is no stack to start")
+	}
+	o := &Options{StateDir: stateDir, UI: u}
+	password, token, err := o.stackSecrets(st, u)
+	if err != nil {
+		return err
+	}
+	cfg := o.stackConfig(st)
+	if err := stack.Up(ctx, o.stackRun(), cfg, password, token); err != nil {
+		return err
+	}
+	u.Say("Stack started for deployment %s.", st.DeploymentID)
+	return nil
+}

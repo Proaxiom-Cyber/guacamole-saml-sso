@@ -1056,3 +1056,37 @@ func TestInstallersNeverReceiveANilRunner(t *testing.T) {
 		t.Log("recording.Install returned no error")
 	}
 }
+
+// TestStartStackRefusesWhenThereIsNothingToStart and, more importantly,
+// pins that the boot path never prompts. Credentials now reach the
+// containers as files on memory-backed storage, which a cold boot empties,
+// so this command is what makes reboot survival work at all — and a boot
+// unit has no terminal to ask anything.
+func TestStartStackRefusesWhenThereIsNothingToStart(t *testing.T) {
+	u, _ := testUI(false, "")
+	err := StartStack(context.Background(), t.TempDir(), u)
+	if err == nil || !strings.Contains(err.Error(), "no deployment exists") {
+		t.Fatalf("want a clear refusal, got %v", err)
+	}
+}
+
+// TestStartStackNeverWaitsForAPerson proves the boot path reports rather
+// than hangs when the credential mode cannot supply a value unattended.
+func TestStartStackNeverWaitsForAPerson(t *testing.T) {
+	dir := t.TempDir()
+	seed(t, dir, &state.State{
+		DeploymentID: "dep-boot",
+		Config: map[string]string{
+			"credential-mode": creds.ModePrompt,
+			"guac-hostname":   "guac.example.com",
+		},
+	})
+	u, _ := testUI(false, "") // no terminal, as a boot unit has none
+	err := StartStack(context.Background(), dir, u)
+	if err == nil {
+		t.Fatal("prompt-mode credentials cannot start a stack unattended")
+	}
+	if !errors.Is(err, creds.ErrUnattendedPrompt) && !strings.Contains(err.Error(), "prompt") {
+		t.Fatalf("the failure does not explain that a person is needed: %v", err)
+	}
+}

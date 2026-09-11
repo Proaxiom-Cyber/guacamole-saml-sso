@@ -439,3 +439,21 @@ this deployment applied. A setting that has drifted since — someone else
 changed it — is preserved exactly as it is, reported with both values,
 and never overwritten. Unattended runs never restore; they stop with exit
 code 3 and name what is waiting.
+
+## Credential delivery to the containers, and reboots
+
+Credentials reach the containers as files, not as environment variables.
+Docker records a container's environment in its own metadata and keeps it
+on disk, so an environment variable would leave a plaintext copy of the
+database password and the tunnel token on the disk even when the
+deployment's credential store is sealed to the TPM.
+
+Each credential is written to an owner-only file on memory-backed storage
+under `/run/guacdeploy/secrets`, and each service reads only its own file.
+Nothing but the path appears in the compose file or in Docker's metadata.
+
+Memory-backed storage is empty after a cold boot, so the stack cannot
+simply restart itself. `guacdeploy stack-start` repopulates the files and
+starts the stack, and the boot unit installed with a persistent
+credential mode calls it. A deployment using prompt-mode credentials
+cannot start unattended, and the command says so instead of waiting.
