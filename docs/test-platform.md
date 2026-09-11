@@ -121,3 +121,12 @@ Integration tests of the deployment tool still need, per later tickets:
 
 Again: VM snapshot rollback never cleans up what tests created in Azure, Entra, or
 Cloudflare. Track and remove those resources separately.
+
+## Platform findings from live runs
+
+- The GenericCloud image ships `kernel-modules-core` only. The first
+  `dnf update` installs a newer kernel with the full `kernel-modules`
+  package. Until the VM reboots into that kernel, Docker cannot load
+  `xt_addrtype` and fails to start. guacdeploy preflight now detects this
+  and asks for a reboot-and-resume. After a rollback to `clean-baseline`,
+  expect one update-and-reboot before deploying.
