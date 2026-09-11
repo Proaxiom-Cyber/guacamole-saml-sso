@@ -52,7 +52,11 @@ func Phases(opts *Options) []Phase {
 		// Rendering is idempotent and also repairs configuration written by
 		// an earlier version, so it re-runs on every resume.
 		{Name: "stack-render", Run: opts.stackRender, Always: true},
-		{Name: "stack-schema", Run: opts.stackSchema},
+		// Schema generation is idempotent: it re-reads the published file,
+		// keeps it when it is valid, and regenerates only when it is
+		// missing or corrupt. It re-runs so a schema written by an earlier
+		// version gets repaired instead of skipped for ever.
+		{Name: "stack-schema", Run: opts.stackSchema, Always: true},
 		{Name: "stack-up", Run: opts.stackUp},
 		{Name: "stack-health", Run: opts.stackHealth},
 	}
