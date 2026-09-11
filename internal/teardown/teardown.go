@@ -409,6 +409,11 @@ type Ops struct {
 	RemoveHostUnits func(ctx context.Context) (removed []string, err error)
 	// RemoveContainers takes the whole stack down in one call.
 	RemoveContainers func(ctx context.Context) error
+	// ContainersPresent reports which of these container names still exist
+	// after that call. A nil seam leaves the removal step's own account of
+	// itself as the only evidence, which is how a still-present path was
+	// once reported as removed; see hostUnitOutcomes.
+	ContainersPresent func(ctx context.Context, names []string) (present []string, err error)
 	// RemoveRendered removes what this deployment rendered into dir and
 	// returns whatever else is still there, so a directory that now holds
 	// unrelated content is preserved rather than deleted.
@@ -706,7 +711,7 @@ func removeStep(ctx context.Context, k Kind, plan Plan, ops Ops) []Outcome {
 	case KindHostUnit:
 		return hostUnitOutcomes(ctx, items, ops)
 	case KindContainer:
-		return bulk(items, call0(ctx, ops.RemoveContainers))
+		return containerOutcomes(ctx, items, ops)
 	case KindCredential:
 		if ops.RemoveCredentials == nil {
 			return bulk(items, errNotImplemented)
@@ -794,6 +799,67 @@ func hostUnitOutcomes(ctx context.Context, items []Item, ops Ops) []Outcome {
 		}
 	}
 	return out
+}
+
+// containerOutcomes takes the stack down in one call and then asks the
+// container runtime which of the recorded names are still there, on the same
+// rule as hostUnitOutcomes: the removal step's own account of itself is not
+// evidence. "docker compose down" exits 0 for a project it can see, so a
+// container this deployment created under a project name the current
+// configuration no longer produces — an installation directory renamed
+// between runs — is left running and reported as removed.
+func containerOutcomes(ctx context.Context, items []Item, ops Ops) []Outcome {
+	if ops.RemoveContainers == nil {
+		return bulk(items, errNotImplemented)
+	}
+	err := ops.RemoveContainers(ctx)
+	if ops.ContainersPresent == nil {
+		return bulk(items, err)
+	}
+	names := make([]string, 0, len(items))
+	for _, it := range items {
+		names = append(names, it.Resource.Name)
+	}
+	present, checkErr := ops.ContainersPresent(ctx, names)
+	if checkErr != nil {
+		// Unanswerable is never evidence of removal. It is residue, so the
+		// run reports what to check instead of claiming completeness.
+		var out []Outcome
+		for _, it := range items {
+			out = append(out, Outcome{Item: it, Status: StatusUncertain,
+				Detail: fmt.Sprintf("the removal step reported %v, but whether %s is still running could not be checked: %v",
+					result(err), it.Resource.Name, checkErr)})
+		}
+		return out
+	}
+	still := map[string]bool{}
+	for _, n := range present {
+		still[n] = true
+	}
+	var out []Outcome
+	for _, it := range items {
+		switch {
+		case !still[it.Resource.Name]:
+			// Gone is removed, whether this run took it or an earlier one
+			// did. That is what makes a second run safe.
+			out = append(out, Outcome{Item: it, Status: StatusRemoved})
+		case err != nil:
+			out = append(out, outcome(it, err))
+		default:
+			out = append(out, Outcome{Item: it, Status: StatusRetained,
+				Detail: "the removal step reported no error, but container " + it.Resource.Name + " is still on this host"})
+		}
+	}
+	return out
+}
+
+// result words a removal step's own outcome for a report that cannot rely on
+// it either way.
+func result(err error) string {
+	if err == nil {
+		return "no error"
+	}
+	return err.Error()
 }
 
 // onDisk reports whether the path is still there. Anything other than a

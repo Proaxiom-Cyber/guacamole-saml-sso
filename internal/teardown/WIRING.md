@@ -336,8 +336,18 @@ only what still carries this deployment's marker, and `creds.UninstallBoot` deli
 leaves the shared binary alone while another unit still calls it — both without an error.
 A path that is still there is now **retained**, with the reason, and stays in the record.
 
-Anything that cannot be stat-ed takes its result from the operation that performed it:
-`RemoveContainers` from `docker compose down`, `RemoveRendered` and `RemoveCredentials`
+Containers are checked the same way, because the filesystem is not the only thing that
+outlives a step's own account of itself. `docker compose down` exits 0 for the project it
+can see, so a container this deployment created under a project name the current
+configuration no longer produces — an installation directory renamed between runs — stays
+up while the step reports no error. `ContainersPresent` asks the runtime for the recorded
+names after the down (`docker ps --all --format {{.Names}}`, by name rather than by
+project, which is the whole point), and a name still listed is **retained**, not removed.
+A runtime that cannot be asked at all makes the outcome **uncertain**: the run says what
+to check and does not report completeness.
+
+Anything that cannot be checked that way takes its result from the operation that
+performed it: `RemoveRendered` and `RemoveCredentials`
 from `removeIfEmpty`'s own `os.Remove`, `RemoveTree` from `os.RemoveAll`, and each
 provider delete from its API call. A stat that fails for any reason other than "it is not
 there" counts as still there: an unanswerable stat is never evidence of removal.

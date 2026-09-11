@@ -347,3 +347,69 @@ func TestRefusedUnitIsRetainedWithItsReason(t *testing.T) {
 		t.Error("the refusal reason was not reported")
 	}
 }
+
+// The same rule as TestRemovedOnlyWhenTheFileIsActuallyGone, for containers.
+// "docker compose down" exits 0 for the project it can see, so a container
+// this deployment created under a project name the current configuration no
+// longer produces is left running while the step reports no error.
+func TestRemovedOnlyWhenTheContainerIsActuallyGone(t *testing.T) {
+	st := &state.State{DeploymentID: "dep1", Resources: []state.Resource{
+		{ID: "r-guac", Provider: "docker", Type: "container", Name: "guacamole",
+			Ownership: "created by this deployment"},
+		{ID: "r-db", Provider: "docker", Type: "container", Name: "guac-postgres",
+			Ownership: "created by this deployment"},
+	}}
+
+	// The stack came down without an error, and one container is still up.
+	ops := Ops{
+		RemoveContainers: func(context.Context) error { return nil },
+		ContainersPresent: func(_ context.Context, names []string) ([]string, error) {
+			return []string{"guacamole"}, nil
+		},
+	}
+	u, out := testUI("")
+	res, err := Run(context.Background(), st, BuildPlan(st, nil, false), ops, u, Options{Consent: true})
+	if !errors.Is(err, ErrIncomplete) {
+		t.Fatalf("want ErrIncomplete, got %v", err)
+	}
+	if !strings.Contains(out.String(), "container guacamole is still on this host") {
+		t.Errorf("the false claim was not explained:\n%s", out.String())
+	}
+	if got := res.Residue(); len(got) != 1 || got[0].Item.Resource.ID != "r-guac" {
+		t.Fatalf("want the still-running container as the only residue, got %+v", got)
+	}
+	if !has(st, "r-guac") {
+		t.Error("a container that is still running was dropped from the record")
+	}
+	if has(st, "r-db") {
+		t.Error("a container that is gone stayed in the record")
+	}
+}
+
+// A container runtime that cannot be asked is never evidence of removal.
+func TestContainerRemovalIsUncertainWhenTheRuntimeCannotBeAsked(t *testing.T) {
+	st := &state.State{DeploymentID: "dep1", Resources: []state.Resource{
+		{ID: "r-guac", Provider: "docker", Type: "container", Name: "guacamole",
+			Ownership: "created by this deployment"},
+	}}
+	ops := Ops{
+		RemoveContainers: func(context.Context) error { return nil },
+		ContainersPresent: func(context.Context, []string) ([]string, error) {
+			return nil, errors.New("docker daemon is not running")
+		},
+	}
+	u, out := testUI("")
+	res, err := Run(context.Background(), st, BuildPlan(st, nil, false), ops, u, Options{Consent: true})
+	if !errors.Is(err, ErrIncomplete) {
+		t.Fatalf("want ErrIncomplete, got %v", err)
+	}
+	if got := res.Residue(); len(got) != 1 || got[0].Status != StatusUncertain {
+		t.Fatalf("want one uncertain outcome, got %+v", got)
+	}
+	if !strings.Contains(out.String(), "could not be checked") {
+		t.Errorf("the run did not say what could not be checked:\n%s", out.String())
+	}
+	if !has(st, "r-guac") {
+		t.Error("a container that could not be checked was dropped from the record")
+	}
+}
