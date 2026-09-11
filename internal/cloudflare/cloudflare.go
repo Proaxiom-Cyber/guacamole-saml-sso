@@ -265,6 +265,11 @@ type Zone struct {
 	Name    string  `json:"name"`
 	Status  string  `json:"status"`
 	Account Account `json:"account"`
+	// NameServers are the zone's authoritative nameservers. A DNS-01
+	// pre-check must ask these, not the deployment host's resolver, which
+	// may be authoritative for the same domain internally and never see a
+	// record published at Cloudflare.
+	NameServers []string `json:"name_servers"`
 }
 
 // ZonesByName lists the zones with exactly this name — the apex the parent

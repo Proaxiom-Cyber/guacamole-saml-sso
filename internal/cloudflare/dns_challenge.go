@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -43,9 +44,18 @@ const (
 type DNS01 struct {
 	P *Provisioner
 
-	// LookupTXT resolves TXT records; nil means this host's resolver. It is
-	// a field so tests can drive the visibility wait without DNS.
+	// LookupTXT resolves TXT records; nil means ask the zone's
+	// authoritative nameservers. It is a field so tests can drive the
+	// visibility wait without DNS.
 	LookupTXT func(ctx context.Context, name string) ([]string, error)
+
+	// NameServers are the zone's authoritative nameservers. Empty means
+	// discover them from the zone. The deployment host's own resolver is
+	// deliberately not the default: a split-horizon resolver that is
+	// authoritative for the same domain internally answers NXDOMAIN for a
+	// record published at Cloudflare, so the wait would fail while the
+	// record is perfectly visible to the certificate authority.
+	NameServers []string
 
 	// Timeout and Interval bound the visibility wait; zero means the
 	// DefaultChallenge… values above.
@@ -85,7 +95,14 @@ func (d *DNS01) Present(ctx context.Context, value string) error {
 func (d *DNS01) waitVisible(ctx context.Context, value string) error {
 	lookup := d.LookupTXT
 	if lookup == nil {
-		lookup = net.DefaultResolver.LookupTXT
+		ns, err := d.authoritativeNameServers(ctx)
+		if err != nil || len(ns) == 0 {
+			// Without authoritative servers the host resolver is the only
+			// option left; the error below names what was actually asked.
+			lookup = net.DefaultResolver.LookupTXT
+		} else {
+			lookup = lookupVia(ns)
+		}
 	}
 	timeout, interval := d.Timeout, d.Interval
 	if timeout == 0 {
@@ -109,8 +126,8 @@ func (d *DNS01) waitVisible(ctx context.Context, value string) error {
 			}
 		}
 		if !time.Now().Before(deadline) {
-			return fmt.Errorf("the DNS-01 challenge record %s was created but did not resolve on this host within %s (last answer: %s)",
-				d.Name(), timeout, last)
+			return fmt.Errorf("the DNS-01 challenge record %s was created but did not become visible within %s (asked %s; last answer: %s)",
+				d.Name(), timeout, describeAsked(d.NameServers), last)
 		}
 		select {
 		case <-ctx.Done():
@@ -143,4 +160,49 @@ func (d *DNS01) CleanUp(ctx context.Context) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// authoritativeNameServers returns the zone's nameservers, caching them on
+// the solver. Asking the authority is what the certificate authority does,
+// and it is the only answer that predicts validation.
+func (d *DNS01) authoritativeNameServers(ctx context.Context) ([]string, error) {
+	if len(d.NameServers) > 0 {
+		return d.NameServers, nil
+	}
+	var z Zone
+	if err := d.P.Client.do(ctx, "GET", "/zones/"+d.P.ZoneID, nil, &z); err != nil {
+		return nil, err
+	}
+	d.NameServers = z.NameServers
+	return d.NameServers, nil
+}
+
+// lookupVia asks the given nameservers directly, in order, until one
+// answers. Each is queried with the Go resolver so the dial is ours.
+func lookupVia(servers []string) func(context.Context, string) ([]string, error) {
+	return func(ctx context.Context, name string) ([]string, error) {
+		var lastErr error
+		for _, s := range servers {
+			r := &net.Resolver{
+				PreferGo: true,
+				Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+					var dl net.Dialer
+					return dl.DialContext(ctx, network, net.JoinHostPort(s, "53"))
+				},
+			}
+			vals, err := r.LookupTXT(ctx, name)
+			if err == nil {
+				return vals, nil
+			}
+			lastErr = err
+		}
+		return nil, lastErr
+	}
+}
+
+func describeAsked(ns []string) string {
+	if len(ns) == 0 {
+		return "this host's resolver, because the zone's authoritative nameservers could not be determined"
+	}
+	return "the zone's authoritative nameservers (" + strings.Join(ns, ", ") + ")"
 }

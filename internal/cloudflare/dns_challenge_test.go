@@ -122,3 +122,33 @@ func TestCleanUpWithNothingToRemoveSucceeds(t *testing.T) {
 		t.Fatalf("CleanUp on an empty name: %v", err)
 	}
 }
+
+// TestChallengeAsksTheAuthorityNotTheLocalResolver pins the fix for a
+// failure seen on the real lab host: the deployment's resolver is
+// authoritative for the same domain internally, so it answered NXDOMAIN
+// for a record that was published at Cloudflare and perfectly visible to
+// the certificate authority. Issuance failed for a record that was fine.
+func TestChallengeAsksTheAuthorityNotTheLocalResolver(t *testing.T) {
+	f := newFake(t)
+	f.mux["POST /zones/zone1/dns_records"] = ok(map[string]any{"id": "txt1"})
+	f.mux["GET /zones/zone1"] = ok(map[string]any{
+		"id": "zone1", "name": "example.com",
+		"name_servers": []any{"ns1.example.invalid", "ns2.example.invalid"},
+	})
+
+	// No LookupTXT injected, so the solver must discover the authority.
+	d := &DNS01{P: f.prov(), Timeout: 10 * time.Millisecond, Interval: time.Millisecond}
+	err := d.Present(context.Background(), "token-value")
+	if err == nil {
+		t.Fatal("the wait should fail against unreachable test nameservers")
+	}
+	if len(d.NameServers) != 2 || d.NameServers[0] != "ns1.example.invalid" {
+		t.Fatalf("the zone's authoritative nameservers were not discovered: %v", d.NameServers)
+	}
+	if !strings.Contains(err.Error(), "ns1.example.invalid") {
+		t.Fatalf("the error does not name the servers that were asked: %v", err)
+	}
+	if strings.Contains(err.Error(), "could not be determined") {
+		t.Fatalf("it fell back to the host resolver despite knowing the authority: %v", err)
+	}
+}
