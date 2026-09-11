@@ -1143,11 +1143,20 @@ func (o *Options) cloudflareAccess(ctx context.Context, st *state.State, u *ui.U
 	})
 	st.Config["cloudflare-access-app-id"] = app.ID
 
-	v, err := p.VerifyAccess(ctx, app.ID)
+	// Verification compares the policy actually stored at Cloudflare with
+	// the allow-list that was applied, so a policy that drifted or admits
+	// everyone is caught rather than assumed correct.
+	v, err := p.VerifyAccess(ctx, app.ID, cloudflare.AccessExpectation{
+		Allow:         allow,
+		EntraTenantID: st.Config["entra-tenant-id"],
+	})
 	if err != nil {
 		return fmt.Errorf("Cloudflare Access was created but could not be verified: %w", err)
 	}
-	u.Say("Cloudflare Access protects %s (%s). Health checks now run against the local origin, because the public hostname answers with the Access challenge.", st.Config["guac-hostname"], fmt.Sprintf("%d allow rule(s), %s", v.AllowRules, v.Challenge))
+	// The package's own summary is used verbatim: it states exactly what was
+	// checked and ends by saying that no user sign-in has been demonstrated.
+	u.Say("%s", v.String())
+	u.Say("Health checks stay on the local origin, because the public hostname now answers with the Access challenge.")
 	return nil
 }
 

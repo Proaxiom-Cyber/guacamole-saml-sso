@@ -1239,3 +1239,25 @@ func TestAdoptedEntraResourcesAreRecordedAsOurs(t *testing.T) {
 		t.Fatal("a pre-existing application must not be treated as ours")
 	}
 }
+
+// TestAccessEvidenceNeverClaimsASignIn pins the distinction the reviewer
+// insisted on: verifying that the provider is configured, and that the
+// hostname answers with the Access challenge, is not evidence that a user
+// signed in. The phase must report the package's own summary, which ends
+// by saying so, rather than composing a looser sentence of its own.
+func TestAccessEvidenceNeverClaimsASignIn(t *testing.T) {
+	v := cloudflare.AccessVerification{
+		AppID: "app-1", Domain: "guac.example.com",
+		AppVerified: true, PolicyMatchesAllowList: true,
+		IdPBoundToTenant: true, ChallengeVerified: true,
+	}
+	summary := v.String()
+	if !strings.Contains(summary, cloudflare.SignInNotProven) {
+		t.Fatalf("the summary does not say a sign-in is unproven:\n%s", summary)
+	}
+	for _, claim := range []string{"signed in", "sign-in succeeded", "logged in"} {
+		if strings.Contains(strings.ToLower(summary), claim) {
+			t.Fatalf("the summary claims a login (%q):\n%s", claim, summary)
+		}
+	}
+}
