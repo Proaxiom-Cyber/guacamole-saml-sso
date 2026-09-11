@@ -168,6 +168,10 @@ func run(args []string) int {
 	var err error
 	switch cmd {
 	case "setup":
+		// Full screen where the terminal supports it, plain lines otherwise.
+		// Only setup: every other command prints a report and exits, so a
+		// full screen that closed immediately would help nobody.
+		u.StartWizard()
 		opts := session.Options{
 			StateDir: *stateDir, UI: u, Resume: *resume,
 			InstallDependencies: *installDeps, CredentialMode: *credMode,

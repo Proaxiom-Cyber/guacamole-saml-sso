@@ -748,6 +748,14 @@ func convergeable(st *state.State, phases []Phase) []Phase {
 // runPhases executes the registry, skipping phases with a successful journal
 // entry, journalling intent before each run and the result after it.
 func runPhases(ctx context.Context, store *state.Store, st *state.State, u *ui.UI, opts *Options, phases []Phase) error {
+	names := make([]string, 0, len(phases))
+	for _, p := range phases {
+		names = append(names, p.Name)
+	}
+	// Declares the whole registry so the wizard can show what is still to
+	// come. Prints nothing in line-oriented output.
+	u.PhaseList(names)
+
 	done := map[string]bool{}
 	for _, a := range st.Actions {
 		if a.FinishedAt != nil && a.Result == state.ResultOK {
@@ -756,7 +764,7 @@ func runPhases(ctx context.Context, store *state.Store, st *state.State, u *ui.U
 	}
 	for _, p := range phases {
 		if done[p.Name] && !p.Always {
-			u.Say("Phase %s: already complete, skipping.", p.Name)
+			u.PhaseSkipped(p.Name)
 			continue
 		}
 		if err := ctx.Err(); err != nil {
@@ -776,6 +784,7 @@ func runPhases(ctx context.Context, store *state.Store, st *state.State, u *ui.U
 				return store.Save(st)
 			}
 		}
+		u.PhaseStart(p.Name)
 		err := p.Run(ctx, st, u)
 		if opts != nil {
 			opts.journalIntent = nil
@@ -795,15 +804,14 @@ func runPhases(ctx context.Context, store *state.Store, st *state.State, u *ui.U
 			if saveErr := store.Save(st); saveErr != nil {
 				return saveErr
 			}
-			u.Say("Phase %s failed: %v", p.Name, err)
-			u.Say("Completed work is retained. Run setup again to resume or clean up.")
+			u.PhaseFailed(p.Name, err)
 			return err
 		}
 		last.Result = state.ResultOK
 		if err := store.Save(st); err != nil {
 			return err
 		}
-		u.Say("Phase %s: complete.", p.Name)
+		u.PhaseDone(p.Name)
 	}
 	u.Say("Session complete. Deployment %s.", st.DeploymentID)
 	return nil
