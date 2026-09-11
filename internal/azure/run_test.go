@@ -2,6 +2,7 @@ package azure
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,8 +14,82 @@ import (
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recording"
 )
 
-func recBlob(name string) string {
-	return testDestination().Prefix(testDeployment) + AreaRecordings + "/" + name
+// --- the scheduled run: upload, then expire, and never the other way round --
+
+func retentionOptions(dest, stateDir string, days int) Options {
+	o := uploadOptions(dest, stateDir)
+	o.RetentionDays = days
+	o.Now = func() time.Time { return expireNow }
+	return o
+}
+
+// TestScheduledRunUploadsThenExpires is the whole scheduled run on the happy
+// path: both kinds of content go up, reported apart, and only then are remote
+// recordings past their retention period removed.
+func TestScheduledRunUploadsThenExpires(t *testing.T) {
+	dest, stateDir := localDest(t), t.TempDir()
+	blobs := newBlobStore(t)
+	putRemote(blobs, recBlob("ancient.guac.age"), testDeployment, expireNow.AddDate(0, 0, -40))
+	putRemote(blobs, dbBlob("guacdeploy-db-20250101T120000.000Z.sql.age"), testDeployment, expireNow.AddDate(0, 0, -400))
+	c := newClient(nil, blobs)
+
+	rep, err := Upload(context.Background(), c, retentionOptions(dest, stateDir, 30))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Database.Uploaded) != 2 || len(rep.Recordings.Uploaded) != 1 {
+		t.Fatalf("database %+v, recordings %+v", rep.Database, rep.Recordings)
+	}
+	if rep.Expire == nil || len(rep.Expire.Removed) != 1 || rep.Expire.Removed[0] != recBlob("ancient.guac.age") {
+		t.Fatalf("expire = %+v", rep.Expire)
+	}
+	if held(blobs, recBlob("ancient.guac.age")) {
+		t.Fatal("a recording past the retention period stayed")
+	}
+	// The database backup is four hundred days old and is not touched: it has
+	// its own retention of the last seven successful backups.
+	if !held(blobs, dbBlob("guacdeploy-db-20250101T120000.000Z.sql.age")) {
+		t.Fatal("the recording age rule reached a database backup")
+	}
+	// The recording this run uploaded has today's Last-Modified, so it is not
+	// expired by the very run that uploaded it.
+	if !held(blobs, recBlob(rec1)) {
+		t.Fatal("the recording uploaded by this run was expired by it")
+	}
+	if s := Summary(stateDir); !strings.Contains(s, "Azure recording retention: 30 days") {
+		t.Fatalf("the status output does not show the retention result:\n%s", s)
+	}
+}
+
+// TestFailedUploadExpiresNothingRemote is the rule that keeps a bad night from
+// becoming data loss: a run that could not copy everything it holds must not
+// start removing what the container already has.
+func TestFailedUploadExpiresNothingRemote(t *testing.T) {
+	dest, stateDir := localDest(t), t.TempDir()
+	blobs := newBlobStore(t)
+	putRemote(blobs, recBlob("ancient.guac.age"), testDeployment, expireNow.AddDate(0, 0, -40))
+	prefix := testDestination().Prefix(testDeployment)
+	blobs.failPut[prefix+"db/"+dbBackup1] = true
+	c := newClient(nil, blobs)
+
+	rep, err := Upload(context.Background(), c, retentionOptions(dest, stateDir, 30))
+	if err == nil {
+		t.Fatal("a failed upload reported success")
+	}
+	if rep.Expire != nil {
+		t.Fatalf("a failed upload ran remote expiry: %+v", rep.Expire)
+	}
+	for _, call := range blobs.calls {
+		if strings.HasPrefix(call, "DELETE ") {
+			t.Fatalf("a failed upload deleted something remote: %s", call)
+		}
+	}
+	if !held(blobs, recBlob("ancient.guac.age")) {
+		t.Fatal("a recording past its retention period was removed by a failed run")
+	}
+	if s := rep.Summary(); !strings.Contains(s, "nothing was expired") {
+		t.Fatalf("the summary does not say expiry was skipped:\n%s", s)
+	}
 }
 
 // TestFailedUploadLeavesTheLocalBackupPublished: the upload is a copy of
@@ -26,7 +101,7 @@ func TestFailedUploadLeavesTheLocalBackupPublished(t *testing.T) {
 	blobs.denyPut = true
 
 	before := listDir(t, dest)
-	if _, err := Upload(context.Background(), newClient(nil, blobs), uploadOptions(dest, stateDir)); err == nil {
+	if _, err := Upload(context.Background(), newClient(nil, blobs), retentionOptions(dest, stateDir, 30)); err == nil {
 		t.Fatal("a denied upload reported success")
 	}
 	if got := listDir(t, dest); strings.Join(got, ",") != strings.Join(before, ",") {
@@ -47,7 +122,7 @@ func TestFailedUploadLeavesTheLocalBackupPublished(t *testing.T) {
 func TestDatabaseAndRecordingOutcomesDoNotContaminateEachOther(t *testing.T) {
 	dest, stateDir := localDest(t), t.TempDir()
 	blobs := newBlobStore(t)
-	blobs.failPut[recBlob(rec1)] = true
+	blobs.failPut[testDestination().Prefix(testDeployment)+"recordings/"+rec1] = true
 
 	rep, err := Upload(context.Background(), newClient(nil, blobs), uploadOptions(dest, stateDir))
 	if err == nil {
@@ -138,7 +213,7 @@ func TestBudgetDeletesAfterAFailedUploadAndTheLossIsReported(t *testing.T) {
 	// The container refuses the copy of the recording that was just deleted.
 	blobs := newBlobStore(t)
 	blobs.failPut[recBlob("aaaa-oldest.guac")] = true
-	rep, err := Upload(context.Background(), newClient(nil, blobs), uploadOptions(dest, stateDir))
+	rep, err := Upload(context.Background(), newClient(nil, blobs), retentionOptions(dest, stateDir, 30))
 	if err == nil {
 		t.Fatal("a failed recording upload reported success")
 	}
@@ -176,7 +251,7 @@ func TestADeletedRecordingWithAConfirmedRemoteCopyIsNotReportedLost(t *testing.T
 		t.Fatal(err)
 	}
 
-	rep, err := Upload(context.Background(), newClient(nil, newBlobStore(t)), uploadOptions(dest, stateDir))
+	rep, err := Upload(context.Background(), newClient(nil, newBlobStore(t)), retentionOptions(dest, stateDir, 30))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +286,7 @@ func TestAnActiveRecordingIsNeverUploaded(t *testing.T) {
 	}
 
 	blobs := newBlobStore(t)
-	rep, err := Upload(context.Background(), newClient(nil, blobs), uploadOptions(dest, stateDir))
+	rep, err := Upload(context.Background(), newClient(nil, blobs), retentionOptions(dest, stateDir, 30))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,6 +297,69 @@ func TestAnActiveRecordingIsNeverUploaded(t *testing.T) {
 	}
 	if len(rep.Recordings.Uploaded) != 1 || !strings.HasPrefix(rep.Recordings.Uploaded[0], "finished-session") {
 		t.Fatalf("recordings uploaded = %v", rep.Recordings.Uploaded)
+	}
+}
+
+// TestACopyPastItsRetentionPeriodIsNotUploadedAgain closes the loop between
+// the two halves of this work. Expiry removes an old recording from the
+// container, but the local published copy is never pruned, so an uploader that
+// simply re-sent everything missing would put it straight back and the
+// retention period would mean nothing.
+func TestACopyPastItsRetentionPeriodIsNotUploadedAgain(t *testing.T) {
+	dest, stateDir := localDest(t), t.TempDir()
+	backdateManifest(t, recording.DestDir(dest), rec1, expireNow.AddDate(0, 0, -40))
+	blobs := newBlobStore(t)
+
+	rep, err := Upload(context.Background(), newClient(nil, blobs), retentionOptions(dest, stateDir, 30))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Recordings.Uploaded) != 0 || len(rep.Recordings.PastRetention) != 1 {
+		t.Fatalf("recordings = %+v", rep.Recordings)
+	}
+	if held(blobs, recBlob(rec1)) {
+		t.Fatal("a copy already past the retention period was uploaded, restarting its clock")
+	}
+	// Database backups are never held back this way: they have their own
+	// retention and are not expired by age.
+	if len(rep.Database.Uploaded) != 2 || len(rep.Database.PastRetention) != 0 {
+		t.Fatalf("the recording age rule reached the database backups: %+v", rep.Database)
+	}
+	if s := rep.Summary(); !strings.Contains(s, "Not sent (too old)") {
+		t.Fatalf("the summary does not explain the held-back copy:\n%s", s)
+	}
+
+	// With no retention period configured, nothing is held back.
+	rep, err = Upload(context.Background(), newClient(nil, newBlobStore(t)), uploadOptions(dest, t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Recordings.Uploaded) != 1 || len(rep.Recordings.PastRetention) != 0 {
+		t.Fatalf("without a retention period: %+v", rep.Recordings)
+	}
+}
+
+// backdateManifest rewrites a published copy's completion manifest so it looks
+// as though it was published long ago. Only PublishedAt changes, so the file
+// still verifies.
+func backdateManifest(t *testing.T, dir, name string, at time.Time) {
+	t.Helper()
+	path := backup.ManifestPath(dir, name)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m backup.Manifest
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	m.PublishedAt = at.UTC()
+	out, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(out, '\n'), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

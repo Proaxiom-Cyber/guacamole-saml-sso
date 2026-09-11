@@ -176,6 +176,13 @@ type Options struct {
 	// OnCalendar is the installed schedule, recorded for the status report.
 	OnCalendar string
 
+	// RetentionDays is how many days this deployment's recordings are kept in
+	// the container (issue #20). Zero leaves remote recordings for ever and
+	// expires nothing. It is asked for during setup and recorded in
+	// deployment state; the administrator chooses it, this package never
+	// guesses a default.
+	RetentionDays int
+
 	// Now supplies the run timestamp; nil means time.Now.
 	Now func() time.Time
 }
@@ -205,6 +212,13 @@ type Outcome struct {
 	// Failed is every file whose upload failed. Nothing was completed for
 	// these.
 	Failed []Failure `json:"failed,omitempty"`
+	// PastRetention is every local recording copy that was already older than
+	// the remote retention period, so it was not sent. Uploading one would
+	// only restart its clock: the copy would be written now, carry today's
+	// Last-Modified, and sit in the container for another full period after
+	// expiry had already removed it once. Database backups never reach here;
+	// they have their own retention and are not expired by age.
+	PastRetention []string `json:"past_retention,omitempty"`
 }
 
 // Report is the result of one upload run, and the destination it used.
@@ -241,13 +255,20 @@ type Report struct {
 	// this run's clock.
 	CleanupRan time.Time `json:"cleanup_ran,omitempty"`
 
+	// RetentionDays and Expire cover remote recording retention (issue #20).
+	// Expire is nil when no retention period is configured, and when the
+	// upload failed: a failed upload expires nothing.
+	RetentionDays int           `json:"retention_days,omitempty"`
+	Expire        *ExpireReport `json:"expire,omitempty"`
+
 	Error      string `json:"error,omitempty"`
 	OnCalendar string `json:"on_calendar,omitempty"`
 }
 
 // Upload is the whole scheduled Azure run: copy this deployment's complete
 // local backups and recording copies into the container, report what the local
-// storage budget lost, and record the outcome either way.
+// storage budget lost, expire remote recordings that are past their retention
+// period, and record the outcome either way.
 //
 // It uploads from the local published destination rather than exporting
 // again: the local publish already carries the completion proof, so the
@@ -266,6 +287,11 @@ type Report struct {
 //  2. The cross-check against the last local cleanup, whether or not the
 //     uploads succeeded: the budget has already deleted by then, and the
 //     point of the line is to say what that cost.
+//  3. Remote expiry, and only when everything above succeeded. A failed
+//     upload must not delete or expire anything remote: the copies in the
+//     container are all that is left of a recording the local budget has
+//     removed, and a run that could not prove what it holds must not start
+//     removing things.
 //
 // An active recording cannot be uploaded here, structurally rather than by a
 // check: this run copies only published recording copies, and
@@ -273,7 +299,8 @@ type Report struct {
 // holds open. There is no path from a live session's file to a blob.
 func Upload(ctx context.Context, c *Client, o Options) (Report, error) {
 	rep := Report{Ran: o.now().UTC(), Result: "ok", Destination: o.Destination,
-		ClientID: o.ClientID, AuthMode: o.AuthMode, OnCalendar: o.OnCalendar}
+		ClientID: o.ClientID, AuthMode: o.AuthMode, OnCalendar: o.OnCalendar,
+		RetentionDays: o.RetentionDays}
 	if o.DeploymentID == "" {
 		return rep, fmt.Errorf("an Azure upload needs the deployment ID to mark and scope its objects")
 	}
@@ -292,10 +319,15 @@ func Upload(ctx context.Context, c *Client, o Options) (Report, error) {
 	dbErr := c.uploadAll(ctx, o, o.Dest, dbNames, AreaDatabase, &rep.Database)
 
 	recDir := recording.DestDir(o.Dest)
-	recNames, err := completeRecordings(recDir, o.DeploymentID)
+	var cutoff time.Time
+	if o.RetentionDays > 0 {
+		cutoff = rep.Ran.AddDate(0, 0, -o.RetentionDays)
+	}
+	recNames, past, err := completeRecordings(recDir, o.DeploymentID, cutoff)
 	if err != nil {
 		return o.fail(rep, fmt.Errorf("the local recording copies in %s could not be read: %w", recDir, err))
 	}
+	rep.Recordings.PastRetention = past
 	recErr := c.uploadAll(ctx, o, recDir, recNames, AreaRecordings, &rep.Recordings)
 
 	rep.noteLocalLosses(o.StateDir)
@@ -307,6 +339,15 @@ func Upload(ctx context.Context, c *Client, o Options) (Report, error) {
 		return o.fail(rep, dbErr)
 	case recErr != nil:
 		return o.fail(rep, recErr)
+	}
+
+	if o.RetentionDays > 0 {
+		er, err := Expire(ctx, c, ExpireOptions{Destination: o.Destination,
+			DeploymentID: o.DeploymentID, Days: o.RetentionDays, Now: o.Now})
+		rep.Expire = &er
+		if err != nil {
+			return o.fail(rep, err)
+		}
 	}
 	if err := WriteReport(o.StateDir, rep); err != nil {
 		return rep, err
@@ -411,28 +452,37 @@ func (c *Client) uploadAll(ctx context.Context, o Options, dir string, names []s
 	return nil
 }
 
-// completeRecordings lists the recording copies in dir that are complete and
-// belong to this deployment. A missing directory means recordings were never
-// backed up locally, which is not a failure.
-func completeRecordings(dir, deploymentID string) ([]string, error) {
+// completeRecordings lists the recording copies in dir that are complete,
+// belong to this deployment, and are not already older than the remote
+// retention period. A missing directory means recordings were never backed up
+// locally, which is not a failure.
+//
+// cutoff zero means no remote retention is configured, and then nothing is
+// held back. A copy whose manifest records no publication time is uploaded
+// rather than held back: an unknown age must not silently stop a backup.
+func completeRecordings(dir, deploymentID string, cutoff time.Time) (names, pastRetention []string, err error) {
 	ents, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var names []string
 	for _, e := range ents {
 		if e.IsDir() || strings.HasSuffix(e.Name(), backup.ManifestSuffix) {
 			continue
 		}
-		if _, err := backup.VerifyPublished(dir, e.Name(), deploymentID); err != nil {
+		m, err := backup.VerifyPublished(dir, e.Name(), deploymentID)
+		if err != nil {
 			continue // incomplete, or another deployment's copy: not ours to upload
+		}
+		if !cutoff.IsZero() && !m.PublishedAt.IsZero() && m.PublishedAt.UTC().Before(cutoff) {
+			pastRetention = append(pastRetention, e.Name())
+			continue
 		}
 		names = append(names, e.Name())
 	}
-	return names, nil
+	return names, pastRetention, nil
 }
 
 // ReportPath is the last-run record, beside the scheduled backup's and the
@@ -501,6 +551,9 @@ func (r Report) Summary() string {
 		len(r.Database.Uploaded), len(r.Database.AlreadyThere), len(r.Database.Failed))
 	fmt.Fprintf(&b, "Recordings:           %d uploaded, %d already held, %d failed\n",
 		len(r.Recordings.Uploaded), len(r.Recordings.AlreadyThere), len(r.Recordings.Failed))
+	if n := len(r.Recordings.PastRetention); n > 0 {
+		fmt.Fprintf(&b, "Not sent (too old):   %d local recording copies are already past the %d-day Azure retention period\n", n, r.RetentionDays)
+	}
 	for _, f := range r.Database.Failed {
 		fmt.Fprintf(&b, "Upload failed (db):   %s: %s\n", f.Name, firstLine(f.Reason))
 	}
@@ -509,6 +562,11 @@ func (r Report) Summary() string {
 	}
 	for _, n := range r.DeletedWithoutRemoteCopy {
 		fmt.Fprintf(&b, "LOST:                 %s was deleted locally to stay within the storage budget and has no confirmed copy in Azure; it cannot be recovered\n", n)
+	}
+	if r.Expire != nil {
+		b.WriteString(r.Expire.Summary())
+	} else if r.RetentionDays > 0 {
+		fmt.Fprintf(&b, "Azure recording retention: %d days (nothing was expired: this run did not complete)\n", r.RetentionDays)
 	}
 	if r.Error != "" {
 		fmt.Fprintf(&b, "Reason:               %s\n", firstLine(r.Error))
