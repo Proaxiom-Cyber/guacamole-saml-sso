@@ -81,6 +81,7 @@ func Phases(opts *Options) []Phase {
 		{Name: "stack-up", Run: opts.stackUp},
 		// Health is checked against the local origin before anything is
 		// published, so a failure later never leaves an exposed service.
+		{Name: "boot-recovery", Run: opts.bootRecovery},
 		{Name: "backup-schedule", Run: opts.backupSchedule},
 		{Name: "recording-schedule", Run: opts.recordingSchedule},
 		{Name: "stack-health", Run: opts.stackHealth},
@@ -1353,5 +1354,44 @@ func StartStack(ctx context.Context, stateDir string, u *ui.UI) error {
 		return err
 	}
 	u.Say("Stack started for deployment %s.", st.DeploymentID)
+	return nil
+}
+
+// bootRecovery installs the unit that brings the stack back after a
+// reboot.
+//
+// It is not optional housekeeping. Credentials reach the containers as
+// files on memory-backed storage, which a cold boot empties, so without
+// this unit Docker restarts the containers into a deployment whose
+// secrets have vanished: postgres refuses to start and the connector has
+// no token. Every persistent credential mode needs it, not only the
+// encrypted ones.
+func (o *Options) bootRecovery(ctx context.Context, st *state.State, u *ui.UI) error {
+	mode := st.Config["credential-mode"]
+	if !creds.Persistent(mode) {
+		u.Say("Credential mode %s cannot supply credentials without a person, so no boot recovery unit is installed.", mode)
+		u.Say("After a reboot, start the stack yourself with 'guacdeploy stack-start'.")
+		return nil
+	}
+	in, err := creds.InstallBoot(ctx, creds.BootOptions{
+		Run:          creds.ExecRunner,
+		DeploymentID: st.DeploymentID,
+		Mode:         mode,
+		StateDir:     o.StateDir,
+	})
+	if err != nil {
+		return fmt.Errorf("installing reboot recovery failed: %w", err)
+	}
+	now := time.Now().UTC()
+	for _, unit := range []string{in.ServicePath, in.RuntimePath} {
+		if unit == "" {
+			continue
+		}
+		st.EnsureResource(state.Resource{
+			Provider: "host", Type: "systemd-unit", Name: unit,
+			Ownership: "installed by this deployment for reboot recovery", CreatedAt: now,
+		})
+	}
+	u.Say("Reboot recovery installed: the stack restarts with its credentials after a reboot, without this binary present.")
 	return nil
 }

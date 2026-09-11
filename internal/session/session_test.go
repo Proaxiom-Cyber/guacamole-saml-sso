@@ -468,7 +468,7 @@ func TestStackPhasesFullPipelineUnattended(t *testing.T) {
 	opts.Phases = withoutPhases(Phases(&opts),
 		"cloudflare-select", "cloudflare-tunnel", "cloudflare-dns",
 		"cloudflare-connect", "entra-signin", "cloudflare-access", "origin-certificate",
-		"backup-schedule", "recording-schedule")
+		"backup-schedule", "recording-schedule", "boot-recovery")
 	if err := Run(context.Background(), opts); err != nil {
 		t.Fatalf("full pipeline: %v\n%s", err, out.String())
 	}
@@ -1088,5 +1088,33 @@ func TestStartStackNeverWaitsForAPerson(t *testing.T) {
 	}
 	if !errors.Is(err, creds.ErrUnattendedPrompt) && !strings.Contains(err.Error(), "prompt") {
 		t.Fatalf("the failure does not explain that a person is needed: %v", err)
+	}
+}
+
+// TestBootRecoveryCoversEveryPersistentMode pins that reboot recovery is
+// installed for file mode too, not only the encrypted ones. Container
+// credentials live on memory-backed storage now, so a cold boot empties
+// them whatever the store is: without the unit, Docker restarts the
+// containers into a deployment whose secrets have vanished.
+func TestBootRecoveryCoversEveryPersistentMode(t *testing.T) {
+	for _, mode := range []string{creds.ModeFile, creds.ModeTPM, creds.ModeHostKey} {
+		if !creds.Persistent(mode) {
+			t.Fatalf("%s should be a persistent mode that gets reboot recovery", mode)
+		}
+	}
+	// A mode that needs a person gets an explanation instead of a unit.
+	o := &Options{StateDir: t.TempDir()}
+	st := &state.State{DeploymentID: "d", Config: map[string]string{"credential-mode": creds.ModePrompt}}
+	u, out := testUI(false, "")
+	if err := o.bootRecovery(context.Background(), st, u); err != nil {
+		t.Fatalf("prompt mode must not fail the deployment: %v", err)
+	}
+	if !strings.Contains(out.String(), "stack-start") {
+		t.Fatalf("the operator was not told how to start the stack after a reboot:\n%s", out.String())
+	}
+	for _, r := range st.Resources {
+		if r.Type == "systemd-unit" {
+			t.Fatal("a boot unit was installed for a mode that cannot use it")
+		}
 	}
 }
