@@ -98,35 +98,53 @@ allowlisting.
 
 ## Deploy
 
-1. Keep the database password in your secret store. For an existing database, use its
-   current password. For a new database, create a password in the store first.
-2. As root, run `./setup.sh` from the Git checkout. It installs or updates the live deployment
-   in `/opt/guacamole`, then continues from there. On the first run it asks for the
-   public hostname and whether to publish through Cloudflare. It writes non-secret
-   configuration to `/opt/guacamole/.env`.
-   To change group names or use Okta or Keycloak, copy `.env.example` to `.env` and edit
-   it before the first run. Set the identity provider metadata URL for Okta or Keycloak.
-3. Supply the database password at the masked prompt and confirm it. Setup can also
-   retrieve it through `POSTGRES_PASSWORD_CMD` or use an existing `POSTGRES_PASSWORD`
-   session variable. It never generates a replacement password on a later run.
-4. The script creates the folders, generates the database schema, and makes a
-   self-signed certificate. If the metadata URL is empty, it also registers the
-   application in Entra ID: it shows a device code, you sign in as an administrator,
-   and it writes the metadata URL back to `.env`.
-   With `COMPOSE_PROFILES=cloudflare` (the default), it then asks for a Cloudflare API
-   token and publishes the hostname: a tunnel, a proxied DNS record, and Cloudflare
-   Access with Entra ID sign-in in front. Setup gets the tunnel token without displaying it.
-5. Setup starts the containers and waits for the guacd, database and tunnel health checks.
-   It checks the Guacamole page through local nginx, shows container status, then prints
-   the service URL. If Cloudflare Access is not ready, setup stops before starting the
-   services. Activate the zone and run setup again.
-6. Without Cloudflare, replace `nginx/certs/fullchain.pem` and `privkey.pem` with a
-   certificate your clients trust, then run setup again. Open `HTTPS_PORT` to your clients.
-7. Open the URL from the summary. With Cloudflare, it is
-   `https://<GUAC_HOSTNAME>/guacamole/`. Sign-in starts at once.
+Run `guacdeploy` as root on the server. One guided run does the whole deployment:
 
-The `init/` scripts run only when `data/` is empty. Get the group names right before
-the first start, or delete `data/` and start again.
+```sh
+sudo guacdeploy
+```
+
+It checks the host first — Rocky Linux 10 on Intel or AMD 64-bit, root, no existing
+installation, and the outbound access it needs — and refuses with an explanation rather
+than changing anything it should not. It then asks how credentials should be supplied,
+shows what it will install before installing it, and records what it creates.
+
+For an unattended run, give it the same answers as flags:
+
+```sh
+sudo guacdeploy setup --non-interactive --install-dependencies \
+  --credentials file \
+  --hostname guac.example.com \
+  --admin-group "Guacamole Administrators" \
+  --operator-group "Guacamole Operators" \
+  --zone example.com
+```
+
+Unattended runs never wait for input. Where the specification requires a person —
+approving a change to a resource the tool did not create, for instance — the run stops
+with exit code 3 and says what needs approving.
+
+What a full run does, in order: prepares the host, selects the Cloudflare account and
+zone, creates the tunnel, renders the stack configuration and database schema, obtains a
+Let's Encrypt certificate for the origin by DNS-01, starts the containers, installs
+reboot recovery and any schedules you asked for, checks the local origin, provisions
+Entra sign-in, publishes the DNS record, puts Cloudflare Access in front, and only then
+starts the connector. Nothing is reachable from the internet until sign-in exists and
+the Access policy has been verified.
+
+If a run is interrupted, run it again: it shows the work that did not finish and offers
+to resume or clean up. Completed work is never repeated, and a creation whose response
+was lost is reconciled by ownership marker rather than repeated.
+
+`guacdeploy status` shows the deployment record. `docs/operator-guide.md` covers every
+command, the exit codes, backups, recordings, certificates and teardown.
+
+### The original shell scripts
+
+`setup.sh` and the `lib/` and `init/` scripts are the pre-V1 workflow and are kept for
+reference. They need a checkout on the server, which is exactly what `guacdeploy`
+removes. A deployment made by those scripts is **not** adopted by `guacdeploy`: it
+refuses to overwrite an existing installation and explains why.
 
 ## Configuration
 
