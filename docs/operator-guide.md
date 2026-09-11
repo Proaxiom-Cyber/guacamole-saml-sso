@@ -22,6 +22,8 @@ launcher verifies and which network destinations it uses.
 | `guacdeploy status` | Show the deployment record without changing anything |
 | `guacdeploy backup-key` | Generate the backup key pair and write the encrypted private-key export |
 | `guacdeploy backup-key --verify` | Prove the export decrypts and matches the recorded public key |
+| `guacdeploy backup` | Export the database, encrypted, into a directory |
+| `guacdeploy restore --file PATH` | Replace the database from a backup file, after validation and consent |
 | `guacdeploy version` | Print the tool version |
 
 ## Exit codes
@@ -117,6 +119,48 @@ prove that a copy was made.
 Run `guacdeploy backup-key --verify` to prove recovery: it decrypts the
 export with your passphrase and checks that the result matches the
 recorded public key.
+
+## Database backup and restore
+
+`guacdeploy backup` exports the database with PostgreSQL's `pg_dump`
+through the running stack. It never copies the data directory. Before the
+export, it writes a versioned snapshot of the deployment record into the
+database, so the backup carries the ownership state. The deployment lock
+is held for the whole run.
+
+Backups are encrypted with the recorded backup public key. Run
+`guacdeploy backup-key` once first. `--plaintext` writes an unencrypted
+file; that is always an explicit choice.
+
+The default destination is `/var/lib/guacdeploy/backups`. Pass `--dest
+DIR` for another directory, such as a mounted share. That directory must
+already exist. A missing directory or mount fails visibly; the tool never
+redirects the backup to another place.
+
+A backup is written as a hidden `.partial-` file first and renamed to
+`guacdeploy-db-<timestamp>.sql.age` (or `.sql`) only after a complete
+export. A failed run leaves only the `.partial-` file and never touches
+earlier backups. On success the command prints the published path; on
+failure it prints that the backup was not published.
+
+`guacdeploy restore --file PATH` replaces the whole database with a
+backup. It first validates the file completely: decryption, the format
+and Guacamole version in the header, and the completion marker that
+proves the dump is not truncated. A file that fails validation causes no
+database change. For an encrypted backup, the command asks for the
+recovery passphrase and decrypts the key export at
+`/var/lib/guacdeploy/recovery/backup-key.age`; `--identity-file PATH`
+accepts a standard age identity file instead, for automation. Protect
+such a file with owner-only permissions and remove it after use.
+
+Restore replaces all current data and interrupts connected users. The
+guided command shows what will be replaced and asks for consent.
+Unattended restore requires `--yes`. Accept the downtime before you run
+it, and restart the stack afterwards so Guacamole reconnects:
+`docker compose --project-directory /opt/guacamole restart`.
+
+The database dump can contain sensitive application data, such as saved
+connection credentials. Treat plaintext backups accordingly.
 
 ## State
 

@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/backup"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/session"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/ui"
@@ -30,6 +31,8 @@ Commands:
   setup    Start or resume the deployment (default)
   status   Show the deployment record
   backup-key  Generate the backup recovery key (guided only); --verify demonstrates recovery
+  backup   Export the database, encrypted with the backup key, into a directory
+  restore  Replace the database from a backup file (asks for consent)
   version  Print the tool version
 
 Flags for setup:
@@ -41,6 +44,15 @@ Flags for setup:
   --admin-group NAME       Identity-provider group for administrators
   --operator-group NAME    Identity-provider group for operators
   --state-dir DIR          Override the state directory (default ` + "/var/lib/guacdeploy" + `)
+
+Flags for backup:
+  --dest DIR               Destination directory (default <state-dir>/backups)
+  --plaintext              Explicitly write an unencrypted backup
+
+Flags for restore:
+  --file PATH              Backup file to restore (required)
+  --identity-file PATH     age identity file instead of the passphrase prompt
+  --yes                    Unattended consent to replace the database
 `
 
 func main() { os.Exit(run(os.Args[1:])) }
@@ -60,6 +72,11 @@ func run(args []string) int {
 	adminGroup := fs.String("admin-group", "", "identity-provider group for administrators")
 	operatorGroup := fs.String("operator-group", "", "identity-provider group for operators")
 	verify := fs.Bool("verify", false, "backup-key: demonstrate recovery from the existing export")
+	dest := fs.String("dest", "", "backup: destination directory (default <state-dir>/backups)")
+	plaintext := fs.Bool("plaintext", false, "backup: explicitly write an unencrypted backup")
+	file := fs.String("file", "", "restore: backup file to restore")
+	identityFile := fs.String("identity-file", "", "restore: age identity file instead of the passphrase prompt")
+	yes := fs.Bool("yes", false, "restore: unattended consent to replace the database")
 	stateDir := fs.String("state-dir", state.DefaultDir(), "state directory")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	if err := fs.Parse(args); err != nil {
@@ -111,6 +128,10 @@ func run(args []string) int {
 		err = session.Status(*stateDir, u)
 	case "backup-key":
 		err = backupKey(*stateDir, *verify, u)
+	case "backup":
+		err = backupCmd(ctx, backup.ExecRunner, *stateDir, *dest, *plaintext, u)
+	case "restore":
+		err = restoreCmd(ctx, backup.ExecRunner, *stateDir, *file, *identityFile, *yes, u)
 	case "version":
 		u.Say("guacdeploy %s", version)
 	default:
