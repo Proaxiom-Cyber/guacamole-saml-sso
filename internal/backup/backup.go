@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -66,6 +67,17 @@ type Options struct {
 	Plaintext   bool   // explicit choice; encryption is the default
 	PublicKey   string // age recipient from state Config, required unless Plaintext
 	GuacVersion string // pinned Guacamole version, recorded in the backup header
+
+	// Now supplies the backup timestamp; nil means time.Now. Tests set it
+	// to a fixed instant to exercise the name-collision guard.
+	Now func() time.Time
+}
+
+func (o Options) now() time.Time {
+	if o.Now != nil {
+		return o.Now()
+	}
+	return time.Now()
 }
 
 // composeArgs targets the running stack's compose project. No credential
@@ -109,11 +121,19 @@ func Backup(ctx context.Context, o Options, st *state.State) (string, error) {
 		return "", fmt.Errorf("backup destination %s is not an existing directory (is the mount present?); nothing was exported", o.Dest)
 	}
 
-	name := "guacdeploy-db-" + time.Now().UTC().Format("20060102T150405Z") + ext
-	partial := filepath.Join(o.Dest, ".partial-"+name)
-	f, err := os.OpenFile(partial, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	// Millisecond resolution makes same-name runs vanishingly unlikely, and
+	// publishNonDestructively below still refuses to overwrite if one ever
+	// does collide. The partial gets a random suffix so a retry started in
+	// the same millisecond cannot fail on, or clobber, an earlier partial.
+	base := "guacdeploy-db-" + o.now().UTC().Format("20060102T150405.000Z")
+	f, err := os.CreateTemp(o.Dest, ".partial-"+base+"-*"+ext)
 	if err != nil {
 		return "", fmt.Errorf("backup destination %s is not writable: %w; nothing was exported", o.Dest, err)
+	}
+	partial := f.Name()
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return "", err
 	}
 	// On failure the .partial file stays behind as evidence of the failed
 	// attempt; its dot-name never matches a published backup, so earlier
@@ -168,15 +188,38 @@ func Backup(ctx context.Context, o Options, st *state.State) (string, error) {
 	if err := f.Close(); err != nil {
 		return "", fmt.Errorf("writing the backup failed, backup not published: %w", err)
 	}
-	final := filepath.Join(o.Dest, name)
-	if err := os.Rename(partial, final); err != nil {
-		return "", fmt.Errorf("publishing the backup failed: %w", err)
+	final, err := publishNonDestructively(o.Dest, partial, base, ext)
+	if err != nil {
+		return "", err
 	}
 	if d, err := os.Open(o.Dest); err == nil {
 		d.Sync()
 		d.Close()
 	}
 	return final, nil
+}
+
+// publishNonDestructively links the finished partial to its published name.
+// os.Link fails atomically when the target exists, so a backup can never
+// overwrite an earlier successful one; on a collision the next free
+// "-N" name is used. The partial is removed only once a link succeeded, so
+// a failure here still leaves the export on disk rather than losing it.
+func publishNonDestructively(dest, partial, base, ext string) (string, error) {
+	for i := 0; i <= 100; i++ {
+		final := filepath.Join(dest, base+ext)
+		if i > 0 {
+			final = filepath.Join(dest, fmt.Sprintf("%s-%d%s", base, i, ext))
+		}
+		err := os.Link(partial, final)
+		if err == nil {
+			os.Remove(partial)
+			return final, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return "", fmt.Errorf("publishing the backup failed: %w", err)
+		}
+	}
+	return "", fmt.Errorf("publishing the backup failed: too many backups share the name %s%s; the export is kept at %s", base, ext, partial)
 }
 
 // Info describes a validated backup file.

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recoverykey"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
@@ -235,5 +236,104 @@ func TestRoundtripEncryptedBackupRestore(t *testing.T) {
 		if !strings.Contains(strings.Join(c.args, " "), "ON_ERROR_STOP=1") {
 			t.Error("restore psql must run with ON_ERROR_STOP=1")
 		}
+	}
+}
+
+// TestBackupsInSameInstantNeverOverwrite pins the reliability case: two
+// successful backups taken at the identical timestamp must both survive
+// under distinct names. A silent overwrite here would destroy a good
+// backup, which retention could never recover.
+func TestBackupsInSameInstantNeverOverwrite(t *testing.T) {
+	f := &fake{}
+	id, _ := recoverykey.Generate()
+	dest := t.TempDir()
+	frozen := time.Date(2026, 9, 11, 10, 48, 26, 0, time.UTC)
+
+	o := opts(f, dest, id.Recipient().String(), false)
+	o.Now = func() time.Time { return frozen }
+
+	first, err := Backup(context.Background(), o, testState())
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstBytes, err := os.ReadFile(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := Backup(context.Background(), o, testState())
+	if err != nil {
+		t.Fatalf("second backup in the same instant failed: %v", err)
+	}
+	if second == first {
+		t.Fatalf("second backup reused the first name %s", first)
+	}
+	// The first backup must be untouched, byte for byte.
+	againBytes, err := os.ReadFile(first)
+	if err != nil {
+		t.Fatalf("first backup disappeared: %v", err)
+	}
+	if string(againBytes) != string(firstBytes) {
+		t.Fatal("first backup was overwritten by the second")
+	}
+
+	// Exactly two published backups, no leftover partials.
+	entries, err := os.ReadDir(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var published, partials int
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".partial-") {
+			partials++
+			continue
+		}
+		published++
+	}
+	if published != 2 || partials != 0 {
+		names := []string{}
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("want 2 published and 0 partial, got %d/%d: %v", published, partials, names)
+	}
+}
+
+// TestFailedBackupLeavesEarlierBackupsIntact proves a failing attempt
+// neither publishes nor disturbs an existing successful backup.
+func TestFailedBackupLeavesEarlierBackupsIntact(t *testing.T) {
+	id, _ := recoverykey.Generate()
+	dest := t.TempDir()
+	frozen := time.Date(2026, 9, 11, 10, 48, 26, 0, time.UTC)
+
+	good := &fake{}
+	o := opts(good, dest, id.Recipient().String(), false)
+	o.Now = func() time.Time { return frozen }
+	first, err := Backup(context.Background(), o, testState())
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(first)
+
+	bad := &fake{failDump: true}
+	o2 := opts(bad, dest, id.Recipient().String(), false)
+	o2.Now = func() time.Time { return frozen }
+	if _, err := Backup(context.Background(), o2, testState()); err == nil {
+		t.Fatal("failing export must not publish a backup")
+	}
+
+	after, err := os.ReadFile(first)
+	if err != nil || string(after) != string(before) {
+		t.Fatal("the earlier successful backup was damaged by a failed attempt")
+	}
+	var published int
+	entries, _ := os.ReadDir(dest)
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), ".partial-") {
+			published++
+		}
+	}
+	if published != 1 {
+		t.Fatalf("want exactly 1 published backup, got %d", published)
 	}
 }
