@@ -1,17 +1,26 @@
-// Package azure connects this deployment's backups to Azure Blob storage
-// that already exists. It signs in, finds the subscription, storage account
-// and container the administrator names, checks three different permissions
-// separately, and uploads published backups so a remote copy is only ever
-// counted as complete when it is whole.
+// Package azure connects this deployment's backups to Azure Blob storage. It
+// signs in, selects the subscription, storage account and container the
+// administrator names — or creates them when the administrator asks for that —
+// checks three different permissions separately, grants the unattended uploader
+// its one data role, and uploads published backups so a remote copy is only
+// ever counted as complete when it is whole.
 //
-// It creates nothing in Azure. There is no code path here that creates a
-// storage account or a container, and no code path that deletes one:
-// creation is a separate slice (issue #18), and "Preserve remote backups and
-// their supporting storage resources during ordinary teardown"
-// (specification, "Azure Blob destination") means teardown must leave the
-// container alone. Every management-plane call this package makes is a GET —
-// see armGet, which is the only ARM helper — so it cannot create or delete a
-// management-plane resource even by mistake.
+// # Nothing here deletes storage, and teardown does nothing
+//
+// There is no code path that deletes a storage account or a container, and
+// there will not be one. "Preserve remote backups and their supporting storage
+// resources during ordinary teardown" (specification, "Azure Blob
+// destination"). That holds for storage this package created as much as for
+// storage it was given: a container this deployment created is exactly the case
+// the specification says to preserve, because it holds the backups. Ordinary
+// teardown makes no call to Azure at all. It may drop the state keys and the
+// credential; the storage stays.
+//
+// The only DELETE in this package removes one blob, after reading this
+// deployment's ownership marker back from the service (DeleteOwnedBlob). The
+// management plane is reached through exactly two helpers, armGet and armPut,
+// so no management-plane resource can be removed from here even by mistake.
+// TestNoContainerOrAccountDeletionPathExists holds the package to that.
 //
 // # No SDK
 //
@@ -49,6 +58,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 const (
@@ -81,6 +91,18 @@ type Client struct {
 	// Do sends one HTTP request. nil means http.DefaultClient.Do. Tests
 	// replace it to fake every Azure call.
 	Do func(*http.Request) (*http.Response, error)
+
+	// Sleep waits between polls of an asynchronous creation. nil means
+	// time.Sleep; tests replace it so a poll costs nothing.
+	Sleep func(time.Duration)
+}
+
+func (c *Client) nap(d time.Duration) {
+	if c.Sleep != nil {
+		c.Sleep(d)
+		return
+	}
+	time.Sleep(d)
 }
 
 func (c *Client) send(req *http.Request) (*http.Response, error) {
@@ -195,13 +217,21 @@ func (c *Client) Subscriptions(ctx context.Context) ([]Subscription, error) {
 
 // StorageAccount is one existing storage account.
 type StorageAccount struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Location   string `json:"location"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Location string `json:"location"`
+	// Tags carry the deployment ownership marker on an account this tool
+	// created. A tag is what a storage account has to carry one; it is read
+	// back from Azure and never assumed.
+	Tags       map[string]string `json:"tags"`
 	Properties struct {
 		PrimaryEndpoints struct {
 			Blob string `json:"blob"`
 		} `json:"primaryEndpoints"`
+		// ProvisioningState is "Creating", "ResolvingDNS" or "Succeeded".
+		// Creating a storage account is asynchronous, so a just-created
+		// account is polled on this.
+		ProvisioningState string `json:"provisioningState"`
 	} `json:"properties"`
 }
 
@@ -248,23 +278,12 @@ func (c *Client) StorageAccounts(ctx context.Context, subscriptionID string) ([]
 // cleanly separate from "can I write blobs", which CheckPermissions tests on
 // its own.
 func (c *Client) Containers(ctx context.Context, accountID string) ([]string, error) {
-	if accountID == "" {
-		return nil, fmt.Errorf("a storage account is needed before containers can be listed")
-	}
-	raw, err := c.armGet(ctx, accountID+"/blobServices/default/containers?api-version="+armStorageAPI)
+	list, err := c.containerRecords(ctx, accountID)
 	if err != nil {
 		return nil, err
 	}
-	var out struct {
-		Value []struct {
-			Name string `json:"name"`
-		} `json:"value"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("the container list is not readable JSON: %w", err)
-	}
-	names := make([]string, 0, len(out.Value))
-	for _, v := range out.Value {
+	names := make([]string, 0, len(list))
+	for _, v := range list {
 		names = append(names, v.Name)
 	}
 	return names, nil
