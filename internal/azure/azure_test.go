@@ -74,12 +74,15 @@ type blobStore struct {
 	denyList   bool            // List Blobs returns 403
 	denyPut    bool            // every Put Blob returns 403
 	denyHead   bool            // Get Blob Properties returns 403
+	failHead   map[string]bool // Get Blob Properties returns 403 for these names
+	failGet    map[string]bool // Get Blob returns 403 for these names
 	failPut    map[string]bool // these blob names fail to write
 	truncate   map[string]int  // store only this many bytes of these blobs
 	corruptMD5 map[string]bool // report a different Content-MD5 on read-back
 	omitMD5    map[string]bool // report no Content-MD5 at all, as a blob written in blocks does
 	badDate    map[string]bool // report a Last-Modified that cannot be parsed
 	denyDelete bool
+	failDelete map[string]bool // Delete Blob returns 403 for these names
 }
 
 type storedBlob struct {
@@ -118,7 +121,9 @@ func ageBlob(t *testing.T, s *blobStore, name string, at time.Time) {
 
 func newBlobStore(t *testing.T) *blobStore {
 	return &blobStore{t: t, blobs: map[string]storedBlob{},
-		failPut: map[string]bool{}, truncate: map[string]int{},
+		failHead: map[string]bool{}, failGet: map[string]bool{},
+		failDelete: map[string]bool{},
+		failPut:    map[string]bool{}, truncate: map[string]int{},
 		corruptMD5: map[string]bool{}, omitMD5: map[string]bool{},
 		badDate: map[string]bool{}}
 }
@@ -274,7 +279,7 @@ func (s *blobStore) put(req *http.Request, name string) (*http.Response, error) 
 }
 
 func (s *blobStore) head(name string) (*http.Response, error) {
-	if s.denyHead {
+	if s.denyHead || s.failHead[name] {
 		return httpResponse(http.StatusForbidden, "", http.Header{"X-Ms-Error-Code": {"AuthorizationPermissionMismatch"}}), nil
 	}
 	blob, ok := s.blobs[name]
@@ -301,6 +306,9 @@ func (s *blobStore) head(name string) (*http.Response, error) {
 }
 
 func (s *blobStore) get(name string) (*http.Response, error) {
+	if s.failGet[name] {
+		return httpResponse(http.StatusForbidden, "", http.Header{"X-Ms-Error-Code": {"AuthorizationPermissionMismatch"}}), nil
+	}
 	blob, ok := s.blobs[name]
 	if !ok {
 		return httpResponse(http.StatusNotFound,
@@ -311,7 +319,7 @@ func (s *blobStore) get(name string) (*http.Response, error) {
 }
 
 func (s *blobStore) del(name string) (*http.Response, error) {
-	if s.denyDelete {
+	if s.denyDelete || s.failDelete[name] {
 		return httpResponse(http.StatusForbidden, "", http.Header{"X-Ms-Error-Code": {"AuthorizationPermissionMismatch"}}), nil
 	}
 	if _, ok := s.blobs[name]; !ok {

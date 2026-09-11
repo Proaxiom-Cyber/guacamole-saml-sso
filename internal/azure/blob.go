@@ -321,9 +321,10 @@ func (c *Client) deleteBlob(ctx context.Context, d Destination, name, deployment
 }
 
 // DeleteOwnedBlob removes one blob belonging to this deployment, refusing
-// anything that does not carry this deployment's marker. Remote retention by
-// age is a separate slice (issue #20); this exists so the permission probe can
-// clean up after itself, and so that slice has a safe primitive to build on.
+// anything that does not carry this deployment's marker. It is the one
+// deletion primitive: the permission probe cleans up after itself with it, and
+// both retention rules delete through it — Expire for recordings by age,
+// PruneBackups for database backups by count.
 func (c *Client) DeleteOwnedBlob(ctx context.Context, d Destination, name, deploymentID string) error {
 	if !strings.HasPrefix(name, d.Prefix(deploymentID)) {
 		return fmt.Errorf("%w: %s is outside this deployment's prefix %s; it was left in place",
