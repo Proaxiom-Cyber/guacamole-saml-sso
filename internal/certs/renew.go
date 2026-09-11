@@ -87,6 +87,14 @@ func Renew(ctx context.Context, o Options) (Status, error) {
 	case current.SelfSigned:
 		s.Reason = "the installed certificate is the temporary self-signed one"
 		s.Certificate = current
+	case !pairMatches(o.CertPath(), o.KeyPath()):
+		// The certificate and the private key are written as two separate
+		// renames, so a crash between them leaves a mismatched pair. nginx
+		// refuses to start on one, which is an outage that no amount of
+		// waiting fixes. Treat it as a reason to re-issue rather than as a
+		// healthy certificate.
+		s.Reason = "the installed certificate and private key do not match"
+		s.Certificate = current
 	case current.NotAfter.After(o.now().Add(o.RenewBefore)):
 		s.Result, s.Certificate = ResultSkipped, current
 		s.Reason = fmt.Sprintf("%s remaining, more than the %s renewal window",
@@ -230,4 +238,22 @@ func until(t, now time.Time) string {
 		return "expired"
 	}
 	return fmt.Sprintf("%d days", int(d.Hours()/24))
+}
+
+// pairMatches reports whether the installed certificate and private key
+// belong together. A mismatch means nginx will refuse to start, so renewal
+// treats it as work to do rather than as a certificate in good standing.
+// An unreadable pair is reported as mismatched: the caller's other checks
+// already cover a missing certificate, and re-issuing is the safe answer.
+func pairMatches(certPath, keyPath string) bool {
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return false
+	}
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		return false
+	}
+	_, err = tls.X509KeyPair(certPEM, keyPEM)
+	return err == nil
 }

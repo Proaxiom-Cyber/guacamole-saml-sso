@@ -11,6 +11,7 @@ import (
 	"errors"
 	"math/big"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -232,5 +233,42 @@ func TestReportNamesBothCertificatesAndSurvivesAnAbsentRecord(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("report does not mention %q:\n%s", want, got)
 		}
+	}
+}
+
+// TestRenewRepairsAMismatchedPair pins recovery from a crash between the
+// two renames that install a certificate and its key. nginx refuses to
+// start on a mismatched pair, and waiting never fixes it: the certificate
+// still looks fresh, so a date-only check would skip renewal for ever and
+// leave the deployment down.
+func TestRenewRepairsAMismatchedPair(t *testing.T) {
+	h := newHarness(t)
+	now := time.Now()
+	h.writeLeaf(t, now.Add(60*24*time.Hour)) // plainly fresh
+	h.o.Now = fixedNow(now)
+
+	// Replace the key with one that does not belong to the certificate,
+	// exactly as a crash between the two renames would leave it.
+	other := newHarness(t)
+	other.writeLeaf(t, now.Add(60*24*time.Hour))
+	if err := os.WriteFile(h.o.KeyPath(), []byte(readFile(t, other.o.KeyPath())), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Renew(context.Background(), h.o)
+	if err != nil {
+		t.Fatalf("Renew: %v", err)
+	}
+	if s.Result != ResultOK {
+		t.Fatalf("result = %q, want %q (the pair must be repaired)", s.Result, ResultOK)
+	}
+	if h.acme.created == 0 {
+		t.Fatal("a mismatched pair was left in place: nginx would not start")
+	}
+	if !pairMatches(h.o.CertPath(), h.o.KeyPath()) {
+		t.Fatal("the repaired pair still does not match")
+	}
+	if !strings.Contains(s.Reason, "do not match") {
+		t.Fatalf("the reason does not explain the repair: %q", s.Reason)
 	}
 }
