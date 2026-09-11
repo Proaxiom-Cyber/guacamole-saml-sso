@@ -432,3 +432,33 @@ func TestCopyWithoutAWritableManifestIsNotComplete(t *testing.T) {
 		t.Fatal("the leftover copy must not verify as a complete backup")
 	}
 }
+
+// TestProcScanRefusesWhenItCannotSeeEveryProcess pins the safe direction of
+// failure. A permission denial means the scan cannot see every open file,
+// and an unseen writer makes a recording that is still being written look
+// complete: it would be copied half-finished and then deleted. Refusing is
+// the only safe answer; skipping quietly loses evidence.
+func TestProcScanRefusesWhenItCannotSeeEveryProcess(t *testing.T) {
+	proc := t.TempDir()
+	// One process directory whose fd listing cannot be read.
+	pid := filepath.Join(proc, "4242")
+	fd := filepath.Join(pid, "fd")
+	if err := os.MkdirAll(fd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(fd, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(fd, 0o755)
+	if os.Geteuid() == 0 {
+		t.Skip("root can read the directory regardless of its mode")
+	}
+
+	_, err := procOpenFilesIn(proc)
+	if err == nil {
+		t.Fatal("a denied fd listing must fail the scan, not be skipped")
+	}
+	if !strings.Contains(err.Error(), "still being written") {
+		t.Fatalf("the error does not explain the consequence: %v", err)
+	}
+}

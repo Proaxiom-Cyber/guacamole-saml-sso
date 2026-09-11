@@ -237,8 +237,11 @@ type OpenFiles func() (map[FileID]struct{}, error)
 // This process is skipped. It opens each recording itself while copying one
 // to the backup destination, and counting that would make a recording look
 // active for exactly as long as it takes to back it up.
-func ProcOpenFiles() (map[FileID]struct{}, error) {
-	const proc = "/proc"
+func ProcOpenFiles() (map[FileID]struct{}, error) { return procOpenFilesIn("/proc") }
+
+// procOpenFilesIn is ProcOpenFiles against a given /proc root, so the
+// permission behaviour can be tested without one.
+func procOpenFilesIn(proc string) (map[FileID]struct{}, error) {
 	procs, err := os.ReadDir(proc)
 	if err != nil {
 		return nil, fmt.Errorf("%s is not readable, so there is no way to tell which recordings are still being written: %w", proc, err)
@@ -257,7 +260,15 @@ func ProcOpenFiles() (map[FileID]struct{}, error) {
 		fdDir := filepath.Join(proc, p.Name(), "fd")
 		fds, err := os.ReadDir(fdDir)
 		if err != nil {
-			continue // the process exited, or holds no inspectable descriptors
+			if os.IsPermission(err) {
+				// Being denied here is not the same as a process having
+				// exited: it means this scan cannot see every open file,
+				// and an unseen writer would make a recording that is
+				// still being written look complete — so it would be
+				// copied half-finished and then deleted. Refuse instead.
+				return nil, fmt.Errorf("cannot read %s, so there is no way to tell which recordings are still being written: %w", fdDir, err)
+			}
+			continue // the process exited between listing and reading
 		}
 		for _, fd := range fds {
 			// Stat follows the descriptor link to the file itself, so the
