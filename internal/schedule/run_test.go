@@ -11,10 +11,15 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/backup"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recoverykey"
 )
 
 const testDump = "--\n-- PostgreSQL database dump\n--\nCREATE TABLE guacamole_entity ();\n"
+
+// testDeployment is the deployment that owns the backups in these tests.
+// It matches runOptions, so retention scoping works in both.
+const testDeployment = "dep-123"
 
 // completeBackup builds a file that satisfies the internal/backup completion
 // contract: header line, dump, and the sha256 end marker over both.
@@ -23,13 +28,42 @@ func completeBackup() string {
 	return body + fmt.Sprintf("-- guacdeploy dump complete sha256:%x\n", sha256.Sum256([]byte(body)))
 }
 
+// manifest publishes the completion manifest for an existing file, as
+// internal/backup does after publishing a backup.
+func manifest(t *testing.T, dir, name, deploymentID string) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mode := "none"
+	if strings.HasSuffix(name, ".age") {
+		mode = "age"
+	}
+	b, err := json.MarshalIndent(backup.Manifest{
+		ManifestVersion: backup.ManifestVersion, FormatVersion: backup.FormatVersion,
+		DeploymentID: deploymentID, File: name, Bytes: int64(len(raw)),
+		SHA256: fmt.Sprintf("%x", sha256.Sum256(raw)), Mode: mode,
+	}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(backup.ManifestPath(dir, name), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // writePlaintext publishes a valid plaintext backup at the given timestamp.
 func writePlaintext(t *testing.T, dir, stamp string) string {
 	t.Helper()
-	name := "guacdeploy-db-" + stamp + ".sql"
-	if err := os.WriteFile(filepath.Join(dir, name), []byte(completeBackup()), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	return writeNamed(t, dir, "guacdeploy-db-"+stamp+".sql", completeBackup())
+}
+
+// writeNamed publishes a backup under an exact name, with its manifest.
+func writeNamed(t *testing.T, dir, name, content string) string {
+	t.Helper()
+	write(t, dir, name, content)
+	manifest(t, dir, name, testDeployment)
 	return name
 }
 
@@ -45,10 +79,13 @@ func writeEncrypted(t *testing.T, dir, stamp string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
 	if err := recoverykey.EncryptTo(id.Recipient().String(), strings.NewReader(completeBackup()), f); err != nil {
 		t.Fatal(err)
 	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manifest(t, dir, name, testDeployment)
 	return name
 }
 
@@ -59,6 +96,9 @@ func write(t *testing.T, dir, name, content string) {
 	}
 }
 
+// remaining lists what is left in dir, without the completion manifests:
+// every published backup has one, and counting them would double every
+// assertion about how many files survive.
 func remaining(t *testing.T, dir string) []string {
 	t.Helper()
 	ents, err := os.ReadDir(dir)
@@ -67,7 +107,26 @@ func remaining(t *testing.T, dir string) []string {
 	}
 	var names []string
 	for _, e := range ents {
+		if strings.HasSuffix(e.Name(), backup.ManifestSuffix) {
+			continue
+		}
 		names = append(names, e.Name())
+	}
+	return names
+}
+
+// manifests lists the completion manifests left in dir.
+func manifests(t *testing.T, dir string) []string {
+	t.Helper()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range ents {
+		if strings.HasSuffix(e.Name(), backup.ManifestSuffix) {
+			names = append(names, e.Name())
+		}
 	}
 	return names
 }
@@ -89,7 +148,7 @@ func TestPruneKeepsNewestValidBackups(t *testing.T) {
 		writePlaintext(t, dir, s)
 	}
 
-	removed, err := Prune(dir, 2)
+	removed, err := Prune(dir, 2, testDeployment)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +178,7 @@ func TestPruneHonoursConfiguredRetention(t *testing.T) {
 		for i := 1; i <= 9; i++ {
 			writePlaintext(t, dir, fmt.Sprintf("2026010%dT000000Z", i))
 		}
-		if _, err := Prune(dir, keep); err != nil {
+		if _, err := Prune(dir, keep, testDeployment); err != nil {
 			t.Fatal(err)
 		}
 		if left := remaining(t, dir); len(left) != keep {
@@ -132,7 +191,7 @@ func TestPruneUnderRetentionDeletesNothing(t *testing.T) {
 	dir := t.TempDir()
 	writePlaintext(t, dir, "20260101T000000Z")
 	writePlaintext(t, dir, "20260102T000000Z")
-	removed, err := Prune(dir, 7)
+	removed, err := Prune(dir, 7, testDeployment)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +224,7 @@ func TestPruneIgnoresPartialAndInvalidFiles(t *testing.T) {
 	write(t, dir, "notes.txt", "hello")
 	write(t, dir, "guacdeploy-db-bogus.sql", completeBackup())
 
-	names, err := List(dir)
+	names, err := List(dir, testDeployment)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +235,7 @@ func TestPruneIgnoresPartialAndInvalidFiles(t *testing.T) {
 	// keep=1 must expire exactly one file: the older *valid* backup. If any
 	// partial or invalid file had been counted, a valid backup would die in
 	// its place.
-	removed, err := Prune(dir, 1)
+	removed, err := Prune(dir, 1, testDeployment)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,14 +265,14 @@ func TestPruneCountsEncryptedBackups(t *testing.T) {
 	// claims encryption but holds plaintext is not accepted.
 	write(t, dir, "guacdeploy-db-20260104T000000Z.sql.age", completeBackup())
 
-	names, err := List(dir)
+	names, err := List(dir, testDeployment)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(names) != 3 {
 		t.Fatalf("List = %v, want the three real encrypted backups", names)
 	}
-	removed, err := Prune(dir, 2)
+	removed, err := Prune(dir, 2, testDeployment)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +288,7 @@ func TestPruneNeverEmptiesTheDirectory(t *testing.T) {
 	// Zero and negative retention are refused outright: there is no
 	// configuration that expires every backup.
 	for _, keep := range []int{0, -1, -7} {
-		if _, err := Prune(dir, keep); err == nil {
+		if _, err := Prune(dir, keep, testDeployment); err == nil {
 			t.Errorf("keep=%d was accepted", keep)
 		}
 	}
@@ -238,7 +297,7 @@ func TestPruneNeverEmptiesTheDirectory(t *testing.T) {
 	}
 
 	// Even at the minimum, the newest survives.
-	removed, err := Prune(dir, 1)
+	removed, err := Prune(dir, 1, testDeployment)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,20 +308,161 @@ func TestPruneNeverEmptiesTheDirectory(t *testing.T) {
 
 func TestRequireMountRejectsAnUnmountedDirectory(t *testing.T) {
 	// A mount point that exists but holds no mount is on the same device as
-	// its parent. Writing there silently fills local storage.
-	dir := filepath.Join(t.TempDir(), "share")
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		t.Fatal(err)
+	// the deployment's own storage. Writing there silently fills local disk.
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	dir := filepath.Join(root, "share")
+	for _, d := range []string{stateDir, dir} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
 	}
-	err := RequireMount(dir)
+	err := RequireMount(stateDir, dir)
 	if err == nil {
 		t.Fatal("an unmounted mount-point directory was accepted")
 	}
-	if !strings.Contains(err.Error(), "not a mount point") {
+	if !strings.Contains(err.Error(), "not mounted") {
 		t.Errorf("error does not explain the missing mount: %v", err)
 	}
-	if err := RequireMount(filepath.Join(dir, "missing")); err == nil {
+	if err := RequireMount(stateDir, filepath.Join(dir, "missing")); err == nil {
 		t.Error("a missing destination was accepted")
+	}
+}
+
+// fakeMounts replaces the device lookup so a test can simulate a share
+// being mounted, unmounted, and replaced. A unit test cannot mount
+// anything; every path is a real directory, only the device is simulated.
+//
+// devices maps a path prefix to the device of everything at or below it.
+// The longest matching prefix wins, so a mount inside a mount works.
+func fakeMounts(t *testing.T, devices map[string]uint64) {
+	t.Helper()
+	real := statDev
+	t.Cleanup(func() { statDev = real })
+	statDev = func(path string) (uint64, error) {
+		if _, err := os.Stat(path); err != nil {
+			return 0, err
+		}
+		path = filepath.Clean(path)
+		best, dev := -1, uint64(1) // 1 is the host's own filesystem
+		for prefix, d := range devices {
+			if (path == prefix || strings.HasPrefix(path, prefix+string(filepath.Separator))) && len(prefix) > best {
+				best, dev = len(prefix), d
+			}
+		}
+		return dev, nil
+	}
+}
+
+// mountedShare builds a state directory and a backup destination that is a
+// subfolder inside a mounted share, the shape an administrator actually
+// uses. It returns the state directory, the share's mount point, and the
+// destination.
+func mountedShare(t *testing.T) (stateDir, mount, dest string) {
+	t.Helper()
+	root := t.TempDir()
+	stateDir = filepath.Join(root, "state")
+	mount = filepath.Join(root, "mnt", "share")
+	dest = filepath.Join(mount, "guacamole", "db")
+	for _, d := range []string{stateDir, dest} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fakeMounts(t, map[string]uint64{mount: 2})
+	return stateDir, mount, dest
+}
+
+// TestRequireMountAcceptsASubfolderInsideAMount pins the destination shape
+// the specification calls a supported destination: "existing mounted
+// shares". Comparing the destination with its immediate parent rejected
+// every subfolder of a share, which left --require-mount unusable on a real
+// share and pushed administrators to turn it off.
+func TestRequireMountAcceptsASubfolderInsideAMount(t *testing.T) {
+	stateDir, mount, dest := mountedShare(t)
+
+	if err := RequireMount(stateDir, dest); err != nil {
+		t.Fatalf("a subfolder inside a mounted share was rejected: %v", err)
+	}
+	// The approved mount is recorded, and the record names the mount point
+	// rather than the destination.
+	rec, err := readMountRecord(stateDir)
+	if err != nil || rec == nil {
+		t.Fatalf("the approved mount was not recorded: %v", err)
+	}
+	if rec.MountPoint != mount {
+		t.Errorf("recorded mount point %q, want %q", rec.MountPoint, mount)
+	}
+	if rec.Marker == "" {
+		t.Error("the record holds no share marker, so a replaced share could not be detected")
+	}
+	// A repeat run is happy with what it approved.
+	if err := RequireMount(stateDir, dest); err != nil {
+		t.Fatalf("the approved mount was rejected on the next run: %v", err)
+	}
+}
+
+func TestRequireMountFailsWhenTheMountDisappears(t *testing.T) {
+	stateDir, mount, dest := mountedShare(t)
+	if err := RequireMount(stateDir, dest); err != nil {
+		t.Fatal(err)
+	}
+
+	// The share is gone: the directory tree is still there, all on the
+	// host's own filesystem, and the marker went with the share.
+	fakeMounts(t, nil)
+	if err := os.Remove(filepath.Join(dest, mountMarkerFile)); err != nil {
+		t.Fatal(err)
+	}
+	err := RequireMount(stateDir, dest)
+	if err == nil {
+		t.Fatal("a vanished mount was accepted; the backup would land on local disk")
+	}
+	for _, want := range []string{mount, "not mounted", "nothing was exported"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+func TestRequireMountFailsWhenTheMountIsReplaced(t *testing.T) {
+	stateDir, _, dest := mountedShare(t)
+	if err := RequireMount(stateDir, dest); err != nil {
+		t.Fatal(err)
+	}
+
+	// Something else is mounted at the same place: still a mount, still the
+	// same paths, but not the filesystem the backups were approved for.
+	if err := os.Remove(filepath.Join(dest, mountMarkerFile)); err != nil {
+		t.Fatal(err)
+	}
+	err := RequireMount(stateDir, dest)
+	if err == nil {
+		t.Fatal("a replaced share was accepted as the approved one")
+	}
+	if !strings.Contains(err.Error(), "not mounted") || !strings.Contains(err.Error(), MountRecordPath(stateDir)) {
+		t.Errorf("error does not explain the replacement or how to approve the new share: %v", err)
+	}
+}
+
+func TestRequireMountRecordHoldsNoSecrets(t *testing.T) {
+	stateDir, _, dest := mountedShare(t)
+	if err := RequireMount(stateDir, dest); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(MountRecordPath(stateDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	allowed := map[string]bool{"dest": true, "mount_point": true, "marker": true}
+	for k := range fields {
+		if !allowed[k] {
+			t.Errorf("unexpected field %q in the mount record; check it cannot hold a secret", k)
+		}
 	}
 }
 
@@ -461,12 +661,12 @@ func TestRetentionRecognisesCurrentBackupNames(t *testing.T) {
 		"guacdeploy-db-20260102T000000Z.sql", // written by an earlier version
 	}
 	for _, n := range current {
-		write(t, dir, n, completeBackup())
-		if !Valid(dir, n) {
+		writeNamed(t, dir, n, completeBackup())
+		if !Valid(dir, n, testDeployment) {
 			t.Errorf("published backup %s not recognised by retention", n)
 		}
 	}
-	got, err := List(dir)
+	got, err := List(dir, testDeployment)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -477,7 +677,171 @@ func TestRetentionRecognisesCurrentBackupNames(t *testing.T) {
 	// A partial of the current shape stays invisible to retention.
 	partial := ".partial-guacdeploy-db-20260911T104826.000Z-123456.sql"
 	write(t, dir, partial, completeBackup())
-	if Valid(dir, partial) {
+	if Valid(dir, partial, testDeployment) {
 		t.Fatal("a .partial- file must never count as a published backup")
+	}
+}
+
+// TestListOrdersByTimestampThenCollisionSuffix pins the order retention
+// depends on. Sorting the names as text got it wrong twice:
+//
+//   - at one timestamp the unsuffixed name sorted ahead of its "-1"
+//     sibling, although publish takes the unsuffixed name first and only
+//     then "-1", so "-1" is the newer backup;
+//   - "-10" sorted between "-1" and "-2", because 10 is not text-greater
+//     than 2.
+//
+// Either mistake expires a newer backup and keeps an older one.
+func TestListOrdersByTimestampThenCollisionSuffix(t *testing.T) {
+	dir := t.TempDir()
+	// Deliberately written in a shuffled order, so nothing here can pass by
+	// accident of directory order.
+	for _, n := range []string{
+		"guacdeploy-db-20260911T104826.000Z-2.sql",
+		"guacdeploy-db-20260101T000000Z.sql",
+		"guacdeploy-db-20260911T104826.000Z.sql",
+		"guacdeploy-db-20260911T104826.000Z-10.sql",
+		"guacdeploy-db-20260911T104826.000Z-1.sql",
+		"guacdeploy-db-20260910T235959.999Z.sql",
+	} {
+		writeNamed(t, dir, n, completeBackup())
+	}
+
+	want := []string{
+		"guacdeploy-db-20260911T104826.000Z-10.sql",
+		"guacdeploy-db-20260911T104826.000Z-2.sql",
+		"guacdeploy-db-20260911T104826.000Z-1.sql",
+		"guacdeploy-db-20260911T104826.000Z.sql",
+		"guacdeploy-db-20260910T235959.999Z.sql",
+		"guacdeploy-db-20260101T000000Z.sql",
+	}
+	got, err := List(dir, testDeployment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("List order is wrong.\n got: %v\nwant: %v", got, want)
+	}
+
+	// The order is not decoration: retention keeps names[:keep].
+	removed, err := Prune(dir, 3, testDeployment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	left := remaining(t, dir)
+	for _, n := range want[:3] {
+		if !has(left, n) {
+			t.Errorf("retention expired %s, one of the three newest backups; removed %v", n, removed)
+		}
+	}
+	for _, n := range want[3:] {
+		if has(left, n) {
+			t.Errorf("retention kept %s, which is older than the three newest", n)
+		}
+	}
+	// Each expired backup takes its manifest with it.
+	if left := manifests(t, dir); len(left) != 3 {
+		t.Errorf("manifests left = %v, want one for each kept backup", left)
+	}
+}
+
+// TestValidRejectsATruncatedEncryptedBackup is the case the completion
+// manifest exists for. A scheduled run holds only the public key, so it
+// cannot decrypt a backup to check it. Without the manifest, any file with
+// an age header under a published name counted as a good backup, so a
+// half-written export could displace a real one and then be expired in its
+// place.
+func TestValidRejectsATruncatedEncryptedBackup(t *testing.T) {
+	dir := t.TempDir()
+	good := writeEncrypted(t, dir, "20260101T000000Z")
+	half := writeEncrypted(t, dir, "20260102T000000Z")
+
+	// Cut the newer backup in half after publication, leaving its age
+	// header, exactly as an interrupted write to a share would.
+	path := filepath.Join(dir, half)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw[:len(raw)/2], 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if Valid(dir, half, testDeployment) {
+		t.Fatal("a truncated encrypted backup counted as a complete backup")
+	}
+	names, err := List(dir, testDeployment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 1 || names[0] != good {
+		t.Fatalf("List = %v, want only the complete backup %s", names, good)
+	}
+
+	// Retention keeps one backup: the truncated file must neither count as
+	// that one nor be deleted, because a damaged backup is still evidence
+	// and is not retention's to throw away.
+	removed, err := Prune(dir, 1, testDeployment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 0 {
+		t.Errorf("retention deleted %v; only complete backups of this deployment may be expired", removed)
+	}
+	if left := remaining(t, dir); !has(left, good) || !has(left, half) {
+		t.Errorf("left %v, want both files", left)
+	}
+}
+
+// TestRetentionPreservesOtherDeploymentsBackups covers a shared
+// destination, which the specification allows: "Destinations are local
+// directories, existing mounted shares, or Azure Blob". Another
+// deployment's backups must never be counted as ours, and never expired.
+func TestRetentionPreservesOtherDeploymentsBackups(t *testing.T) {
+	dir := t.TempDir()
+	ours := []string{
+		writePlaintext(t, dir, "20260108T000000Z"),
+		writePlaintext(t, dir, "20260109T000000Z"),
+	}
+	// Another deployment writing into the same share, complete and valid,
+	// just not ours. Older than ours, so a retention that counted them
+	// would expire them first.
+	var theirs []string
+	for _, stamp := range []string{"20260101T000000Z", "20260102T000000Z", "20260103T000000Z"} {
+		name := "guacdeploy-db-" + stamp + ".sql"
+		write(t, dir, name, completeBackup())
+		manifest(t, dir, name, "dep-someone-else")
+		theirs = append(theirs, name)
+	}
+	// A backup with no manifest at all: written by an older version of this
+	// tool, or copied in by hand. Unverifiable, so preserved.
+	orphan := "guacdeploy-db-20260104T000000Z.sql"
+	write(t, dir, orphan, completeBackup())
+
+	names, err := List(dir, testDeployment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 2 {
+		t.Fatalf("List = %v, want only this deployment's two backups", names)
+	}
+
+	removed, err := Prune(dir, 1, testDeployment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 1 || filepath.Base(removed[0]) != ours[0] {
+		t.Fatalf("removed %v, want only our own older backup %s", removed, ours[0])
+	}
+	left := remaining(t, dir)
+	for _, n := range append(theirs, orphan, ours[1]) {
+		if !has(left, n) {
+			t.Errorf("retention deleted %s, which it does not own", n)
+		}
+	}
+	for _, n := range theirs {
+		if !has(manifests(t, dir), n+backup.ManifestSuffix) {
+			t.Errorf("retention deleted the manifest of %s, which it does not own", n)
+		}
 	}
 }

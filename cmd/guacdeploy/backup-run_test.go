@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/backup"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/schedule"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/ui"
@@ -20,23 +22,35 @@ import (
 func scheduledRun(t *testing.T) schedule.Options {
 	t.Helper()
 	dir := t.TempDir()
-	seedDeployment(t, dir, "pass-phrase-for-the-test")
+	id := seedDeployment(t, dir, "pass-phrase-for-the-test")
 	dest := filepath.Join(dir, "backups")
 	if err := os.MkdirAll(dest, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	return schedule.Options{StateDir: dir, Dest: dest, Keep: 2, Exe: os.Args[0]}
+	return schedule.Options{StateDir: dir, Dest: dest, Keep: 2, Exe: os.Args[0], DeploymentID: id}
 }
 
-// seedBackup publishes an earlier valid backup. Backup names carry a
-// one-second timestamp, so earlier runs are simulated rather than taken
-// back to back: a real schedule is daily.
-func seedBackup(t *testing.T, dest, stamp string) string {
+// seedBackup publishes an earlier valid backup, with the completion
+// manifest that makes retention count it. Backup names carry a one-second
+// timestamp, so earlier runs are simulated rather than taken back to back:
+// a real schedule is daily.
+func seedBackup(t *testing.T, o schedule.Options, stamp string) string {
 	t.Helper()
 	body := "-- guacdeploy backup format=1 guacamole=1.6.0 mode=none\n" + cmdFakeDump
 	content := body + fmt.Sprintf("-- guacdeploy dump complete sha256:%x\n", sha256.Sum256([]byte(body)))
 	name := "guacdeploy-db-" + stamp + ".sql"
-	if err := os.WriteFile(filepath.Join(dest, name), []byte(content), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(o.Dest, name), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m, err := json.Marshal(backup.Manifest{
+		ManifestVersion: backup.ManifestVersion, FormatVersion: backup.FormatVersion,
+		DeploymentID: o.DeploymentID, File: name, Bytes: int64(len(content)),
+		SHA256: fmt.Sprintf("%x", sha256.Sum256([]byte(content))), Mode: "none",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(backup.ManifestPath(o.Dest, name), m, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return name
@@ -44,15 +58,15 @@ func seedBackup(t *testing.T, dest, stamp string) string {
 
 func TestBackupRunPublishesThenExpires(t *testing.T) {
 	o := scheduledRun(t)
-	oldest := seedBackup(t, o.Dest, "20260101T000000Z")
-	seedBackup(t, o.Dest, "20260102T000000Z")
+	oldest := seedBackup(t, o, "20260101T000000Z")
+	seedBackup(t, o, "20260102T000000Z")
 
 	var calls []recorded
 	if err := backupRunCmd(context.Background(), fakeDocker(&calls), o, ui.New(false)); err != nil {
 		t.Fatal(err)
 	}
 
-	names, err := schedule.List(o.Dest)
+	names, err := schedule.List(o.Dest, o.DeploymentID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,9 +102,9 @@ func TestBackupRunPublishesThenExpires(t *testing.T) {
 func TestBackupRunFailsWithoutDeletingOrHoldingTheLock(t *testing.T) {
 	o := scheduledRun(t)
 	for _, s := range []string{"20260101T000000Z", "20260102T000000Z", "20260103T000000Z"} {
-		seedBackup(t, o.Dest, s)
+		seedBackup(t, o, s)
 	}
-	before, _ := schedule.List(o.Dest)
+	before, _ := schedule.List(o.Dest, o.DeploymentID)
 	if len(before) != 3 {
 		t.Fatalf("setup left %v", before)
 	}
@@ -107,7 +121,7 @@ func TestBackupRunFailsWithoutDeletingOrHoldingTheLock(t *testing.T) {
 
 	// Three valid backups with retention set to two: a run that pruned on
 	// failure would have deleted one.
-	after, _ := schedule.List(o.Dest)
+	after, _ := schedule.List(o.Dest, o.DeploymentID)
 	if len(after) != len(before) {
 		t.Errorf("a failed run changed the backup set: %v -> %v", before, after)
 	}

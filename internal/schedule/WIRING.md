@@ -63,7 +63,7 @@ For `setup` (all optional; the guided wizard can prompt for the same values):
 | `--backup-schedule EXPR` | systemd `OnCalendar` expression | `daily` |
 | `--backup-keep N` | successful backups to retain | `7` |
 | `--backup-dest DIR` | destination directory | `<state-dir>/backups` |
-| `--backup-require-mount` | destination must be a real mount point | off |
+| `--backup-require-mount` | destination must be on an approved mounted share | off |
 | `--no-backup-schedule` | do not install the timer | off |
 
 For the new `backup-run` command, which the timer calls and an administrator can run
@@ -76,7 +76,7 @@ backup-run   Take the scheduled backup, then expire old backups
   --dest DIR           destination directory (required)
   --keep N             successful backups to retain (default 7)
   --plaintext          explicitly write an unencrypted backup
-  --require-mount      fail unless --dest is a real mount point
+  --require-mount      fail unless --dest is on the approved mounted share
 ```
 
 `--keep` and `--dest` already exist as flag names in main.go's shared flag set
@@ -182,21 +182,34 @@ added that could.
 - **A failed backup deletes nothing.** `RunBackup` records the failure and returns
   before `Prune`. Do not add a retention call anywhere else in the run.
 - **Retention only counts files that passed the completion contract.** `Valid` requires
-  the published name (`.partial-` can never match), and for a plaintext backup the
-  header and the sha256 end marker from `internal/backup`. An encrypted backup cannot
-  be verified without the recovery key — which a scheduled run deliberately does not
-  have — so its evidence is the publish contract plus the age header.
+  the published name (`.partial-` can never match) and a matching completion manifest:
+  `internal/backup` publishes `<name>.manifest.json` beside every backup, and retention
+  re-hashes and length-checks the file against it. That works for an encrypted backup
+  too, which a scheduled run cannot decrypt because it deliberately holds only the
+  public key.
+- **Retention is scoped to one deployment.** `Valid`, `List` and `Prune` take the
+  deployment ID and only count backups whose manifest carries it. A shared destination
+  holding another deployment's backups is left alone. `backupRunCmd` takes the ID from
+  the deployment record, so the unit's command line does not need it.
 - **Retention never empties the destination.** `keep < 1` is refused, and only
   `names[keep:]` is ever deleted.
-- **Retention only ever deletes files it recognises as this tool's backups.** Anything
-  else in a shared destination directory is untouched.
+- **Retention only ever deletes files it recognises as this deployment's backups.**
+  Anything else in a shared destination directory is untouched: another deployment's
+  backups, a backup with no manifest, a file that does not match its manifest, and
+  anything unrelated.
+- **`RequireMount` records the approved mount** in `<state-dir>/backup-mount.json` on
+  the first checked run, and compares on every later one. Do not delete that file as
+  part of an unrelated cleanup: the next run would approve whatever is mounted then.
 
 ## Known limits
 
 - One deployment per host, so the unit names are fixed. That matches V1.
-- `internal/backup` names a backup with a one-second timestamp, so two runs inside the
-  same second collide on the final name. Irrelevant for a daily timer; worth knowing
-  before anyone schedules sub-minute backups or writes a test that loops.
-- A truncated *encrypted* backup cannot be detected without the recovery key. The
-  publish contract makes one improbable; Azure Blob upload (a later slice) is the place
-  to add an integrity check that does not need the private key.
+- A crash between publishing a backup and writing its manifest leaves a backup that
+  retention preserves but never counts. It is the safe direction (see
+  `publishManifest` for why that ordering was chosen), but the file has to be removed
+  by hand, and the operator guide says so.
+- The manifest is integrity evidence, not authentication. Anything that can rewrite a
+  backup on the share can rewrite its manifest. It catches truncation, corruption and
+  foreign files, which is what retention needs. Signing is not V1.
+- `RequireMount` cannot tell a deliberately replaced share from a mistake, so it fails
+  and tells the operator to delete the record to approve the new share.

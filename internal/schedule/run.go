@@ -2,12 +2,16 @@ package schedule
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -16,76 +20,134 @@ import (
 )
 
 // publishedName matches a published backup exactly as internal/backup names
-// one. A failed export leaves ".partial-guacdeploy-db-...", whose leading dot
-// can never match, so an in-progress or abandoned export is invisible to
-// retention by construction.
+// one, and captures the parts that order it. A failed export leaves
+// ".partial-guacdeploy-db-...", whose leading dot can never match, so an
+// in-progress or abandoned export is invisible to retention by construction.
 //
 // The timestamp carries milliseconds, and a name collision appends "-N";
 // both come from internal/backup's non-overwriting publish. The
 // millisecond part stays optional so backups written by an earlier version
-// are still recognised, rather than silently becoming unprunable.
-var publishedName = regexp.MustCompile(`^guacdeploy-db-\d{8}T\d{6}(\.\d{3})?Z(-\d+)?\.sql(\.age)?$`)
+// (\d{8}T\d{6}Z) are still recognised, rather than silently becoming
+// unprunable.
+var publishedName = regexp.MustCompile(`^guacdeploy-db-(\d{8}T\d{6})(\.\d{3})?Z(?:-(\d+))?\.sql(?:\.age)?$`)
 
-// Valid reports whether dir/name is a complete, published backup.
+// published is a backup name parsed into the values that order it.
+type published struct {
+	name string
+	at   time.Time
+	seq  int // the "-N" collision suffix; 0 when there is none
+}
+
+// parsePublished reads the timestamp and collision suffix out of a name.
 //
-// Plaintext backups are checked in full with backup.Validate: the header and
-// the sha256 completion marker prove the dump is neither truncated nor
-// altered. Encrypted backups cannot be checked that way, because a scheduled
-// run holds only the public key (specification: "Scheduled backups use only
-// the public key and require no recovery passphrase"). For those, the
-// evidence is the publish contract itself: internal/backup writes to
-// ".partial-" and renames to the final name only after a complete, verified
-// export, so a file under the published name exists only if the export
-// finished. The age header is checked as a cheap guard against a truncated
-// or foreign file sitting under a matching name.
-//
-// ponytail: reads the whole file to check it. The Guacamole database is
-// small. Stream the header and tail instead if backups ever grow large.
-func Valid(dir, name string) bool {
-	if !publishedName.MatchString(name) {
-		return false
+// Both have to be parsed rather than compared as text. Sorting the names
+// themselves gets the order wrong twice: at an identical timestamp the
+// unsuffixed name sorts before its "-1" sibling although the sibling is the
+// newer backup (publish takes the unsuffixed name first and only then "-1"),
+// and a text sort puts "-10" between "-1" and "-2". Either way retention
+// would expire a newer backup and keep an older one.
+func parsePublished(name string) (published, bool) {
+	m := publishedName.FindStringSubmatch(name)
+	if m == nil {
+		return published{}, false
 	}
-	raw, err := os.ReadFile(filepath.Join(dir, name))
+	layout, stamp := "20060102T150405", m[1]
+	if m[2] != "" {
+		layout, stamp = "20060102T150405.000", m[1]+m[2]
+	}
+	at, err := time.Parse(layout, stamp)
 	if err != nil {
+		return published{}, false
+	}
+	seq := 0
+	if m[3] != "" {
+		if seq, err = strconv.Atoi(m[3]); err != nil {
+			return published{}, false
+		}
+	}
+	return published{name: name, at: at.UTC(), seq: seq}, true
+}
+
+// newer reports whether a is the more recent backup: later timestamp first,
+// then the higher collision suffix, because publish only reaches "-N+1"
+// after "-N" is taken.
+//
+// The tie-break is the name in reverse order. It is only reachable between a
+// ".sql" and a ".sql.age" written in the same millisecond under the same
+// suffix, which publish cannot produce in one run; it exists so the order is
+// total and stable rather than dependent on directory order.
+func (a published) newer(b published) bool {
+	if !a.at.Equal(b.at) {
+		return a.at.After(b.at)
+	}
+	if a.seq != b.seq {
+		return a.seq > b.seq
+	}
+	return a.name > b.name
+}
+
+// Valid reports whether dir/name is a complete backup published by this
+// deployment.
+//
+// The evidence is the completion manifest internal/backup publishes beside
+// every backup: re-hashing and length-checking the file against it proves
+// the export finished and was not truncated, corrupted, or replaced, and
+// the deployment ID in it proves the backup is ours. None of that needs the
+// recovery key, which a scheduled run deliberately does not hold.
+//
+// Anything that fails is not ours to touch: a backup from another
+// deployment sharing the destination, a file with no manifest, a half-copied
+// file. Prune only ever deletes what Valid accepts, so all of those are
+// preserved.
+func Valid(dir, name, deploymentID string) bool {
+	if _, ok := parsePublished(name); !ok {
 		return false
 	}
-	if strings.HasSuffix(name, ".age") {
-		return backup.Encrypted(raw)
-	}
-	if backup.Encrypted(raw) {
-		return false // encrypted content under a plaintext name: not what it claims
-	}
-	_, _, err = backup.Validate(raw, nil, "")
+	_, err := backup.VerifyPublished(dir, name, deploymentID)
 	return err == nil
 }
 
-// List returns the valid published backups in dir, newest first. The names
-// carry a fixed-width UTC timestamp, so lexical order is chronological order.
-func List(dir string) ([]string, error) {
+// List returns this deployment's valid published backups in dir, newest
+// first, ordered by timestamp and then by collision suffix.
+func List(dir, deploymentID string) ([]string, error) {
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
-	var names []string
+	var found []published
 	for _, e := range ents {
-		if !e.IsDir() && Valid(dir, e.Name()) {
-			names = append(names, e.Name())
+		if e.IsDir() {
+			continue
 		}
+		p, ok := parsePublished(e.Name())
+		if !ok {
+			continue
+		}
+		if _, err := backup.VerifyPublished(dir, e.Name(), deploymentID); err != nil {
+			continue
+		}
+		found = append(found, p)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(names)))
+	sort.Slice(found, func(i, j int) bool { return found[i].newer(found[j]) })
+	names := make([]string, 0, len(found))
+	for _, p := range found {
+		names = append(names, p.name)
+	}
 	return names, nil
 }
 
-// Prune deletes valid backups beyond the newest keep. It only ever considers
-// files that passed Valid, so a partial export never displaces a real backup,
-// and it only ever deletes from position keep onwards, so keep backups always
-// survive and the destination is never emptied. Callers must not run Prune
-// after a failed backup: a failed export must not expire earlier ones.
-func Prune(dir string, keep int) ([]string, error) {
+// Prune deletes valid backups beyond the newest keep, with each backup's
+// manifest. It only ever considers files that passed Valid, so a partial
+// export, a foreign deployment's backup, or anything else in a shared
+// destination never displaces a real backup and is never deleted. It only
+// ever deletes from position keep onwards, so keep backups always survive
+// and the destination is never emptied. Callers must not run Prune after a
+// failed backup: a failed export must not expire earlier ones.
+func Prune(dir string, keep int, deploymentID string) ([]string, error) {
 	if keep < 1 {
 		return nil, fmt.Errorf("retention must keep at least one backup, got %d", keep)
 	}
-	names, err := List(dir)
+	names, err := List(dir, deploymentID)
 	if err != nil {
 		return nil, err
 	}
@@ -98,28 +160,202 @@ func Prune(dir string, keep int) ([]string, error) {
 		if err := os.Remove(p); err != nil {
 			return removed, fmt.Errorf("expire old backup %s: %w", p, err)
 		}
+		// The manifest goes with its backup. A manifest left behind would
+		// describe a file that no longer exists.
+		if err := os.Remove(backup.ManifestPath(dir, n)); err != nil && !os.IsNotExist(err) {
+			return removed, fmt.Errorf("expire old backup manifest for %s: %w", p, err)
+		}
 		removed = append(removed, p)
 	}
 	return removed, nil
 }
 
-// RequireMount fails when dir is not itself a mount point. A share that is
-// not mounted leaves its mount-point directory present but on the host's own
-// filesystem, so a plain existence check would let the backup land silently
-// in local storage. Comparing the device of dir with the device of its
-// parent detects exactly that.
-func RequireMount(dir string) error {
-	var d, parent syscall.Stat_t
-	if err := syscall.Stat(dir, &d); err != nil {
-		return fmt.Errorf("backup destination %s cannot be inspected: %w; nothing was exported", dir, err)
+// statDev returns the filesystem device of path. It is a variable because a
+// unit test cannot mount a share; the tests replace it to simulate a mount
+// appearing, disappearing, and being replaced.
+var statDev = func(path string) (uint64, error) {
+	var st syscall.Stat_t
+	if err := syscall.Stat(path, &st); err != nil {
+		return 0, err
 	}
-	if err := syscall.Stat(filepath.Dir(dir), &parent); err != nil {
-		return fmt.Errorf("backup destination %s cannot be inspected: %w; nothing was exported", dir, err)
+	return uint64(st.Dev), nil
+}
+
+// mountPointOf walks up from path to the directory where the filesystem
+// changes: the mount point path sits on. That is the whole point of the
+// walk — a backup destination is normally a subfolder inside a share
+// (/mnt/backups/guacamole), not the mount point itself, and comparing only
+// with the immediate parent rejected every such destination.
+func mountPointOf(path string) (string, error) {
+	path = filepath.Clean(path)
+	dev, err := statDev(path)
+	if err != nil {
+		return "", err
 	}
-	if d.Dev == parent.Dev {
-		return fmt.Errorf("backup destination %s is not a mount point: the expected share is not mounted; nothing was exported, and the backup was not redirected into local storage", dir)
+	for {
+		parent := filepath.Dir(path)
+		if parent == path {
+			return path, nil // the root of the tree
+		}
+		pdev, err := statDev(parent)
+		if err != nil {
+			return "", err
+		}
+		if pdev != dev {
+			return path, nil
+		}
+		path = parent
+	}
+}
+
+// mountMarkerFile identifies the filesystem the destination is on. It lives
+// on the share itself, holds a random non-secret tag, and survives an
+// ordinary unmount and remount — which the device number does not, so the
+// device number is never recorded.
+const mountMarkerFile = ".guacdeploy-backup-mount"
+
+// mountRecord is the approved destination mount. Non-secret: two paths and
+// a random tag.
+type mountRecord struct {
+	Dest       string `json:"dest"`
+	MountPoint string `json:"mount_point"`
+	Marker     string `json:"marker"`
+}
+
+// MountRecordPath is the approved-mount record, beside the last-run record.
+func MountRecordPath(stateDir string) string {
+	return filepath.Join(stateDir, "backup-mount.json")
+}
+
+// RequireMount checks that dest is still on the mounted share it was
+// approved on. "A missing mount must fail visibly instead of redirecting
+// output to local storage" (specification).
+//
+// The first checked run records the mount: the mount point dest sits inside,
+// and a marker file written on the share. It refuses to record a destination
+// on the same filesystem as the deployment's own state directory, because
+// that is local storage, not a share — that is the case where the mount
+// point directory exists but holds no mount.
+//
+// Every later run compares. The expected mount disappearing (dest is now on
+// some other filesystem, usually the root one) and the expected mount being
+// replaced (the marker on the share is gone or different) both fail here,
+// before any export.
+func RequireMount(stateDir, dest string) error {
+	if fi, err := os.Stat(dest); err != nil || !fi.IsDir() {
+		return fmt.Errorf("backup destination %s is not an existing directory: the expected share is not mounted; nothing was exported, and the backup was not redirected into local storage", dest)
+	}
+	mp, err := mountPointOf(dest)
+	if err != nil {
+		return fmt.Errorf("backup destination %s cannot be inspected: %w; nothing was exported", dest, err)
+	}
+
+	rec, err := readMountRecord(stateDir)
+	if err != nil {
+		return err
+	}
+	if rec == nil || rec.Dest != filepath.Clean(dest) {
+		// No approved mount yet, or the administrator changed --dest: this
+		// run approves what is there now.
+		return recordMount(stateDir, filepath.Clean(dest), mp)
+	}
+	if mp != rec.MountPoint {
+		return fmt.Errorf("backup destination %s is no longer inside the approved mount %s (it is now on %s): the expected share is not mounted; nothing was exported, and the backup was not redirected into local storage", dest, rec.MountPoint, mp)
+	}
+	got, err := os.ReadFile(filepath.Join(dest, mountMarkerFile))
+	if err != nil || strings.TrimSpace(string(got)) != rec.Marker {
+		return fmt.Errorf("the filesystem mounted at %s is not the one approved for backups: the %s marker is missing or different, so the expected share is not mounted; nothing was exported, and the backup was not redirected into local storage. If the share was replaced deliberately, delete %s to approve the new one",
+			rec.MountPoint, mountMarkerFile, MountRecordPath(stateDir))
 	}
 	return nil
+}
+
+func recordMount(stateDir, dest, mountPoint string) error {
+	sdev, err := statDev(stateDir)
+	if err != nil {
+		return fmt.Errorf("state directory %s cannot be inspected: %w; nothing was exported", stateDir, err)
+	}
+	ddev, err := statDev(dest)
+	if err != nil {
+		return fmt.Errorf("backup destination %s cannot be inspected: %w; nothing was exported", dest, err)
+	}
+	if sdev == ddev {
+		return fmt.Errorf("backup destination %s is not a mount point and is not inside one: it is on the same filesystem as %s, so the expected share is not mounted; nothing was exported, and the backup was not redirected into local storage", dest, stateDir)
+	}
+	marker, err := readOrCreateMarker(dest)
+	if err != nil {
+		return fmt.Errorf("backup destination %s cannot be marked: %w; nothing was exported", dest, err)
+	}
+	b, err := json.MarshalIndent(mountRecord{Dest: dest, MountPoint: mountPoint, Marker: marker}, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := MountRecordPath(stateDir)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, append(b, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
+}
+
+func readMountRecord(stateDir string) (*mountRecord, error) {
+	b, err := os.ReadFile(MountRecordPath(stateDir))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var r mountRecord
+	if err := json.Unmarshal(b, &r); err != nil {
+		return nil, fmt.Errorf("%s is not readable JSON: %w", MountRecordPath(stateDir), err)
+	}
+	return &r, nil
+}
+
+// readOrCreateMarker returns the share's tag, creating it when the share has
+// none. An existing tag is kept, so two deployments writing to the same
+// share agree on the same identity.
+func readOrCreateMarker(dest string) (string, error) {
+	path := filepath.Join(dest, mountMarkerFile)
+	read := func() (string, error) {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
+	if s, err := read(); err == nil && s != "" {
+		return s, nil
+	}
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	tag := hex.EncodeToString(buf)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		return read() // another deployment marked the share first
+	}
+	if err != nil {
+		return "", err
+	}
+	_, err = f.WriteString(tag + "\n")
+	if serr := f.Sync(); err == nil {
+		err = serr
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(path)
+		return "", err
+	}
+	return tag, nil
 }
 
 // Status is the last-run record. It holds paths, counts and error text only:
@@ -228,13 +464,19 @@ func RunBackup(ctx context.Context, o Options, do func(context.Context) (string,
 	if err := o.defaults(); err != nil {
 		return Status{}, err
 	}
+	// Retention is scoped to this deployment, so it needs the ID. Without
+	// it nothing would verify as ours, retention would silently stop, and
+	// backups would grow without limit.
+	if o.DeploymentID == "" {
+		return Status{}, fmt.Errorf("a scheduled backup needs the deployment ID to know which backups are its own")
+	}
 	s := Status{Ran: time.Now().UTC(), Destination: o.Dest, Keep: o.Keep,
 		OnCalendar: o.OnCalendar, RequireMount: o.RequireMount}
 
 	fail := func(err error) (Status, error) {
 		s.Result = "failed"
 		s.Error = err.Error()
-		s.Kept = len(mustList(o.Dest))
+		s.Kept = len(mustList(o.Dest, o.DeploymentID))
 		if werr := WriteStatus(o.StateDir, s); werr != nil {
 			return s, fmt.Errorf("%v (and the status file could not be written: %v)", err, werr)
 		}
@@ -242,7 +484,7 @@ func RunBackup(ctx context.Context, o Options, do func(context.Context) (string,
 	}
 
 	if o.RequireMount {
-		if err := RequireMount(o.Dest); err != nil {
+		if err := RequireMount(o.StateDir, o.Dest); err != nil {
 			return fail(err)
 		}
 	}
@@ -252,9 +494,9 @@ func RunBackup(ctx context.Context, o Options, do func(context.Context) (string,
 	}
 
 	s.Result, s.Published = "ok", path
-	removed, perr := Prune(o.Dest, o.Keep)
+	removed, perr := Prune(o.Dest, o.Keep, o.DeploymentID)
 	s.Removed = removed
-	s.Kept = len(mustList(o.Dest))
+	s.Kept = len(mustList(o.Dest, o.DeploymentID))
 	if perr != nil {
 		s.Error = perr.Error()
 	}
@@ -264,7 +506,7 @@ func RunBackup(ctx context.Context, o Options, do func(context.Context) (string,
 	return s, perr
 }
 
-func mustList(dir string) []string {
-	names, _ := List(dir)
+func mustList(dir, deploymentID string) []string {
+	names, _ := List(dir, deploymentID)
 	return names
 }
