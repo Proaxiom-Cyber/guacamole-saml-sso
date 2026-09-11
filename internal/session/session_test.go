@@ -234,8 +234,8 @@ func TestCompletedDeploymentRunsPhasesItNeverRan(t *testing.T) {
 	if ranOld != 0 {
 		t.Fatalf("a completed phase was re-run: %d", ranOld)
 	}
-	if !strings.Contains(out.String(), "has not run") {
-		t.Fatalf("the operator was not told what would run:\n%s", out.String())
+	if !strings.Contains(out.String(), "does not overwrite") || !strings.Contains(out.String(), "Re-applying") {
+		t.Fatalf("the operator was not told what happened:\n%s", out.String())
 	}
 }
 

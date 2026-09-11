@@ -608,18 +608,19 @@ func Run(ctx context.Context, opts Options) error {
 		// only the outstanding phases converges the deployment; it is not
 		// the overwrite of an existing deployment that the specification
 		// forbids, because every completed phase is left alone.
-		if outstanding := outstandingPhases(st, opts.phases()); len(outstanding) > 0 {
-			u.Say("A completed deployment exists, but this version adds work it has not run:")
-			for _, p := range outstanding {
-				u.Say("  - %s", p.Name)
-			}
-			u.Say("Completed work is left exactly as it is.")
-			return runPhases(ctx, store, st, u, &opts, opts.phases())
-		}
 		u.Say("A completed deployment already exists on this host (deployment %s, created %s).",
 			st.DeploymentID, st.CreatedAt.Format(time.RFC3339))
 		u.Say("This tool manages one deployment per host and does not overwrite it.")
 		u.Say("Run teardown first to start over. Existing installations from the old scripts are not adopted.")
+		// Not overwriting is not the same as doing nothing. A newer version
+		// can carry work this deployment never ran, and the phases that
+		// write desired state -- units, timers, rendered configuration --
+		// must be able to repair a host that is already set up. Completed
+		// one-shot phases are still left exactly as they are.
+		if len(convergeable(st, opts.phases())) > 0 {
+			u.Say("Re-applying the configuration this tool maintains. Completed work is left as it is.")
+			return runPhases(ctx, store, st, u, &opts, opts.phases())
+		}
 		if !u.Interactive {
 			return errors.New("existing deployment present; teardown is required before a new setup")
 		}
@@ -652,10 +653,11 @@ func cleanup(store *state.Store, st *state.State, u *ui.UI) error {
 	return nil
 }
 
-// outstandingPhases returns registry phases with no successful journal
-// entry. Always-phases are excluded: they re-run on every session anyway,
-// so they never mean the deployment is unfinished.
-func outstandingPhases(st *state.State, phases []Phase) []Phase {
+// convergeable returns the phases a completed deployment can still usefully
+// run: those it never ran, plus the desired-state phases that re-apply on
+// every session. It never includes a completed one-shot phase, so nothing
+// that created a cloud resource runs again.
+func convergeable(st *state.State, phases []Phase) []Phase {
 	done := map[string]bool{}
 	for _, a := range st.Actions {
 		if a.FinishedAt != nil && a.Result == state.ResultOK {
@@ -664,7 +666,7 @@ func outstandingPhases(st *state.State, phases []Phase) []Phase {
 	}
 	var out []Phase
 	for _, p := range phases {
-		if !done[p.Name] && !p.Always {
+		if p.Always || !done[p.Name] {
 			out = append(out, p)
 		}
 	}
