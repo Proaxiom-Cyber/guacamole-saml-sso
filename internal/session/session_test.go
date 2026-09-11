@@ -548,3 +548,45 @@ func TestFileModeGeneratesMachineCredential(t *testing.T) {
 		t.Fatal("generated secret leaked")
 	}
 }
+
+// TestAlwaysPhaseRerunsOnResume pins the repair path found on the live
+// Rocky host: rendering is idempotent and also fixes configuration written
+// by an older version, so a completed render must NOT be skipped on
+// resume. Skipping it left a host with unreadable bind-mount directories
+// broken forever, because the journal said the work was done.
+func TestAlwaysPhaseRerunsOnResume(t *testing.T) {
+	dir := t.TempDir()
+	var renders, onces int
+	phases := []Phase{
+		{Name: "once", Run: func(context.Context, *state.State, *ui.UI) error { onces++; return nil }},
+		{Name: "render", Always: true, Run: func(context.Context, *state.State, *ui.UI) error { renders++; return nil }},
+		{Name: "flaky", Run: func(context.Context, *state.State, *ui.UI) error {
+			if renders < 2 {
+				return errors.New("boom")
+			}
+			return nil
+		}},
+	}
+
+	u, _ := testUI(false, "")
+	if err := Run(context.Background(), Options{StateDir: dir, UI: u, Phases: phases}); err == nil {
+		t.Fatal("first run should fail at the flaky phase")
+	}
+	if renders != 1 || onces != 1 {
+		t.Fatalf("after first run renders=%d onces=%d", renders, onces)
+	}
+
+	u2, out := testUI(false, "")
+	if err := Run(context.Background(), Options{StateDir: dir, UI: u2, Resume: true, Phases: phases}); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if renders != 2 {
+		t.Fatalf("Always phase did not re-run on resume: renders=%d", renders)
+	}
+	if onces != 1 {
+		t.Fatalf("ordinary completed phase re-ran: onces=%d", onces)
+	}
+	if !strings.Contains(out.String(), "once: already complete") {
+		t.Fatalf("ordinary phase should have been skipped:\n%s", out.String())
+	}
+}

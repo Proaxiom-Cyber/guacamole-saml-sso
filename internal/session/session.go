@@ -30,6 +30,12 @@ var ErrApprovalRequired = errors.New("interactive approval required")
 type Phase struct {
 	Name string
 	Run  func(ctx context.Context, st *state.State, u *ui.UI) error
+
+	// Always re-runs the phase on resume even when an earlier attempt
+	// succeeded. Only for phases that write desired state and are safe to
+	// repeat: skipping those would leave a host repaired by a later tool
+	// version still broken, because the journal says the work is done.
+	Always bool
 }
 
 // Phases builds the ordered registry for one session. Later tickets append
@@ -43,7 +49,9 @@ func Phases(opts *Options) []Phase {
 		{Name: "credential-check", Run: opts.credentialCheck},
 		{Name: "host-dependencies", Run: opts.hostDependencies},
 		{Name: "stack-configure", Run: opts.stackConfigure},
-		{Name: "stack-render", Run: opts.stackRender},
+		// Rendering is idempotent and also repairs configuration written by
+		// an earlier version, so it re-runs on every resume.
+		{Name: "stack-render", Run: opts.stackRender, Always: true},
 		{Name: "stack-schema", Run: opts.stackSchema},
 		{Name: "stack-up", Run: opts.stackUp},
 		{Name: "stack-health", Run: opts.stackHealth},
@@ -511,7 +519,7 @@ func runPhases(ctx context.Context, store *state.Store, st *state.State, u *ui.U
 		}
 	}
 	for _, p := range phases {
-		if done[p.Name] {
+		if done[p.Name] && !p.Always {
 			u.Say("Phase %s: already complete, skipping.", p.Name)
 			continue
 		}
