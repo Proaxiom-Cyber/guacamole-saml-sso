@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -744,17 +745,25 @@ func packageFuncsUsing(t *testing.T, pkg, sel string) []string {
 // behaviour test. "Preserve remote backups and their supporting storage
 // resources during ordinary teardown" (specification) cannot be proved by
 // exercising an operation that must not exist, so the package source is
-// checked instead: exactly one function issues a DELETE, it deletes a blob,
-// and every management-plane call goes through the GET-only helper, so no
-// container or storage account can be removed — or created — from here.
+// checked instead: exactly one function issues a DELETE and it deletes a blob,
+// and the management plane is reached through exactly two helpers, one of which
+// only reads and the other of which only writes with PUT. So no container and
+// no storage account can be removed from here, whether this deployment created
+// it or not.
+//
+// The allow-list grew by one name when issue #18 added creation: armPut. That
+// is the point of checking it — adding a management-plane write has to be a
+// deliberate, visible change to this test, not something that arrives with a
+// feature.
 func TestNoContainerOrAccountDeletionPathExists(t *testing.T) {
 	deleters := packageFuncsUsing(t, "http", "MethodDelete")
 	if len(deleters) != 1 || deleters[0] != "deleteBlob" {
 		t.Fatalf("functions issuing DELETE = %v; only deleteBlob may, and it deletes one marker-verified blob", deleters)
 	}
 	armUsers := packageFuncsUsing(t, "", "armBase")
-	if len(armUsers) != 1 || armUsers[0] != "armGet" {
-		t.Fatalf("functions reaching Azure Resource Manager = %v; only the GET-only armGet helper may", armUsers)
+	sort.Strings(armUsers)
+	if len(armUsers) != 2 || armUsers[0] != "armGet" || armUsers[1] != "armPut" {
+		t.Fatalf("functions reaching Azure Resource Manager = %v; only the read-only armGet and the PUT-only armPut helpers may", armUsers)
 	}
 	posters := packageFuncsUsing(t, "http", "MethodPost")
 	for _, fn := range posters {
@@ -767,9 +776,10 @@ func TestNoContainerOrAccountDeletionPathExists(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, forbidden := range []string{"DeleteContainer", "deleteContainer", "DeleteAccount", "deleteAccount", "CreateContainer", "createContainer"} {
+		for _, forbidden := range []string{"DeleteContainer", "deleteContainer", "DeleteAccount", "deleteAccount",
+			"DeleteStorageAccount", "deleteStorageAccount", "DeleteResourceGroup", "deleteResourceGroup"} {
 			if strings.Contains(string(body), forbidden) {
-				t.Fatalf("%s contains %q: creating or deleting a container or account is out of scope here", file, forbidden)
+				t.Fatalf("%s contains %q: deleting a container, a storage account or a resource group is out of scope here, and stays out of scope — it holds backups", file, forbidden)
 			}
 		}
 	}

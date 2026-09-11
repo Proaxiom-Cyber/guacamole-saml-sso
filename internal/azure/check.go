@@ -15,6 +15,13 @@ type Check struct {
 	// Fix names the role that would make a failed check pass. It is empty
 	// when the check passed.
 	Fix string `json:"fix,omitempty"`
+	// Pending means the check could not be carried out yet, because what it
+	// tests does not exist so far. It is not a pass and it is not a failure:
+	// reporting "FAILED" for something nobody has tried would send an
+	// administrator to fix a permission that is not missing. Only the
+	// creation path sets it (see CreateChecks); the reuse path's three
+	// checks all run against resources that already exist.
+	Pending bool `json:"pending,omitempty"`
 }
 
 // Preflight holds the three permission checks the specification requires to
@@ -189,7 +196,7 @@ func (c *Client) checkRoleAssignment(ctx context.Context, d Destination) Check {
 		k.Fix = fmt.Sprintf("assign the User Access Administrator or Owner role on storage account %s to the identity that has to grant the unattended service principal its Storage Blob Data Contributor role; without it, someone with that role has to make the assignment instead", d.Account)
 		return k
 	}
-	allowed, err := grantsRoleAssignment(raw)
+	allowed, err := permits(raw, roleAssignmentWrite)
 	if err != nil {
 		k.Detail = err.Error()
 		k.Fix = "check the role assignment by hand in the Azure portal before relying on unattended uploads"
@@ -205,12 +212,12 @@ func (c *Client) checkRoleAssignment(ctx context.Context, d Destination) Check {
 	return k
 }
 
-// grantsRoleAssignment decodes the effective-permissions reply and reports
-// whether roleAssignments/write is allowed and not denied. Azure returns one
-// entry per role the caller holds at the scope, so any entry granting the
-// action is enough, and a notActions entry on that same role takes it away
-// again — which is how a denied action is expressed.
-func grantsRoleAssignment(raw []byte) (bool, error) {
+// permits decodes the effective-permissions reply and reports whether one
+// action is allowed and not denied. Azure returns one entry per role the caller
+// holds at the scope, so any entry granting the action is enough, and a
+// notActions entry on that same role takes it away again — which is how a
+// denied action is expressed.
+func permits(raw []byte, action string) (bool, error) {
 	var out struct {
 		Value []struct {
 			Actions    []string `json:"actions"`
@@ -221,7 +228,7 @@ func grantsRoleAssignment(raw []byte) (bool, error) {
 		return false, fmt.Errorf("the effective permissions reply is not readable JSON: %w", err)
 	}
 	for _, p := range out.Value {
-		if matchesAction(p.Actions, roleAssignmentWrite) && !matchesAction(p.NotActions, roleAssignmentWrite) {
+		if matchesAction(p.Actions, action) && !matchesAction(p.NotActions, action) {
 			return true, nil
 		}
 	}
