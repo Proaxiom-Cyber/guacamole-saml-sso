@@ -15,8 +15,9 @@ status command, and a timer. Nothing under `internal/session`, `internal/stack`,
 `internal/cloudflare`, `internal/teardown`, or `cmd/guacdeploy/main.go` was modified.
 
 Files: `internal/azure/{azure.go,auth.go,blob.go,check.go,upload.go}` (issue #17),
-`internal/azure/{create.go,role.go}` (issue #18), `internal/azure/unit.go` (issue #19),
-`internal/azure/expire.go` (issue #20), `cmd/guacdeploy/azure.go`.
+`internal/azure/{create.go,role.go}` (issue #18), `internal/azure/setup.go` (the guided
+run that puts #17 and #18 in front of an administrator), `internal/azure/unit.go`
+(issue #19), `internal/azure/expire.go` (issue #20), `cmd/guacdeploy/azure.go`.
 
 ## The four slices
 
@@ -205,6 +206,65 @@ carries no marker. They have different fixes and are never merged.
 
 ## API surface for the parent
 
+### The guided phase in one call: `azure.Setup`
+
+`setup.go` is the only thing the `azure-destination` phase has to call. It puts the
+primitives below in the order the specification requires, asks the questions between
+them through an injected seam, and refuses the two things that must never be assumed:
+creation without approval, and a destination whose blob data access nobody proved.
+
+```go
+res, err := azure.Setup(ctx, azure.SetupOptions{
+        App:          azure.App{TenantID: tenant},   // ClientID defaults to the Azure CLI public client
+        DeploymentID: st.DeploymentID,
+        Hostname:     st.Config["guac-hostname"],
+
+        // Answers already given on the command line. An empty field is asked for.
+        SubscriptionID: *azureSubscription,
+        Account:        *azureAccount,
+        Container:      *azureContainer,
+        Create:         *azureCreate,
+        Location:       *azureLocation,
+        ResourceGroup:  *azureResourceGroup,
+        ApproveExistingResourceGroup: *azureApproveExistingGroup,
+
+        // The unattended uploader, from the Entra phase. Without these no role is
+        // granted, and the result says scheduled uploads will fail until one is.
+        UploaderObjectID: st.Config["entra-sp-object-id"],
+        Uploader:         &azure.Client{Token: uploaderPrincipal.TokenSource()},
+
+        // The interaction seam. Say is required; the three question seams refuse
+        // when they are not supplied, so an unattended run stops rather than
+        // answering for the administrator.
+        Say: u.Say, Ask: u.Line, Confirm: u.Confirm, Choose: chooseFromList(u),
+
+        // The parent's journal. Creation does not start until it returns.
+        Journal: func(cs []azure.Creation) error { return o.journalIntent(describe(cs)) },
+})
+```
+
+What comes back:
+
+| Field | What the parent does with it |
+|---|---|
+| `Configured` | The **only** flag to test before recording the destination. True only when storage was selected or created *and* blob data access was proved by a real write. |
+| `Reason` | Why there is no destination. Set when the administrator declined; `err` is nil. |
+| `Destination` | The state keys below. Record it only when `Configured`. |
+| `Location` | `azure-location`. Empty on the reuse path, where nothing chose a region. |
+| `Created` | One `state.Resource` each: `Type`, `Name`, `ProviderID` (the ARM resource ID) and `Ownership` are already in the shape the table under "Created resources" needs. **Populated even when `Setup` returns an error**, because a resource that was created has to be recorded either way. |
+| `Reused` | The same shape for what the run found and did not create. Not created, so not recorded as created. |
+| `Planned` | What was journalled before creation started. |
+| `Preflight` | The administrator's three checks, already shown through `Say`. |
+| `RoleAssignment` | `azure-role-assignment`, nil when no role was granted. |
+| `RoleEffective` | The proof the granted role works. A non-nil check that is not OK means it was granted and had not taken effect. |
+| `BlobDataProvenBy` | Which identity's real write proved blob data access. Never empty when `Configured`. |
+
+`Setup` returns an error for a refusal and `Result{Configured: false, Reason: ...}` with
+a nil error when the administrator simply chose not to use Azure. An Azure destination
+is optional, so declining one is not a failure.
+
+### The primitives underneath
+
 ```go
 // Sign in (guided).
 app := azure.App{TenantID: tenant}            // ClientID defaults to the Azure CLI public client
@@ -298,14 +358,22 @@ before the backup schedule is installed, because the schedule's destination and 
 destination are recorded together. It is skipped entirely when the administrator does not
 choose Azure: it is an optional destination alongside local directories and mounted shares.
 
-The phase does, in order:
+`azure.Setup` is that phase. What follows is the order it runs in, so the parent can
+check it rather than re-implement it:
 
-1. Device-code sign-in (`StartSignIn`, show the code, `CompleteSignIn`).
-2. `Subscriptions` → let the administrator choose. Then **reuse or create**:
+1. Device-code sign-in (`StartSignIn`, show `DeviceCode.String()` through `Say`,
+   `CompleteSignIn`). The offer is put first and only when nothing on the command line
+   has already answered it; declining ends the phase with no destination and no error.
+2. `Subscriptions` → let the administrator choose. Exactly one is used and named rather
+   than put as a question with one answer; none is a refusal that says what it means
+   (this sign-in can see no subscription, which is not a permission this tool can grant).
+   Then **reuse or create**:
 
    **Reuse.** `StorageAccounts` → choose; `Containers` → choose; `Resolve`. Listings of
    what exists; nothing is created. A missing account or container fails with the list of
-   what does exist.
+   what does exist. An account or container carrying this deployment's marker is used
+   again without asking: a second one with the same marker is a case only a person can
+   resolve, so it is never offered as one option among many.
 
    **Create.** `PlanCreate`, show `plan.Summary()` — that is the "show subscription and
    proposed resources before creation" step, and it is the whole of it. Then, in this
@@ -319,25 +387,37 @@ The phase does, in order:
    3. `CheckCreatePermissions` and show `Summary()`. `checks.Err()` is the stop condition.
    4. `ApplyCreate`. On any error, journal the action `ResultUncertain` and stop; the next
       run's `PlanCreate` reconciles by marker.
-   5. Record each created resource in `state.Resource` with `Provider: "azure"`, the
-      correlation identifier, and ownership evidence
-      (`"tag guacdeploy_deployment=<id>"`, or `"container metadata ..."`).
-3. `CheckPermissions`, and show `Summary()`. `pre.Err()` is the stop condition; a failed
-   role-assignment check is shown but does not stop setup.
-   Also ask, in this phase, **how many days recordings are kept in Azure**, and record it
-   as `azure-recording-retention-days`. There is no default: an absent value means nothing
-   ever expires, which is a decision the administrator makes, not one this package guesses.
-   Show the policy at the same time as the local recording budget, because the two are
-   independent and an operator who confuses them will expect the wrong thing: the local
-   budget deletes a recording whether or not its copy reached Azure, and remote retention
-   deletes an Azure copy whether or not the local one is still there.
+   5. Sort what was created from what was found, into `Result.Created` and
+      `Result.Reused`. The parent records one `state.Resource` per entry of
+      `Result.Created`, with `Provider: "azure"`, the correlation identifier, and the
+      `Ownership` string already in the entry.
+3. `CheckPermissions`, and show `Summary()`. A failed **management** check stops the
+   phase: an identity that cannot see the storage account has nothing to record. A failed
+   role-assignment check is shown and does not stop setup. Blob data access is decided in
+   step 5, after the role has had its chance.
 4. Grant the unattended uploader its role: `AssignUploaderRole` with the service
    principal's **object ID** (the enterprise application's object ID, not the application
    ID), then `WaitRoleEffective` with a client signed in **as that principal**. A role
-   assignment is eventually consistent, so this polls a real write rather than assuming.
-   If it never lands, show the Check: setup is otherwise complete and the nightly upload
-   will fail until the role takes effect.
-5. Record the destination in state, and register the client secret credential (below).
+   assignment is eventually consistent, so this polls a real write rather than assuming,
+   and the administrator is told in as many words that this can take minutes. If it never
+   lands, the Check says so. With no uploader named, no role is granted and the run says
+   plainly that scheduled uploads will fail until somebody grants one.
+5. **Refuse a destination whose blob data access nobody proved.** The only evidence
+   accepted is a write that actually happened — the administrator's own probe, or the
+   uploader's probe after the role took effect. A listing is not evidence and a
+   successful role-assignment PUT is not evidence. Without one, `Configured` stays false,
+   an error names the role that fixes it, and `Result.Created` still carries anything
+   that was created so the parent's record stays honest.
+
+**What the phase still owns, outside `Setup`.** Record the destination and
+`Result.Location` in state, record `Result.Created`, register the client secret
+credential (below), and ask **how many days recordings are kept in Azure**
+(`azure-recording-retention-days`). There is no default: an absent value means nothing
+ever expires, which is a decision the administrator makes, not one this package guesses.
+Show that policy at the same time as the local recording budget, because the two are
+independent and an operator who confuses them will expect the wrong thing: the local
+budget deletes a recording whether or not its copy reached Azure, and remote retention
+deletes an Azure copy whether or not the local one is still there.
 
 ## Credential registration
 
@@ -418,6 +498,14 @@ If the parent later wires the timer, record the unit paths exactly as
 `--azure-create` is given, and the resource to select when it is not. Unattended runs that
 would need approval must stop, not assume it: `plan.NeedsApproval()` without
 `--azure-approve-existing-group` is a refusal, which is specification A8.
+
+Every flag above except `--no-azure` is a field of `azure.SetupOptions` with the same
+name, and `Setup` asks for whatever is left empty. `--no-azure` is the parent's: it means
+the phase is not run at all, so nothing signs in. Any of `--azure-subscription`,
+`--azure-account`, `--azure-container` or `--azure-create` counts as having already
+chosen Azure, so the offer is not put again. An unattended run reaching a question it was
+not given the answer to stops and names the question, because the three question seams
+refuse by default rather than guessing.
 
 ```go
 case "azure-upload":
@@ -562,7 +650,12 @@ recording the local budget lost for good, and the remote retention result.
   what does exist. Creation is the separate, explicitly chosen `PlanCreate` /
   `ApplyCreate` path. Do not make the reuse path fall back to creating.
 - **Intent is journalled before `ApplyCreate`, never after.** `plan.Creations` on disk with
-  a correlation identifier is what makes a lost response recoverable.
+  a correlation identifier is what makes a lost response recoverable. `Setup` refuses to
+  create anything without a `Journal` seam rather than creating it unrecorded.
+- **A destination whose blob data access was not proved is never recorded.**
+  `Result.Configured` is the gate, and it is true only after a real write succeeded.
+  Do not record the `Destination` on the strength of a successful selection, a successful
+  creation, or a successful role-assignment PUT: none of the three writes a blob.
 - **Nothing deletes a container, a storage account or a resource group.** There is no such
   code path, a test enforces it, and teardown is "do nothing" even for storage this tool
   created — it holds the backups.
@@ -671,8 +764,21 @@ needs. Retrieval tooling must therefore use Entra sign-in (`az storage blob down
   marker query and lead to a second create attempt, which the deterministic name would
   then turn into `ErrNameTaken` rather than a duplicate. Add `nextLink` following before
   that is likely.
+- **There is no path to create a container inside a storage account this deployment did
+  not create.** `PlanCreate` refuses a storage account that matches by name without this
+  deployment's marker, which is the same rule that stops a name match being treated as
+  ownership — so "reuse that account, just make me a container in it" cannot be
+  expressed. The guided flow says so and names the two ways out: make the container in
+  the portal, or let the tool create a storage account and container of its own. Adding
+  the missing path means letting the plan adopt a named account for a container-only
+  creation, which is a deliberate loosening of the ownership rule and belongs in its own
+  review.
 - **Everything here is unit-tested against a fake HTTP seam and a temporary filesystem.**
-  No call has been made to a real Azure subscription, and no systemd unit has been loaded
-  by systemd. Live verification of sign-in, creation, role behaviour, upload, retrieval,
-  the timer actually firing, and expiry against real blob ages is still required before
-  acceptance (A18, A19, A20, A21, A23).
+  **No live Azure sign-in has ever been run in this project.** No device code has been
+  entered by a person, no real subscription has been listed, no storage account has been
+  created, no role assignment has been observed taking effect, and no systemd unit has
+  been loaded by systemd. The guided flow in `setup.go` is no exception: its tests script
+  a fake identity platform and a fake management plane, and they prove the order of the
+  steps and the refusals, not that Azure behaves this way. Live verification of sign-in,
+  creation, role behaviour, upload, retrieval, the timer actually firing, and expiry
+  against real blob ages is still required before acceptance (A18, A19, A20, A21, A23).
