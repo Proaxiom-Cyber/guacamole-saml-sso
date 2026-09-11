@@ -56,6 +56,12 @@ Flags for setup:
   --zone NAME              Cloudflare zone name (default: the hostname's apex)
   --access-emails LIST     Cloudflare Access allow-list when Entra groups are unavailable
   --acme-contact ADDR      Operator address for the certificate account
+  --backup-schedule EXPR   Schedule for backups, a systemd OnCalendar expression (default daily)
+  --backup-keep N          Successful backups to retain (default 7)
+  --backup-dest DIR        Scheduled backup destination directory
+  --require-mount          The backup destination must sit on an approved mounted share
+  --no-backup-schedule     Do not install the scheduled backup timer
+  --recording-budget SIZE  Local recording storage budget, for example 20GiB
   --state-dir DIR          Override the state directory (default ` + "/var/lib/guacdeploy" + `)
 
 Flags for backup:
@@ -66,6 +72,20 @@ Flags for restore:
   --file PATH              Backup file to restore (required)
   --identity-file PATH     age identity file instead of the passphrase prompt
   --yes                    Unattended consent to replace the database
+
+Flags for backup-run:
+  --dest DIR               Destination directory (required)
+  --keep N                 Successful backups to retain (default 7)
+  --plaintext              Explicitly write an unencrypted backup
+  --require-mount          Fail unless the destination is on the approved mounted share
+
+Flags for the recordings commands:
+  --recording-budget SIZE  Storage budget enforced by recordings-run
+  --recordings-dir DIR     Recordings directory (default <install-dir>/recordings)
+  --dest DIR               Backup destination root for recordings-run
+  --connection NAME        recordings-enable: connection to record
+  --file PATH              recordings-restore: backup file holding the recording
+  --out DIR                recordings-restore: where to write the recovered recording
 `
 
 func main() { os.Exit(run(os.Args[1:])) }
