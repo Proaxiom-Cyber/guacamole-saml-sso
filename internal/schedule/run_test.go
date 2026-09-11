@@ -447,3 +447,37 @@ func TestSummaryBeforeAnyRun(t *testing.T) {
 		t.Errorf("ReadStatus = %v, %v; want nil, nil", s, err)
 	}
 }
+
+// TestRetentionRecognisesCurrentBackupNames guards the seam between
+// internal/backup's non-overwriting publish and retention. Millisecond
+// timestamps and the "-N" collision suffix must count as published
+// backups; if they did not, retention would silently stop pruning and
+// backups would grow without limit.
+func TestRetentionRecognisesCurrentBackupNames(t *testing.T) {
+	dir := t.TempDir()
+	current := []string{
+		"guacdeploy-db-20260911T104826.000Z.sql",
+		"guacdeploy-db-20260911T104826.000Z-1.sql",
+		"guacdeploy-db-20260102T000000Z.sql", // written by an earlier version
+	}
+	for _, n := range current {
+		write(t, dir, n, completeBackup())
+		if !Valid(dir, n) {
+			t.Errorf("published backup %s not recognised by retention", n)
+		}
+	}
+	got, err := List(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(current) {
+		t.Fatalf("List returned %d backups, want %d: %v", len(got), len(current), got)
+	}
+
+	// A partial of the current shape stays invisible to retention.
+	partial := ".partial-guacdeploy-db-20260911T104826.000Z-123456.sql"
+	write(t, dir, partial, completeBackup())
+	if Valid(dir, partial) {
+		t.Fatal("a .partial- file must never count as a published backup")
+	}
+}

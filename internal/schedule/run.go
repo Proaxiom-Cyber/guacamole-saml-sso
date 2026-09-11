@@ -19,7 +19,12 @@ import (
 // one. A failed export leaves ".partial-guacdeploy-db-...", whose leading dot
 // can never match, so an in-progress or abandoned export is invisible to
 // retention by construction.
-var publishedName = regexp.MustCompile(`^guacdeploy-db-\d{8}T\d{6}Z\.sql(\.age)?$`)
+//
+// The timestamp carries milliseconds, and a name collision appends "-N";
+// both come from internal/backup's non-overwriting publish. The
+// millisecond part stays optional so backups written by an earlier version
+// are still recognised, rather than silently becoming unprunable.
+var publishedName = regexp.MustCompile(`^guacdeploy-db-\d{8}T\d{6}(\.\d{3})?Z(-\d+)?\.sql(\.age)?$`)
 
 // Valid reports whether dir/name is a complete, published backup.
 //
