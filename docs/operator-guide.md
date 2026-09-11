@@ -439,10 +439,21 @@ written.
 `guacdeploy azure-status` shows the configured destination and the last
 upload result.
 
-Remote recordings are expired by age when a retention period is
-configured. Database backups are not covered by that rule: they keep
-their own retention. Ordinary teardown removes nothing from Azure and
-never deletes a container or a storage account.
+Two separate retention rules apply in Azure, and they never reach each
+other's objects.
+
+- **Recordings are expired by age**, when a retention period is
+  configured. Without one, nothing is expired.
+- **Database backups keep the last seven successful backups**, or the
+  number in `azure-backup-retention-count`. Only a backup whose copy in
+  the container is verified complete counts towards the seven, so seven
+  failed uploads cannot push seven good backups out of retention, and an
+  object that cannot be checked is neither counted nor removed. There is
+  no setting for "keep every backup for ever".
+
+An object is removed only when the ownership marker read back from the
+service proves it is this deployment's. Ordinary teardown removes nothing
+from Azure and never deletes a container or a storage account.
 
 **Not yet reachable from setup.** Choosing an Azure destination during a
 guided run is not wired in yet, so the destination has to be configured

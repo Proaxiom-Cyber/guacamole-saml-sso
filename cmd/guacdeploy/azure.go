@@ -30,6 +30,12 @@ const (
 	// are kept in Azure. The administrator is asked during setup; an absent
 	// value means no remote expiry, never a guessed default.
 	azureRetentionDaysConfig = "azure-recording-retention-days"
+	// azureBackupKeepConfig is how many successful database backups this
+	// deployment keeps in Azure. It mirrors the local backup schedule's own
+	// count. Absent means the specification's default of seven, never
+	// "keep for ever": the two rules are separate, and only the recording
+	// rule can be switched off.
+	azureBackupKeepConfig = "azure-backup-retention-count"
 )
 
 // azureRetentionDays reads the remote recording retention period from the
@@ -44,6 +50,22 @@ func azureRetentionDays(st *state.State) (int, error) {
 	n, err := strconv.Atoi(v)
 	if err != nil || n < 1 {
 		return 0, fmt.Errorf("%s is %q, which is not a number of days of at least 1; fix the deployment record before recordings can expire in Azure", azureRetentionDaysConfig, v)
+	}
+	return n, nil
+}
+
+// azureBackupKeep reads how many database backups to keep in Azure. Unlike
+// the recording period, an absent value is the default of seven rather than
+// "no retention": remote backups accumulating for ever is the defect this
+// closes, so there is no way to express it by omission.
+func azureBackupKeep(st *state.State) (int, error) {
+	v := st.Config[azureBackupKeepConfig]
+	if v == "" {
+		return 0, nil // PruneBackups applies the default
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("%s is %q, which is not a number of backups of at least 1; fix the deployment record before backups can be pruned in Azure", azureBackupKeepConfig, v)
 	}
 	return n, nil
 }
@@ -98,6 +120,10 @@ func azureUploadCmd(ctx context.Context, stateDir, dest string, u *ui.UI) error 
 	if err != nil {
 		return err
 	}
+	keep, err := azureBackupKeep(st)
+	if err != nil {
+		return err
+	}
 
 	m := &creds.Manager{Mode: st.Config["credential-mode"], Dir: filepath.Join(stateDir, "credentials")}
 	principal := &azure.ServicePrincipal{
@@ -118,6 +144,7 @@ func azureUploadCmd(ctx context.Context, stateDir, dest string, u *ui.UI) error 
 		Dest: dest, StateDir: stateDir, DeploymentID: st.DeploymentID, Destination: d,
 		ClientID: st.Config[azureClientIDConfig], AuthMode: "service-principal",
 		OnCalendar: st.Config[azureScheduleConfig], RetentionDays: days,
+		KeepBackups: keep,
 	})
 	u.Say("%s", rep.Summary())
 	return err
