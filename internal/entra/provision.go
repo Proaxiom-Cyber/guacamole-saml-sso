@@ -588,6 +588,12 @@ func (c *Client) Apply(ctx context.Context, plan *Plan) (*Result, error) {
 				return nil, fmt.Errorf("decode created group: %v", err)
 			}
 			ag.ObjectID, ag.Created = created.ID, true
+			// The role assignment below references this group by ID, and
+			// Entra rejects a reference to an object it has not yet
+			// replicated ("Not a valid reference update"). Wait for it.
+			if err := c.waitVisible(ctx, "/groups/"+created.ID); err != nil {
+				return nil, err
+			}
 			ag.Evidence = "created empty by this deployment; marker " + marker + " in description; add members in Entra ID"
 		} else {
 			ag.ObjectID = g.ObjectID

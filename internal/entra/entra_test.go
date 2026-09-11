@@ -8,6 +8,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"path"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -22,11 +24,20 @@ type fake struct {
 	routes map[string]func(t *testing.T, req *http.Request) *http.Response
 }
 
+// replicationRead matches a read-back of one directory object by ID.
+var replicationRead = regexp.MustCompile(`^/v1\.0/(groups|servicePrincipals|applications)/[^/]+$`)
+
 func (f *fake) do(req *http.Request) (*http.Response, error) {
 	key := req.Method + " " + req.URL.Path
 	f.calls = append(f.calls, key)
 	h, ok := f.routes[key]
 	if !ok {
+		// A freshly created object is read back once to confirm the
+		// directory has replicated it. Unless a test routes that read
+		// explicitly (to exercise a delay), the object simply exists.
+		if req.Method == http.MethodGet && replicationRead.MatchString(req.URL.Path) {
+			return jsonResp(200, `{"id":"`+path.Base(req.URL.Path)+`"}`), nil
+		}
 		f.t.Fatalf("unexpected call: %s (query %q)", key, req.URL.RawQuery)
 	}
 	return h(f.t, req), nil
@@ -218,9 +229,6 @@ func TestApplyFreshProvisioning(t *testing.T) {
 				t.Fatalf("service principal must link to the created app: %v", b)
 			}
 			return jsonResp(201, map[string]string{"id": "sp-1"})
-		},
-		"GET /v1.0/servicePrincipals/sp-1": func(t *testing.T, r *http.Request) *http.Response {
-			return jsonResp(200, `{"id":"sp-1"}`)
 		},
 		"PATCH /v1.0/servicePrincipals/sp-1": func(t *testing.T, r *http.Request) *http.Response {
 			b := readBody(t, r)
@@ -459,9 +467,6 @@ func TestPreExistingAppChangesReturnOriginals(t *testing.T) {
 				t.Fatalf("patch must converge groupMembershipClaims: %v", b)
 			}
 			return jsonResp(204, nil)
-		},
-		"GET /v1.0/servicePrincipals/sp-1": func(t *testing.T, r *http.Request) *http.Response {
-			return jsonResp(200, `{"id":"sp-1"}`)
 		},
 		"PATCH /v1.0/servicePrincipals/sp-1": func(t *testing.T, r *http.Request) *http.Response {
 			return jsonResp(204, nil)
