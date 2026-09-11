@@ -44,8 +44,26 @@ The guest agent runs as root, but SELinux restricts what it can access. For exam
 it cannot edit the guest's SSH authorization files. Do not disable SELinux to work
 around those restrictions.
 
-Direct SSH access still needs a Secure Enclave-backed key and verification. This
-requirement remains open in issue #25. No guest password has been configured.
+Direct SSH access now uses the Secure Enclave-backed key `~/.ssh/id_ecdsa_sk_rk`,
+whose private half cannot leave the Secure Enclave. Only its public half is installed
+in the VM, through the cloud-init snippet. sshd accepts it: an authentication attempt
+reaches `Server accepts key: ... ECDSA-SK` and then asks the provider to sign.
+
+**It cannot be used unattended.** Signing with a Secure Enclave key requires user
+presence, so an automated session with no person at the Mac cannot complete the
+handshake. Cameron can use it interactively; scripts cannot. No guest password is
+configured, and none should be.
+
+Automated live runs therefore go through Proxmox cloud-init instead: a `--cicustom`
+snippet whose per-boot `bootcmd` writes a root script and runs it, leaving results in
+`/var/tmp/verify.log` relabelled to `virt_qemu_ga_tmp_t` so the SELinux-confined guest
+agent can read them back. Two traps: `qm reboot` does **not** regenerate the cloud-init
+ISO (a cold stop/start does), and cloud-init's ssh module runs per instance, which is
+why the key installation lives in `bootcmd` rather than in `ssh_authorized_keys` alone.
+
+`qm guest exec` runs as root but is confined to `virt_qemu_ga_t`: it cannot execute
+docker and cannot read `/home/rocky/.ssh`. It is useful for reading relabelled files and
+for delivering secrets with `--pass-stdin`, which keeps them out of every command line.
 
 The first platform agent created a file-based private key at
 `~/.ssh/slq-guac-test`. This broke the global SSH-key rule. The supervisor revoked
@@ -97,7 +115,6 @@ VM133's TPM. Delete only the additional VM created for that test after it finish
 - pve-cam-lab MCP for read/inspect and guest-exec operations. Note: the MCP token
   cannot allocate ISO/template content on storage (403 Datastore.AllocateTemplate);
   image downloads go over `ssh pve01-root`.
-- Secure Enclave-backed guest SSH access, once configured and verified.
 
 ## Remaining test-account requirements (not created by this platform)
 
