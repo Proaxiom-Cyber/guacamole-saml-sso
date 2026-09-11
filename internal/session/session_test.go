@@ -19,6 +19,7 @@ import (
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/entra"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/host"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recording"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recoverykey"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/schedule"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/stack"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
@@ -1797,5 +1798,104 @@ func TestRecordingSchedulePhaseAsksWhenNoBudgetIsSet(t *testing.T) {
 	}
 	if st.Config["recording-budget"] != "" {
 		t.Fatal("declining recorded a budget anyway")
+	}
+}
+
+// A resumed or repeated setup is usually run without the flags again. What the
+// operator chose the first time has to survive that, or a second run silently
+// blanks the recorded schedule and retention.
+func TestRepeatedSetupKeepsTheRecordedScheduleAndBudget(t *testing.T) {
+	dir := t.TempDir()
+	o := &Options{StateDir: dir} // no flags, as a resume is normally run
+	st := &state.State{DeploymentID: "d1", Config: map[string]string{
+		"backup-public-key": "age1example",
+		"backup-dest":       "/srv/backups",
+		"backup-schedule":   "Mon *-*-* 02:00:00",
+		"backup-keep":       "14",
+		"recording-budget":  "50GiB",
+	}}
+	// The phase installs units, which this test must not do, so stop at the
+	// point the values are settled by checking what it carries forward.
+	o.BackupSchedule = firstNonEmpty(o.BackupSchedule, st.Config["backup-schedule"])
+	if o.BackupSchedule != "Mon *-*-* 02:00:00" {
+		t.Fatalf("the recorded schedule was lost: %q", o.BackupSchedule)
+	}
+	o.RecordingBudget = firstNonEmpty(o.RecordingBudget, st.Config["recording-budget"])
+	if o.RecordingBudget != "50GiB" {
+		t.Fatalf("the recorded budget was lost: %q", o.RecordingBudget)
+	}
+	// An explicit flag still wins.
+	o2 := &Options{StateDir: dir, BackupSchedule: "daily", RecordingBudget: "5GiB"}
+	if got := firstNonEmpty(o2.BackupSchedule, st.Config["backup-schedule"]); got != "daily" {
+		t.Fatalf("the flag did not win: %q", got)
+	}
+	if got := firstNonEmpty(o2.RecordingBudget, st.Config["recording-budget"]); got != "5GiB" {
+		t.Fatalf("the flag did not win: %q", got)
+	}
+}
+
+// The export is written before the public key is recorded. A run interrupted
+// between the two leaves key material nothing points at, and the export never
+// overwrites — so regenerating is refused and the operator is stuck. The
+// passphrase recovers the pair instead, and nothing is regenerated.
+func TestInterruptedKeyGenerationIsAdoptedNotRegenerated(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "recovery", "backup-key.age")
+	id, err := recoverykey.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverykey.ExportEncrypted(id, "the-passphrase", path); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u, out := testUI(true, "")
+	u.Secret = func(string) (string, error) { return "the-passphrase", nil }
+	o := &Options{StateDir: dir}
+	st := &state.State{DeploymentID: "d1", Config: map[string]string{}}
+	made, err := o.offerBackupKey(st, u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !made {
+		t.Fatal("the existing export was not adopted")
+	}
+	if st.Config["backup-public-key"] != id.Recipient().String() {
+		t.Fatal("the recorded public key is not the one in the export")
+	}
+	after, _ := os.ReadFile(path)
+	if string(before) != string(after) {
+		t.Fatal("the existing export was rewritten; a copy already taken would be invalid")
+	}
+	if !strings.Contains(out.String(), "interrupted") {
+		t.Errorf("the operator was not told what happened:\n%s", out.String())
+	}
+}
+
+// A wrong passphrase must change nothing and say what can be done.
+func TestAdoptingAnExportRefusesAWrongPassphrase(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "recovery", "backup-key.age")
+	id, _ := recoverykey.Generate()
+	if err := recoverykey.ExportEncrypted(id, "the-passphrase", path); err != nil {
+		t.Fatal(err)
+	}
+	u, _ := testUI(true, "")
+	u.Secret = func(string) (string, error) { return "wrong", nil }
+	o := &Options{StateDir: dir}
+	st := &state.State{DeploymentID: "d1", Config: map[string]string{}}
+	_, err := o.offerBackupKey(st, u)
+	if err == nil {
+		t.Fatal("a wrong passphrase was accepted")
+	}
+	if !strings.Contains(err.Error(), "move that file aside") {
+		t.Fatalf("the error gives no way forward: %v", err)
+	}
+	if st.Config["backup-public-key"] != "" {
+		t.Fatal("a public key was recorded from a failed adoption")
 	}
 }

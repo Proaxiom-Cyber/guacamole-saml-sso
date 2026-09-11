@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1479,15 +1480,26 @@ func (o *Options) backupSchedule(ctx context.Context, st *state.State, u *ui.UI)
 			return nil
 		}
 	}
-	dest := o.BackupDest
-	if dest == "" {
-		dest = filepath.Join(o.StateDir, "backups")
-	}
 	if st.Config == nil {
 		st.Config = map[string]string{}
 	}
+	// A resumed or repeated setup is usually run without the flags again, so
+	// what the operator chose the first time has to survive it. Only an
+	// explicit flag changes a recorded value.
+	dest := firstNonEmpty(o.BackupDest, st.Config["backup-dest"], filepath.Join(o.StateDir, "backups"))
+	o.BackupSchedule = firstNonEmpty(o.BackupSchedule, st.Config["backup-schedule"])
+	if o.BackupKeep == 0 {
+		if n, err := strconv.Atoi(st.Config["backup-keep"]); err == nil && n > 0 {
+			o.BackupKeep = n
+		}
+	}
 	st.Config["backup-dest"] = dest
-	st.Config["backup-schedule"] = o.BackupSchedule
+	if o.BackupSchedule != "" {
+		st.Config["backup-schedule"] = o.BackupSchedule
+	}
+	if o.BackupKeep > 0 {
+		st.Config["backup-keep"] = strconv.Itoa(o.BackupKeep)
+	}
 
 	in, err := schedule.Install(ctx, schedule.Options{
 		Run:          schedule.ExecRunner,
@@ -1525,6 +1537,9 @@ func (o *Options) backupSchedule(ctx context.Context, st *state.State, u *ui.UI)
 // upload failed, and that such a deletion can permanently lose a
 // recording, so setup says that plainly rather than burying it.
 func (o *Options) recordingSchedule(ctx context.Context, st *state.State, u *ui.UI) error {
+	// Same rule as the backup schedule: a repeat run without the flag keeps
+	// the budget the operator already chose.
+	o.RecordingBudget = firstNonEmpty(o.RecordingBudget, st.Config["recording-budget"])
 	if o.RecordingBudget == "" {
 		// The specification asks for the budget during setup. Without this,
 		// a guided deployment silently ended with recordings accumulating
@@ -1767,6 +1782,15 @@ func (o *Options) offerBackupKey(st *state.State, u *ui.UI) (bool, error) {
 	if !u.Interactive {
 		return false, nil
 	}
+	path := filepath.Join(o.StateDir, "recovery", "backup-key.age")
+	// An interruption between writing the export and recording the public key
+	// leaves an export nothing points at. Generating again is refused by the
+	// export itself (it never overwrites), which would strand the operator,
+	// and regenerating would silently invalidate a copy they had already
+	// taken. Recover the public key from the export they already have.
+	if _, err := os.Stat(path); err == nil {
+		return o.adoptBackupKey(st, u, path)
+	}
 	u.Say("Scheduled backups are encrypted with a key generated here on the server.")
 	u.Say("The private key leaves as one passphrase-encrypted file, which you copy off this host and keep with its passphrase, separately.")
 	want, err := u.Confirm("Generate the backup key now and install the schedule?")
@@ -1795,7 +1819,6 @@ func (o *Options) offerBackupKey(st *state.State, u *ui.UI) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	path := filepath.Join(o.StateDir, "recovery", "backup-key.age")
 	if err := recoverykey.ExportEncrypted(id, pass, path); err != nil {
 		return false, err
 	}
@@ -1810,6 +1833,52 @@ func (o *Options) offerBackupKey(st *state.State, u *ui.UI) (bool, error) {
 	u.Say("Backup key generated. The encrypted export is at %s.", path)
 	u.Say("Copy it off this host and store it apart from its passphrase. Neither alone recovers a backup.")
 	u.Say("Showing this does not prove a copy was made: run 'guacdeploy backup-key --verify' to prove the export decrypts.")
+	return true, nil
+}
+
+// firstNonEmpty returns the first value that is not empty, so a flag beats a
+// recorded value and a recorded value beats a default.
+func firstNonEmpty(vs ...string) string {
+	for _, v := range vs {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// adoptBackupKey records the public key of an export that already exists.
+//
+// It is the other half of the interruption window: the export is written
+// before the public key is recorded, so a run interrupted between the two
+// leaves key material on disk that the deployment does not know about. The
+// passphrase is the only thing that can open it, so it is asked for, and a
+// wrong one leaves everything exactly as it was with an action to take.
+func (o *Options) adoptBackupKey(st *state.State, u *ui.UI, path string) (bool, error) {
+	u.Say("A backup key export already exists at %s, but no public key is recorded.", path)
+	u.Say("An earlier run was interrupted between writing it and recording it. Its passphrase recovers the pair; nothing is regenerated, so a copy you already took stays valid.")
+	secret := u.SecretReader()
+	if secret == nil {
+		return false, nil
+	}
+	pass, err := secret("Passphrase for the existing backup key export")
+	if err != nil {
+		return false, err
+	}
+	id, err := recoverykey.RecoverIdentity(path, pass)
+	if err != nil {
+		return false, fmt.Errorf("the existing export at %s could not be opened with that passphrase: %w\n"+
+			"Nothing was changed. Run setup again with the right passphrase, or move that file aside deliberately to generate a new key — which makes any backup taken under the old one unreadable", path, err)
+	}
+	if st.Config == nil {
+		st.Config = map[string]string{}
+	}
+	st.Config["backup-public-key"] = id.Recipient().String()
+	st.EnsureResource(state.Resource{
+		Provider: "host", Type: "recovery-key-export", Name: path,
+		Ownership: "written by this deployment", CreatedAt: time.Now().UTC(),
+	})
+	u.Say("The existing export was adopted; its public key is now recorded and scheduled backups can encrypt to it.")
 	return true, nil
 }
 
