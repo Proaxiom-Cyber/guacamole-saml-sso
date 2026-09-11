@@ -159,10 +159,11 @@ func (o *Options) stackConfigure(ctx context.Context, st *state.State, u *ui.UI)
 	}
 	items := []struct {
 		key, flag, prompt, def string
+		hostname               bool
 	}{
-		{"guac-hostname", o.Hostname, "Public hostname for this deployment (for example guac.example.com)", ""},
-		{"admin-group", o.AdminGroup, "Identity-provider group for administrators", "Guacamole Administrators"},
-		{"operator-group", o.OperatorGroup, "Identity-provider group for operators", "Guacamole Operators"},
+		{key: "guac-hostname", flag: o.Hostname, prompt: "Public hostname for this deployment (for example guac.example.com)", hostname: true},
+		{key: "admin-group", flag: o.AdminGroup, prompt: "Identity-provider group for administrators", def: "Guacamole Administrators"},
+		{key: "operator-group", flag: o.OperatorGroup, prompt: "Identity-provider group for operators", def: "Guacamole Operators"},
 	}
 	for _, it := range items {
 		v := st.Config[it.key]
@@ -179,8 +180,19 @@ func (o *Options) stackConfigure(ctx context.Context, st *state.State, u *ui.UI)
 				return err
 			}
 		}
-		if strings.ContainsAny(v, " /") || v == "" {
-			return fmt.Errorf("%s %q is not valid: use a bare DNS name or group name without spaces or slashes", it.key, v)
+		v = strings.TrimSpace(v)
+		switch {
+		case v == "":
+			return fmt.Errorf("%s is required", it.key)
+		case it.hostname && strings.ContainsAny(v, " /"):
+			// A hostname is a DNS name: it carries no spaces or slashes.
+			return fmt.Errorf("%s %q is not a DNS name: remove spaces and slashes", it.key, v)
+		case !it.hostname && strings.ContainsAny(v, "/"):
+			// Group display names routinely contain spaces, and the
+			// identity provider is where they are defined, so only a
+			// slash is rejected. It would break the database seeding and
+			// the claim matching that rely on the exact display name.
+			return fmt.Errorf("%s %q cannot contain a slash", it.key, v)
 		}
 		st.Config[it.key] = v
 	}

@@ -984,3 +984,37 @@ func TestCloudflareConditionsMapToTheSessionContract(t *testing.T) {
 		t.Fatalf("an ordinary error was rewritten: %v", got)
 	}
 }
+
+// TestGroupNamesMayContainSpaces pins a real-world constraint: Entra group
+// display names normally contain spaces ("Guacamole Administrators"), and
+// the database seeding and the SAML claim match on that exact name. Only
+// the hostname is a DNS name.
+func TestGroupNamesMayContainSpaces(t *testing.T) {
+	dir := t.TempDir()
+	o := &Options{
+		StateDir: dir, Hostname: "guac.example.com",
+		AdminGroup: "Guacamole Administrators", OperatorGroup: " Guacamole Operators ",
+	}
+	st := &state.State{Config: map[string]string{}}
+	u, _ := testUI(false, "")
+	if err := o.stackConfigure(context.Background(), st, u); err != nil {
+		t.Fatalf("group names with spaces were rejected: %v", err)
+	}
+	if st.Config["admin-group"] != "Guacamole Administrators" {
+		t.Fatalf("admin group = %q", st.Config["admin-group"])
+	}
+	if st.Config["operator-group"] != "Guacamole Operators" {
+		t.Fatalf("surrounding spaces were not trimmed: %q", st.Config["operator-group"])
+	}
+
+	// A hostname is still a DNS name.
+	bad := &Options{StateDir: dir, Hostname: "not a hostname", AdminGroup: "a", OperatorGroup: "b"}
+	if err := bad.stackConfigure(context.Background(), &state.State{Config: map[string]string{}}, u); err == nil {
+		t.Fatal("a hostname with spaces must be rejected")
+	}
+	// A slash in a group name would break seeding and claim matching.
+	slash := &Options{StateDir: dir, Hostname: "guac.example.com", AdminGroup: "a/b", OperatorGroup: "c"}
+	if err := slash.stackConfigure(context.Background(), &state.State{Config: map[string]string{}}, u); err == nil {
+		t.Fatal("a group name with a slash must be rejected")
+	}
+}
