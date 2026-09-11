@@ -183,6 +183,14 @@ type Options struct {
 	// guesses a default.
 	RetentionDays int
 
+	// KeepBackups is how many successful database backups this deployment
+	// keeps in the container. Zero means the specification's default of
+	// seven, never "for ever": remote backups accumulating without limit is
+	// the defect PruneBackups closes. It is a count, deliberately unlike
+	// RetentionDays, because a backup's worth is its position in the series
+	// rather than its age.
+	KeepBackups int
+
 	// Now supplies the run timestamp; nil means time.Now.
 	Now func() time.Time
 }
@@ -260,6 +268,10 @@ type Report struct {
 	// upload failed: a failed upload expires nothing.
 	RetentionDays int           `json:"retention_days,omitempty"`
 	Expire        *ExpireReport `json:"expire,omitempty"`
+	// Prune is the database-backup retention result: the last KeepBackups
+	// successful backups are kept and the rest removed. Nil when the run did
+	// not reach it, which is what a failed upload does.
+	Prune *PruneReport `json:"prune,omitempty"`
 
 	Error      string `json:"error,omitempty"`
 	OnCalendar string `json:"on_calendar,omitempty"`
@@ -348,6 +360,16 @@ func Upload(ctx context.Context, c *Client, o Options) (Report, error) {
 		if err != nil {
 			return o.fail(rep, err)
 		}
+	}
+	// Database backups keep their own count-based retention, under the same
+	// condition: a failed upload prunes nothing. Unlike the recording rule
+	// this one has no "off" setting, because leaving every backup in the
+	// container for ever is not a policy anybody chose.
+	pr, err := PruneBackups(ctx, c, PruneOptions{Destination: o.Destination,
+		DeploymentID: o.DeploymentID, Keep: o.KeepBackups, Now: o.Now})
+	rep.Prune = &pr
+	if err != nil {
+		return o.fail(rep, err)
 	}
 	if err := WriteReport(o.StateDir, rep); err != nil {
 		return rep, err
@@ -567,6 +589,11 @@ func (r Report) Summary() string {
 		b.WriteString(r.Expire.Summary())
 	} else if r.RetentionDays > 0 {
 		fmt.Fprintf(&b, "Azure recording retention: %d days (nothing was expired: this run did not complete)\n", r.RetentionDays)
+	}
+	if r.Prune != nil {
+		b.WriteString(r.Prune.Summary())
+	} else {
+		b.WriteString("Azure backup retention: nothing was pruned, because this run did not complete\n")
 	}
 	if r.Error != "" {
 		fmt.Fprintf(&b, "Reason:               %s\n", firstLine(r.Error))

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/azure"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/backup"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/certs"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/cloudflare"
@@ -106,6 +107,11 @@ func Phases(opts *Options) []Phase {
 		// leaves the origin unreachable rather than reachable and
 		// unprotected.
 		{Name: "cloudflare-connect", Run: opts.cloudflareConnect},
+		// The off-host copy is last, and only when asked for. It needs the
+		// tenant and the service principal the identity phase produces, and
+		// it must never gate publication: a deployment that works should not
+		// be left unpublished because a storage account could not be made.
+		{Name: "azure-destination", Run: opts.azureDestination},
 	}
 }
 
@@ -571,7 +577,17 @@ type Options struct {
 	CredDetector creds.Detector
 	// CredsRun executes systemd-creds for the sealed modes; nil means the
 	// real one.
-	CredsRun           creds.Runner
+	CredsRun creds.Runner
+	// Azure asks for an Azure Blob destination during a guided run. The
+	// remaining fields answer the questions ahead of time; any one of them
+	// also turns the phase on.
+	Azure              bool
+	AzureSubscription  string
+	AzureAccount       string
+	AzureContainer     string
+	AzureCreate        bool
+	AzureLocation      string
+	AzureResourceGroup string
 	Hostname           string // explicit configuration; guided asks when empty
 	AdminGroup         string
 	OperatorGroup      string
@@ -996,6 +1012,10 @@ func (o *Options) entraSignin(ctx context.Context, st *state.State, u *ui.UI) er
 
 	st.Config["saml-metadata-url"] = res.MetadataURL
 	st.Config["entra-tenant-id"] = res.TenantID
+	// The service principal is the identity an unattended Azure upload signs
+	// in as, so its object ID has to outlive this phase for the Azure
+	// destination to be able to grant it a role.
+	st.Config["entra-sp-object-id"] = res.App.SPObjectID
 	// Cloudflare Access needs the group object IDs; without them its
 	// allow-list silently degrades to email addresses.
 	for _, g := range res.Groups {
@@ -1174,6 +1194,14 @@ func (o *Options) cloudflareDNS(ctx context.Context, st *state.State, u *ui.UI) 
 	})
 	st.Config["cloudflare-record-id"] = rec.ID
 	u.Say("DNS record %s published. Unrelated records in this zone are untouched and the zone is preserved at teardown.", rec.Name)
+	// Access is verified against this hostname in the next phase, so the
+	// record has to be answered before that runs. On a first deployment it
+	// never is at the instant it is created, and the Access phase then
+	// reports an application it created but could not verify.
+	if err := p.WaitResolvable(ctx, 0, 0); err != nil {
+		return err
+	}
+	u.Say("%s is answered, so the Access policy can be verified against it.", rec.Name)
 	return nil
 }
 
@@ -1582,4 +1610,113 @@ func (o *Options) bootRecovery(ctx context.Context, st *state.State, u *ui.UI) e
 	}
 	u.Say("Reboot recovery installed: the stack restarts with its credentials after a reboot, without this binary present.")
 	return nil
+}
+
+// azureDestination offers an Azure Blob container as the off-host copy of
+// this deployment's backups and recordings.
+//
+// It is optional and it is skipped unless the operator asks for it: a
+// deployment with no Azure account is the ordinary case, and an unattended
+// run that was given no Azure answers has nothing to configure. The phase
+// creates nothing without journalling the intent first, and records only a
+// destination whose blob-data access was proved by a real write — the
+// package decides that, not this phase.
+func (o *Options) azureDestination(ctx context.Context, st *state.State, u *ui.UI) error {
+	if !o.wantsAzure(st) {
+		return nil
+	}
+	if st.Config == nil {
+		st.Config = map[string]string{}
+	}
+	corr := state.NewID()
+	res, err := azure.Setup(ctx, azure.SetupOptions{
+		App:            azure.App{TenantID: st.Config["entra-tenant-id"]},
+		DeploymentID:   st.DeploymentID,
+		Hostname:       st.Config["guac-hostname"],
+		SubscriptionID: o.AzureSubscription,
+		Account:        o.AzureAccount,
+		Container:      o.AzureContainer,
+		Create:         o.AzureCreate,
+		Location:       o.AzureLocation,
+		ResourceGroup:  o.AzureResourceGroup,
+		// The uploader is the deployment's own service principal, which only
+		// exists once the identity phase has run. Without it the package says
+		// plainly that scheduled uploads will fail until a role is granted.
+		UploaderObjectID: st.Config["entra-sp-object-id"],
+		Say:              u.Say,
+		Ask:              u.Line,
+		Confirm:          u.Confirm,
+		Choose:           chooseFromList(u),
+		Journal: func(cs []azure.Creation) error {
+			if o.journalIntent == nil {
+				return errors.New("this run cannot journal a creation intent, so nothing will be created in Azure")
+			}
+			return o.journalIntent("will create in Azure: " + describeCreations(cs))
+		},
+	})
+	// Recorded whether or not the run succeeded: a resource that was created
+	// before the failure is this deployment's to account for either way.
+	now := time.Now().UTC()
+	for _, cr := range res.Created {
+		st.EnsureResource(state.Resource{
+			Provider: "azure", Type: cr.Type, Name: cr.Name, ProviderID: cr.ProviderID,
+			Ownership: cr.Ownership, CorrelationID: corr, CreatedAt: now,
+		})
+	}
+	if err != nil {
+		return err
+	}
+	if !res.Configured {
+		u.Say("No Azure destination was configured: %s", res.Reason)
+		return nil
+	}
+	st.Config["azure-subscription-id"] = res.SubscriptionID
+	st.Config["azure-account-id"] = res.Destination.AccountID
+	st.Config["azure-account"] = res.Destination.Account
+	st.Config["azure-container"] = res.Destination.Container
+	st.Config["azure-blob-endpoint"] = res.Destination.BlobEndpoint
+	st.Config["azure-tenant-id"] = st.Config["entra-tenant-id"]
+	u.Say("Azure destination: container %s in storage account %s; blob access proved by %s.",
+		res.Destination.Container, res.Destination.Account, res.BlobDataProvenBy)
+	u.Say("Backups and completed recordings are copied there by 'guacdeploy azure-upload'. Teardown never removes them.")
+	return nil
+}
+
+// wantsAzure reports whether this run has been asked for an Azure
+// destination. Silence is no, in both modes: a guided run does not interrogate
+// every operator about Azure, and an unattended run with no Azure answers has
+// nothing to act on.
+func (o *Options) wantsAzure(st *state.State) bool {
+	return o.Azure || o.AzureSubscription != "" || o.AzureAccount != "" ||
+		o.AzureContainer != "" || o.AzureCreate || st.Config["azure-account-id"] != ""
+}
+
+// chooseFromList adapts the package's index-based menu to the UI's
+// rune-keyed one. Ten or more options would run past the digits, so it says
+// so rather than silently offering a menu nobody can answer.
+func chooseFromList(u *ui.UI) func(string, []string) (int, error) {
+	return func(prompt string, options []string) (int, error) {
+		if len(options) > 9 {
+			return 0, fmt.Errorf("%d options is more than this menu can offer; narrow the choice with the matching flag", len(options))
+		}
+		choices := make([]ui.Choice, 0, len(options))
+		for i, opt := range options {
+			choices = append(choices, ui.Choice{Key: rune('1' + i), Label: opt})
+		}
+		k, err := u.Choose(prompt, choices)
+		if err != nil {
+			return 0, err
+		}
+		return int(k - '1'), nil
+	}
+}
+
+// describeCreations words the intent for the journal, so an interrupted run
+// leaves behind what it was about to create rather than only that it tried.
+func describeCreations(cs []azure.Creation) string {
+	parts := make([]string, 0, len(cs))
+	for _, c := range cs {
+		parts = append(parts, c.Type+" "+c.Name)
+	}
+	return strings.Join(parts, ", ")
 }

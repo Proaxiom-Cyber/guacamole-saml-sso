@@ -1533,3 +1533,81 @@ func TestSealedModeAcceptsTheValueOnceFromTheEnvironment(t *testing.T) {
 		t.Errorf("the run did not say the environment variable is no longer needed:\n%s", out.String())
 	}
 }
+
+// An Azure destination is optional. A deployment with no Azure account is the
+// ordinary case, so the phase must do nothing at all — and above all reach no
+// network — unless this run was asked for one.
+func TestAzureDestinationIsSkippedUnlessAskedFor(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		o    Options
+		st   *state.State
+		want bool
+	}{
+		{name: "nothing asked", o: Options{}, st: &state.State{}, want: false},
+		{name: "asked with the flag", o: Options{Azure: true}, st: &state.State{}, want: true},
+		{name: "a subscription answers the question", o: Options{AzureSubscription: "sub-1"}, st: &state.State{}, want: true},
+		{name: "an account answers it", o: Options{AzureAccount: "acct"}, st: &state.State{}, want: true},
+		{name: "a container answers it", o: Options{AzureContainer: "c"}, st: &state.State{}, want: true},
+		{name: "creation answers it", o: Options{AzureCreate: true}, st: &state.State{}, want: true},
+		{name: "a destination already recorded keeps it on", o: Options{},
+			st: &state.State{Config: map[string]string{"azure-account-id": "/subscriptions/x"}}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.o.wantsAzure(tc.st); got != tc.want {
+				t.Fatalf("wantsAzure = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// And the phase itself is a no-op then: a network call would fail here,
+	// because nothing is wired to answer one.
+	u, out := testUI(false, "")
+	o := Options{}
+	if err := o.azureDestination(context.Background(), &state.State{}, u); err != nil {
+		t.Fatalf("the phase must do nothing when no destination was asked for: %v", err)
+	}
+	if out.String() != "" {
+		t.Fatalf("the phase said something about Azure to an operator who never asked:\n%s", out.String())
+	}
+}
+
+// The index-based menu and the rune-keyed UI have to agree, or the operator's
+// choice silently becomes a different one.
+func TestChooseFromListMapsTheAnswerBackToItsIndex(t *testing.T) {
+	u, _ := testUI(true, "3\n")
+	got, err := chooseFromList(u)("Which one?", []string{"first", "second", "third"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 2 {
+		t.Fatalf("choosing the third option gave index %d, want 2", got)
+	}
+
+	// Past the digits the menu cannot be answered, so it says so rather than
+	// offering keys nobody can press.
+	many := make([]string, 12)
+	for i := range many {
+		many[i] = "option"
+	}
+	if _, err := chooseFromList(u)("Which one?", many); err == nil {
+		t.Fatal("a menu of twelve options was offered with nine keys")
+	}
+}
+
+// The Azure destination needs the tenant and the service principal that the
+// identity phase produces, and it must never gate publication: a working
+// deployment should not be left unpublished because a storage account could
+// not be created.
+func TestAzureDestinationRunsAfterIdentityAndAfterPublication(t *testing.T) {
+	idx := map[string]int{}
+	for i, p := range Phases(&Options{}) {
+		idx[p.Name] = i
+	}
+	if idx["azure-destination"] < idx["entra-signin"] {
+		t.Fatal("the Azure phase runs before the identity phase, so the tenant and the service principal it needs do not exist yet")
+	}
+	if idx["azure-destination"] < idx["cloudflare-connect"] {
+		t.Fatal("the Azure phase runs before publication, so a storage failure would leave a working deployment unpublished")
+	}
+}

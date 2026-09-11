@@ -81,3 +81,37 @@ func TestAzureDestinationComesFromNonSecretStateOnly(t *testing.T) {
 		}
 	}
 }
+
+// The two Azure retention rules are separate, and only one of them can be
+// switched off. Leaving the backup count out must mean the default of seven,
+// because remote backups accumulating for ever is the defect it closes.
+func TestAzureBackupKeepDefaultsRatherThanKeepingForEver(t *testing.T) {
+	for _, tc := range []struct {
+		name, value string
+		want        int
+		wantErr     bool
+	}{
+		{name: "absent means the package default", value: "", want: 0},
+		{name: "an explicit count is honoured", value: "3", want: 3},
+		{name: "zero is refused, not read as for ever", value: "0", wantErr: true},
+		{name: "a negative count is refused", value: "-1", wantErr: true},
+		{name: "nonsense is refused rather than ignored", value: "lots", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &state.State{Config: map[string]string{azureBackupKeepConfig: tc.value}}
+			got, err := azureBackupKeep(st)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("%q was accepted", tc.value)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("got %d, want %d", got, tc.want)
+			}
+		})
+	}
+}

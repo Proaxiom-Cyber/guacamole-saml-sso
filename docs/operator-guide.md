@@ -118,6 +118,30 @@ deployment state, logs, or command arguments. Files written by the tool
 are recorded as material owned by this deployment, so teardown can offer
 their removal; files you placed yourself are pre-existing and stay.
 
+## Recovering onto a replacement host
+
+When the host is lost, `guacdeploy recover --file <backup>` rebuilds the
+deployment record on a replacement machine. It reads the backup, asks
+Cloudflare and Entra what of the lost deployment is still there, and writes
+the record that an ordinary `guacdeploy setup` then works from.
+
+It creates nothing, changes nothing at any provider and deletes nothing.
+Each resource is looked up by this deployment's ownership marker, so one
+that survived is adopted rather than created a second time, and one that
+only matches by name is reported for a person to look at rather than
+touched. A provider that cannot be asked stops the run: recreating on an
+unanswered question is how a duplicate tunnel gets made.
+
+The credentials died with the host, so recovery asks for the Cloudflare API
+token again, at a hidden prompt or from `GUACDEPLOY_CRED_CLOUDFLARE_API_TOKEN`,
+and needs a Microsoft Graph token in `GUACDEPLOY_GRAPH_TOKEN`. A credential
+sealed to the old host's TPM cannot be decrypted on a replacement at all;
+that is the point of the mode, and it is why the guide says to keep an
+independent record of anything you cannot recreate.
+
+The database is restored separately, with `guacdeploy restore`, once the
+stack is running.
+
 ## Backup recovery key
 
 Backups are encrypted with a key pair. `guacdeploy backup-key` generates
@@ -439,12 +463,36 @@ written.
 `guacdeploy azure-status` shows the configured destination and the last
 upload result.
 
-Remote recordings are expired by age when a retention period is
-configured. Database backups are not covered by that rule: they keep
-their own retention. Ordinary teardown removes nothing from Azure and
-never deletes a container or a storage account.
+Two separate retention rules apply in Azure, and they never reach each
+other's objects.
 
-**Not yet reachable from setup.** Choosing an Azure destination during a
-guided run is not wired in yet, so the destination has to be configured
-before these commands are useful. The steps are written up in
-`internal/azure/WIRING.md`.
+- **Recordings are expired by age**, when a retention period is
+  configured. Without one, nothing is expired.
+- **Database backups keep the last seven successful backups**, or the
+  number in `azure-backup-retention-count`. Only a backup whose copy in
+  the container is verified complete counts towards the seven, so seven
+  failed uploads cannot push seven good backups out of retention, and an
+  object that cannot be checked is neither counted nor removed. There is
+  no setting for "keep every backup for ever".
+
+An object is removed only when the ownership marker read back from the
+service proves it is this deployment's. Ordinary teardown removes nothing
+from Azure and never deletes a container or a storage account.
+
+**Choosing the destination during setup.** `guacdeploy setup --azure` offers
+it: you sign in with a device code, pick a subscription, then select an
+existing storage account and container or ask for new ones with
+`--azure-create --azure-location <region>`. `--azure-subscription`,
+`--azure-account` and `--azure-container` answer those questions ahead of
+time. Nothing is created before the intent is written to the deployment
+record, and no destination is recorded until a real write has proved that
+blob data access works — a granted role takes minutes to take effect, and
+the run waits for it rather than assuming.
+
+Without any of those flags the phase does nothing: a deployment with no
+Azure account is the ordinary case.
+
+**Not proven against real Azure.** Every Azure path in this tool is tested
+against a fake identity platform and a fake management plane. No device
+code has been entered by a person, no real subscription listed, no storage
+account created, and no role assignment watched taking effect.

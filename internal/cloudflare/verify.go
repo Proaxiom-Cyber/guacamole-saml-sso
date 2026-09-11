@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
 	"sort"
 	"strings"
+	"time"
 )
 
 // ErrAllowsEveryone: the stored Access policy would admit anybody who can
@@ -447,4 +449,71 @@ func (m accessMeta) audiences() []string {
 		return out
 	}
 	return nil
+}
+
+// Bounds for waiting on a newly published record. A proxied record is served
+// by Cloudflare's own nameservers, so it appears in seconds rather than
+// minutes; the timeout is generous enough to absorb a slow propagation and
+// short enough that a genuinely broken zone is reported while the operator
+// is still watching.
+const (
+	DefaultResolveTimeout  = 90 * time.Second
+	DefaultResolveInterval = 3 * time.Second
+)
+
+// WaitResolvable waits until this deployment's hostname is answered, asking
+// the zone's authoritative nameservers where this host's own resolver cannot
+// see the record.
+//
+// A live run published the DNS record and verified Access immediately after,
+// and the verification failed because the authority had not started serving
+// the record yet. That is a delay, not a misconfiguration: on a first
+// deployment it happens every time, and the phase that followed reported a
+// created-but-unverifiable Access application. The wait is deliberately here
+// rather than inside the probe, so that a hostname that never resolves is
+// still reported by the probe that needs it, with what it asked.
+func (p *Provisioner) WaitResolvable(ctx context.Context, timeout, interval time.Duration) error {
+	if timeout <= 0 {
+		timeout = DefaultResolveTimeout
+	}
+	if interval <= 0 {
+		interval = DefaultResolveInterval
+	}
+	p.ensureAuthority(ctx)
+	lookup := p.Resolve
+	if lookup == nil {
+		lookup = func(ctx context.Context, host string) ([]string, error) {
+			if addrs, err := net.DefaultResolver.LookupHost(ctx, host); err == nil && len(addrs) > 0 {
+				return addrs, nil
+			}
+			return p.Client.resolveAtAuthority(ctx, host)
+		}
+	}
+	deadline := time.Now().Add(timeout)
+	var last error
+	for {
+		if addrs, err := lookup(ctx, p.Hostname); err == nil && len(addrs) > 0 {
+			return nil
+		} else {
+			last = err
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("%s was published but is not answered yet: this host's resolver does not have it and %s: %v",
+				p.Hostname, describeAuthority(p.Client.AuthorityNameServers), last)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+}
+
+// describeAuthority names what was asked, so the error says where the answer
+// was looked for rather than only that there was none.
+func describeAuthority(ns []string) string {
+	if len(ns) == 0 {
+		return "the zone's authoritative nameservers are not known"
+	}
+	return "the zone's authority (" + strings.Join(ns, ", ") + ") does not answer for it either"
 }
