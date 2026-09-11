@@ -281,6 +281,13 @@ func run(args []string) int {
 		return 2
 	}
 
+	// Leave the alternate screen before anything is written to stderr. The
+	// deferred restore runs too late: the final message below would be drawn
+	// on the full-screen buffer and disappear with it, so a failure before
+	// the first phase gave the operator exit 1 and a blank terminal.
+	// RestoreTerminal is idempotent.
+	u.RestoreTerminal()
+
 	switch {
 	case err == nil:
 		return 0
