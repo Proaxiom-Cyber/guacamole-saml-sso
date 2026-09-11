@@ -21,6 +21,7 @@ import (
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recording"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/schedule"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/session"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/settings"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/ui"
 )
@@ -39,6 +40,7 @@ Commands:
   recordings-status Show recording backup and cleanup results
   recordings-enable Turn on recording for a connection
   recordings-restore Recover one recording from a backup
+  settings    Show (--list) or restore (--restore) changes made to pre-existing settings
   backup-run  Take the scheduled backup, then expire old backups
   backup-status Show the scheduled backup destination and last-run result
   renew-cert  Renew the origin certificate now (used by the installed timer)
@@ -72,6 +74,10 @@ Flags for restore:
   --file PATH              Backup file to restore (required)
   --identity-file PATH     age identity file instead of the passphrase prompt
   --yes                    Unattended consent to replace the database
+
+Flags for settings:
+  --list                   Show pending restorations; changes nothing
+  --restore                Restore approved settings that have not drifted
 
 Flags for backup-run:
   --dest DIR               Destination directory (required)
@@ -117,6 +123,8 @@ func run(args []string) int {
 	recordingsDir := fs.String("recordings-dir", "", "recordings directory (default <install-dir>/recordings)")
 	connection := fs.String("connection", "", "recordings-enable: connection name to record")
 	out := fs.String("out", "", "recordings-restore: directory to write the recovered recording into")
+	list := fs.Bool("list", false, "settings: show pending restorations without changing anything")
+	restore := fs.Bool("restore", false, "settings: restore approved pre-existing settings")
 	verify := fs.Bool("verify", false, "backup-key: demonstrate recovery from the existing export")
 	dest := fs.String("dest", "", "backup: destination directory (default <state-dir>/backups)")
 	plaintext := fs.Bool("plaintext", false, "backup: explicitly write an unencrypted backup")
@@ -203,6 +211,12 @@ func run(args []string) int {
 		err = recordingsEnableCmd(ctx, backup.ExecRunner, *stateDir, *connection, u)
 	case "recordings-restore":
 		err = recordingsRestoreCmd(*stateDir, *file, *out, *identityFile, u)
+	case "settings":
+		if !*list && !*restore {
+			fmt.Fprintln(os.Stderr, "guacdeploy settings: pass --list or --restore")
+			return 2
+		}
+		err = settingsCmd(ctx, *stateDir, *restore, u)
 	case "renew-cert":
 		err = renewCertCmd(ctx, *stateDir, u)
 	case "cert-status":
@@ -217,7 +231,8 @@ func run(args []string) int {
 	switch {
 	case err == nil:
 		return 0
-	case errors.Is(err, session.ErrApprovalRequired), errors.Is(err, ui.ErrInputRequired):
+	case errors.Is(err, session.ErrApprovalRequired), errors.Is(err, ui.ErrInputRequired),
+		errors.Is(err, settings.ErrApprovalRequired):
 		fmt.Fprintf(os.Stderr, "guacdeploy: %v\n", err)
 		return 3
 	case errors.Is(err, context.Canceled):

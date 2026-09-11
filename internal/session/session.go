@@ -820,9 +820,17 @@ func (o *Options) entraSignin(ctx context.Context, st *state.State, u *ui.UI) er
 		})
 	}
 	for _, ch := range res.Changes {
+		// Two of the six changed fields live on the service principal, not
+		// the application. Naming the application's object ID for those
+		// would point the restore at the wrong object, so the field decides
+		// which object the target names.
+		target := "application/" + res.App.ObjectID + "/" + ch.Field
+		if strings.HasPrefix(ch.Field, "servicePrincipal.") {
+			target = "servicePrincipal/" + res.App.SPObjectID + "/" + ch.Field
+		}
 		st.Changes = append(st.Changes, state.SettingChange{
 			ID: state.NewID(), Provider: "entra",
-			Target:   "application/" + res.App.ObjectID + "/" + ch.Field,
+			Target:   target,
 			Original: ch.Original, Applied: ch.Applied,
 		})
 	}

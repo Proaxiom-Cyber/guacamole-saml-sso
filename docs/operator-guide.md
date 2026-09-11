@@ -416,3 +416,18 @@ between runs can take usage over the budget temporarily.
 `guacdeploy recordings-status` shows the last backup and cleanup result.
 `guacdeploy recordings-run` performs both immediately.
 `guacdeploy recordings-restore` recovers one recording from a backup.
+
+## Restoring changes to pre-existing settings
+
+When setup changes a setting on a resource it did not create, it records
+the original and the applied value before making the change.
+
+`guacdeploy settings --list` shows what is pending and changes nothing.
+Each entry is one of: restorable, drifted, unsupported, or unreadable.
+
+`guacdeploy settings --restore` restores the originals, but only after
+you approve each one and only when the current value still matches what
+this deployment applied. A setting that has drifted since — someone else
+changed it — is preserved exactly as it is, reported with both values,
+and never overwritten. Unattended runs never restore; they stop with exit
+code 3 and name what is waiting.
