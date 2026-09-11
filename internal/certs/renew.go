@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -124,7 +125,12 @@ func Renew(ctx context.Context, o Options) (Status, error) {
 	// which exits nonzero and puts it in front of the administrator.
 	rerr := reload(ctx, o)
 	s.Reloaded = rerr == nil
-	if rerr != nil {
+	if errors.Is(rerr, errNoReloadNeeded) {
+		// Expected during setup: the certificate is in place before the
+		// stack starts, which is the whole point of installing it first.
+		s.Reason += "; nginx was not running yet, so it will serve this certificate from its first start"
+		rerr = nil
+	} else if rerr != nil {
 		s.Error = rerr.Error()
 	}
 	if werr := WriteStatus(o.StateDir, s); werr != nil {
@@ -149,11 +155,35 @@ func reload(ctx context.Context, o Options) error {
 		"-f", filepath.Join(o.InstallDir, "compose.yaml"),
 		"exec", "-T", "nginx", "nginx", "-s", "reload"}
 	out, errOut, err := o.Run(ctx, "", "docker", args...)
-	if err != nil {
-		return fmt.Errorf("the new certificate is installed but nginx did not reload, so it is still serving the previous one: %v\n%s",
-			err, strings.TrimSpace(errOut+out))
+	if err == nil {
+		return nil
 	}
-	return nil
+	// A certificate can legitimately be issued before the stack starts:
+	// setup installs it first precisely so nginx serves the real one from
+	// its first start, and the tunnel never has to accept an unverified
+	// origin. There is nothing to reload then, and calling that a failure
+	// would fail the whole deployment over an expected condition. A reload
+	// failure while nginx IS running is a real problem, because the old
+	// certificate stays in use.
+	if !nginxRunning(ctx, o) {
+		return errNoReloadNeeded
+	}
+	return fmt.Errorf("the new certificate is installed but nginx did not reload, so it is still serving the previous one: %v\n%s",
+		err, strings.TrimSpace(errOut+out))
+}
+
+// errNoReloadNeeded reports that nginx was not running, so the freshly
+// installed certificate will simply be read when it starts.
+var errNoReloadNeeded = errors.New("nginx is not running yet, so it will read the new certificate when it starts")
+
+// nginxRunning reports whether the stack's nginx container is up.
+func nginxRunning(ctx context.Context, o Options) bool {
+	out, _, err := o.Run(ctx, "", "docker", "compose",
+		"--project-directory", o.InstallDir,
+		"--env-file", filepath.Join(o.InstallDir, ".env"),
+		"-f", filepath.Join(o.InstallDir, "compose.yaml"),
+		"ps", "--status", "running", "--format", "{{.Name}}", "nginx")
+	return err == nil && strings.TrimSpace(out) != ""
 }
 
 // Verify makes the check cloudflared makes: a TLS handshake with the origin,

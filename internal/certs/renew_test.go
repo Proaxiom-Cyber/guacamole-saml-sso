@@ -144,7 +144,14 @@ func TestRenewFailureKeepsTheInstalledCertificateAndFails(t *testing.T) {
 func TestRenewReportsAReloadFailureAndKeepsTheNewCertificate(t *testing.T) {
 	h := newHarness(t)
 	h.o.Now = fixedNow(time.Now())
-	h.o.Run = func(context.Context, string, string, ...string) (string, string, error) {
+	// nginx is running, so a failed reload means the old certificate keeps
+	// being served and must be reported.
+	h.o.Run = func(_ context.Context, _, _ string, args ...string) (string, string, error) {
+		for _, a := range args {
+			if a == "ps" {
+				return "guacamole-nginx-1\n", "", nil
+			}
+		}
 		return "", "no such service: nginx", errors.New("exit status 1")
 	}
 
@@ -270,5 +277,58 @@ func TestRenewRepairsAMismatchedPair(t *testing.T) {
 	}
 	if !strings.Contains(s.Reason, "do not match") {
 		t.Fatalf("the reason does not explain the repair: %q", s.Reason)
+	}
+}
+
+// TestIssuanceBeforeTheStackStartsIsNotAFailure pins the setup ordering.
+// The certificate is installed before the stack starts so nginx serves the
+// real one from its first start and the tunnel never has to accept an
+// unverified origin. There is nothing to reload at that point, and
+// treating the absent reload as a failure failed the whole deployment over
+// an expected condition — which is exactly what happened on the live host.
+func TestIssuanceBeforeTheStackStartsIsNotAFailure(t *testing.T) {
+	h := newHarness(t)
+	h.writeSelfSigned(t)
+	h.o.Now = fixedNow(time.Now())
+	// docker compose exec fails (nginx is not up) and ps reports nothing
+	// running, which is the state during initial setup.
+	h.o.Run = func(_ context.Context, _, _ string, args ...string) (string, string, error) {
+		for _, a := range args {
+			if a == "ps" {
+				return "", "", nil // no running nginx
+			}
+		}
+		return "", "service \"nginx\" is not running", errors.New("exit status 1")
+	}
+
+	s, err := Renew(context.Background(), h.o)
+	if err != nil {
+		t.Fatalf("issuing before the stack starts must succeed: %v", err)
+	}
+	if s.Result != ResultOK {
+		t.Fatalf("result = %q, want %q", s.Result, ResultOK)
+	}
+	if s.Error != "" {
+		t.Fatalf("an expected condition was recorded as an error: %q", s.Error)
+	}
+	if !strings.Contains(s.Reason, "not running yet") {
+		t.Fatalf("the reason does not explain why no reload happened: %q", s.Reason)
+	}
+
+	// But a reload failure while nginx IS running stays a real failure: the
+	// old certificate would keep being served.
+	h2 := newHarness(t)
+	h2.writeSelfSigned(t)
+	h2.o.Now = fixedNow(time.Now())
+	h2.o.Run = func(_ context.Context, _, _ string, args ...string) (string, string, error) {
+		for _, a := range args {
+			if a == "ps" {
+				return "guacamole-nginx-1\n", "", nil // it is running
+			}
+		}
+		return "", "reload refused", errors.New("exit status 1")
+	}
+	if _, err := Renew(context.Background(), h2.o); err == nil {
+		t.Fatal("a failed reload with nginx running must be reported")
 	}
 }
