@@ -61,6 +61,8 @@ func backupCmd(ctx context.Context, run backup.Runner, stateDir, dest string, pl
 		return err
 	}
 	u.Say("Backup published: %s", path)
+	u.Say("Completion manifest: %s (copy it with the backup; it holds no secrets)",
+		backup.ManifestPath(filepath.Split(path)))
 	if plaintext {
 		u.Say("This backup is NOT encrypted. You chose --plaintext; protect the file yourself.")
 	}

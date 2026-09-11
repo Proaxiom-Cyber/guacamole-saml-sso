@@ -4,13 +4,16 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/backup"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recoverykey"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/session"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
@@ -36,7 +39,8 @@ func fakeDocker(calls *[]recorded) func(ctx context.Context, stdin, name string,
 
 // seedDeployment writes a deployment record with a recorded backup public
 // key and the passphrase-encrypted private-key export, as backup-key would.
-func seedDeployment(t *testing.T, dir, passphrase string) {
+// It returns the deployment ID, which retention scopes itself to.
+func seedDeployment(t *testing.T, dir, passphrase string) string {
 	t.Helper()
 	id, err := recoverykey.Generate()
 	if err != nil {
@@ -55,6 +59,7 @@ func seedDeployment(t *testing.T, dir, passphrase string) {
 	if err := s.Save(st); err != nil {
 		t.Fatal(err)
 	}
+	return st.DeploymentID
 }
 
 func TestBackupRestoreCommandsRoundtrip(t *testing.T) {
@@ -151,6 +156,61 @@ func TestRestoreUnattendedNeedsYes(t *testing.T) {
 	}
 	if len(calls) != 2 {
 		t.Fatalf("consented restore commands = %d, want 2", len(calls))
+	}
+}
+
+// TestRestoreRefusesAManifestMismatch covers a backup that is internally
+// valid — right header, right version, intact completion marker — but is no
+// longer the file that was published under that name. Only the completion
+// manifest can tell, and restore must refuse before touching the database.
+func TestRestoreRefusesAManifestMismatch(t *testing.T) {
+	dir := t.TempDir()
+	seedDeployment(t, dir, "p")
+	var out bytes.Buffer
+	var bcalls []recorded
+	if err := backupCmd(context.Background(), fakeDocker(&bcalls), dir, "", true, &ui.UI{Out: &out}); err != nil {
+		t.Fatal(err)
+	}
+	matches, _ := filepath.Glob(filepath.Join(dir, "backups", "guacdeploy-db-*.sql"))
+	if len(matches) != 1 {
+		t.Fatalf("published backups = %v", matches)
+	}
+
+	// Replace the published file with a different, perfectly valid backup:
+	// a whole dump swapped in under a name that already has a manifest.
+	raw, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, _, _ := strings.Cut(string(raw), "\n")
+	body := head + "\n" + strings.Replace(cmdFakeDump, "guacamole_entity", "guacamole_other", 1)
+	swapped := body + fmt.Sprintf("-- guacdeploy dump complete sha256:%x\n", sha256.Sum256([]byte(body)))
+	if err := os.WriteFile(matches[0], []byte(swapped), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls []recorded
+	err = restoreCmd(context.Background(), fakeDocker(&calls), dir, matches[0], "", true, &ui.UI{Out: &out})
+	if err == nil {
+		t.Fatal("restore accepted a backup that does not match its manifest")
+	}
+	for _, want := range []string{"the database was not changed", "manifest"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	if len(calls) != 0 {
+		t.Fatalf("a refused restore issued %d database commands, want 0", len(calls))
+	}
+
+	// With no manifest at all the same file restores: an administrator may
+	// copy only the backup off the host, and a replacement host must still
+	// be able to use it.
+	if err := os.Remove(backup.ManifestPath(filepath.Split(matches[0]))); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreCmd(context.Background(), fakeDocker(&calls), dir, matches[0], "", true, &ui.UI{Out: &out}); err != nil {
+		t.Fatalf("a backup copied without its manifest was refused: %v", err)
 	}
 }
 

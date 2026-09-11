@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"filippo.io/age"
@@ -40,6 +42,9 @@ func restoreCmd(ctx context.Context, run backup.Runner, stateDir, file, identity
 		return fmt.Errorf("no deployment exists in %s; V1 restore targets the deployed stack on this host", stateDir)
 	}
 
+	if err := checkManifest(file); err != nil {
+		return fmt.Errorf("restore refused, the database was not changed: %w", err)
+	}
 	raw, err := os.ReadFile(file)
 	if err != nil {
 		return err
@@ -82,6 +87,30 @@ func restoreCmd(ctx context.Context, run backup.Runner, stateDir, file, identity
 	u.Say("Restore complete from %s.", file)
 	u.Say("Restart the stack so Guacamole reconnects cleanly:")
 	u.Say("  docker compose --project-directory %s restart", installDirFrom(st))
+	return nil
+}
+
+// checkManifest verifies a backup against the completion manifest published
+// beside it, when there is one. A mismatch means the file is truncated,
+// corrupt, or not the file the manifest describes, and restore refuses
+// before touching the database.
+//
+// A missing manifest is not an error: an administrator copying a backup off
+// the host (which the specification tells them to do) may bring only the
+// backup file, and a replacement host must still be able to restore it. The
+// completion marker inside the backup still proves the dump is whole.
+//
+// Ownership is deliberately not checked. A replacement host has its own
+// deployment ID, and refusing to restore another deployment's backup would
+// break exactly the recovery case this command exists for.
+func checkManifest(file string) error {
+	dir, name := filepath.Split(file)
+	if _, err := backup.ReadManifest(dir, name); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if _, err := backup.VerifyPublished(dir, name, ""); err != nil {
+		return fmt.Errorf("the backup does not match its completion manifest (%s): %w", backup.ManifestPath(dir, name), err)
+	}
 	return nil
 }
 

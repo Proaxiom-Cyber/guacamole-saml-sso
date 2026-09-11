@@ -137,18 +137,31 @@ DIR` for another directory, such as a mounted share. That directory must
 already exist. A missing directory or mount fails visibly; the tool never
 redirects the backup to another place.
 
-A backup is written as a hidden `.partial-` file first and renamed to
+A backup is written as a hidden `.partial-` file first and published as
 `guacdeploy-db-<timestamp>.sql.age` (or `.sql`) only after a complete
 export. A failed run leaves only the `.partial-` file and never touches
 earlier backups. On success the command prints the published path; on
 failure it prints that the backup was not published.
 
+Each backup gets a completion manifest beside it,
+`<backup name>.manifest.json`. It records the format version, the
+deployment ID, the file name, the byte length, and a SHA-256 of the
+published file. It holds no secrets and no database content. Copy it with
+the backup. The manifest is what lets the scheduled backup prove a file
+is complete without the recovery key.
+
+The manifest is written after the backup file, never before. If the host
+stops between the two steps, the backup stays on the share and retention
+preserves it, but does not count it.
+
 `guacdeploy restore --file PATH` replaces the whole database with a
-backup. It first validates the file completely: decryption, the format
-and Guacamole version in the header, and the completion marker that
-proves the dump is not truncated. A file that fails validation causes no
-database change. For an encrypted backup, the command asks for the
-recovery passphrase and decrypts the key export at
+backup. It first validates the file completely: the completion manifest
+when one is beside the file, then decryption, the format and Guacamole
+version in the header, and the completion marker that proves the dump is
+not truncated. A file that fails validation causes no database change. A
+backup copied without its manifest still restores. For an encrypted
+backup, the command asks for the recovery passphrase and decrypts the key
+export at
 `/var/lib/guacdeploy/recovery/backup-key.age`; `--identity-file PATH`
 accepts a standard age identity file instead, for automation. Protect
 such a file with owner-only permissions and remove it after use.
@@ -195,11 +208,20 @@ journalctl -u guacdeploy-backup.service
 Retention runs only after a backup is published. A failed backup deletes
 nothing. Earlier successful backups always stay.
 
-Retention counts only complete backups. It ignores a `.partial-` file from
-a failed export. For a plaintext backup it also checks the header and the
-completion marker. It never deletes a file it does not recognise as a
-backup from this tool, so other files in the destination directory are
-safe.
+Retention counts only complete backups of this deployment. For each file
+it reads the completion manifest, then measures and re-hashes the file
+against it. A truncated, damaged, or replaced file does not match and is
+not counted. This needs no recovery key, so the scheduled backup can
+check an encrypted file it cannot decrypt.
+
+Retention deletes only files that pass this check, with their manifests.
+Everything else stays: a `.partial-` file from a failed export, a backup
+that another deployment wrote into the same share, a backup with no
+manifest, and any unrelated file.
+
+Retention keeps the newest backups by the time in the name. Where two
+backups share a timestamp, the one with the higher `-N` suffix is the
+newer, because the tool only uses `-2` after `-1` is taken.
 
 Retention always keeps at least one backup. A retention count of zero is
 refused.
@@ -218,12 +240,34 @@ credentials.
 
 ### Destinations on a mounted share
 
-Give `--dest` a directory on the share. The directory must exist.
+Give `--dest` a directory on the share. The directory must exist. It can
+be the mount point or any subfolder inside it, such as
+`/mnt/backups/guacamole`.
 
-If the share is a mount point, also use `--require-mount`. The tool then
-fails when the share is not mounted. Without this option, a directory that
+Add `--require-mount` for a destination on a share. The first checked run
+approves what it finds: it records the mount point the destination sits
+inside, in `/var/lib/guacdeploy/backup-mount.json`, and writes a marker
+file, `.guacdeploy-backup-mount`, on the share. The record and the marker
+hold no secrets. A destination on the same filesystem as
+`/var/lib/guacdeploy` is refused, because that is local storage, not a
+share.
+
+Every later run compares against the record. The run fails, and exports
+nothing, when the destination is no longer inside the approved mount, or
+when the marker on the share is missing or different. Both mean the
+expected share is not mounted. Without this option, a directory that
 exists but holds no mount accepts the backup into local storage, which
 fills the system disk and gives no warning.
+
+To approve a replacement share, delete
+`/var/lib/guacdeploy/backup-mount.json`. The next run records the new
+share.
+
+The tool publishes a backup with a hard link where the filesystem
+supports one. Many SMB/CIFS shares do not. On those it reserves the
+published name, then copies the file into it. Both ways refuse to
+overwrite an existing backup, and both keep the `.partial-` export if
+publication fails.
 
 ## State
 

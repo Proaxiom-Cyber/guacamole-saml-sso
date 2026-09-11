@@ -35,6 +35,11 @@ func backupRunCmd(ctx context.Context, run backup.Runner, o schedule.Options, u 
 	if st == nil {
 		return fmt.Errorf("no deployment exists in %s; there is nothing to back up", o.StateDir)
 	}
+	// Retention is scoped to this deployment's own backups, so it needs the
+	// ID. It comes from the deployment record rather than the unit's command
+	// line: the record is authoritative, and a shared destination may hold
+	// another deployment's backups, which must never be expired here.
+	o.DeploymentID = st.DeploymentID
 
 	s, err := schedule.RunBackup(ctx, o, func(ctx context.Context) (string, error) {
 		return backup.Backup(ctx, backup.Options{

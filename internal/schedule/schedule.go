@@ -64,7 +64,7 @@ type Options struct {
 	OnCalendar   string // systemd calendar expression, default "daily"
 	Keep         int    // successful backups to retain, default 7
 	Plaintext    bool   // explicit choice; encryption is the default
-	RequireMount bool   // destination must be a real mount point
+	RequireMount bool   // destination must be on an approved mounted share
 
 	UnitDir    string // default /etc/systemd/system
 	RuntimeDir string // deployment-owned; default /usr/local/lib/guacdeploy
