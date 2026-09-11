@@ -58,8 +58,10 @@ func Phases(opts *Options) []Phase {
 		{Name: "host-dependencies", Run: opts.hostDependencies},
 		{Name: "stack-configure", Run: opts.stackConfigure},
 		{Name: "cloudflare-select", Run: opts.cloudflareSelect},
+		// The tunnel is created and its ingress configured here, but no
+		// connector runs and no DNS points at it yet, so nothing is
+		// reachable from the internet.
 		{Name: "cloudflare-tunnel", Run: opts.cloudflareTunnel},
-		{Name: "cloudflare-dns", Run: opts.cloudflareDNS},
 		// Rendering is idempotent and also repairs configuration written by
 		// an earlier version, so it re-runs on every resume.
 		{Name: "stack-render", Run: opts.stackRender, Always: true},
@@ -69,11 +71,20 @@ func Phases(opts *Options) []Phase {
 		// version gets repaired instead of skipped for ever.
 		{Name: "stack-schema", Run: opts.stackSchema, Always: true},
 		{Name: "stack-up", Run: opts.stackUp},
+		// Health is checked against the local origin before anything is
+		// published, so a failure later never leaves an exposed service.
+		{Name: "stack-health", Run: opts.stackHealth},
 		{Name: "entra-signin", Run: opts.entraSignin},
 		// Access must follow entra-signin: its allow-list is built from the
 		// tenant and group object IDs that phase produces.
 		{Name: "cloudflare-access", Run: opts.cloudflareAccess},
-		{Name: "stack-health", Run: opts.stackHealth},
+		// Only now is the deployment published: the DNS record is created
+		// and the connector started. Everything that protects the service
+		// -- SAML sign-in and a verified Access policy -- already exists,
+		// so a failure in an earlier phase can never leave a reachable
+		// origin without protection.
+		{Name: "cloudflare-dns", Run: opts.cloudflareDNS},
+		{Name: "cloudflare-connect", Run: opts.cloudflareConnect},
 	}
 }
 
@@ -204,7 +215,7 @@ func (o *Options) stackSecrets(st *state.State, u *ui.UI) (password, tunnelToken
 	// The connector token is fetched at start time and delivered through
 	// the in-memory Compose override. It never reaches state, .env, logs or
 	// command arguments, and a rotated token needs no local change.
-	if id := st.Config["cloudflare-tunnel-id"]; id != "" {
+	if id := st.Config["cloudflare-tunnel-id"]; id != "" && strings.Contains(st.Config["compose-profiles"], "cloudflare") {
 		tunnelToken, err = o.provisioner(st, u).TunnelToken(context.Background(), id)
 		if err != nil {
 			return "", "", fmt.Errorf("fetching the Cloudflare tunnel connector token failed: %w", err)
@@ -917,8 +928,6 @@ func (o *Options) cloudflareSelect(ctx context.Context, st *state.State, u *ui.U
 	st.Config["cloudflare-account-name"] = z.Account.Name
 	st.Config["cloudflare-zone-id"] = z.ID
 	st.Config["cloudflare-zone-name"] = z.Name
-	// Rendered into .env so stack-up starts the cloudflared connector.
-	st.Config["compose-profiles"] = "cloudflare"
 	u.Say("Cloudflare account %q, zone %q selected. The zone itself is pre-existing and is never removed by teardown.", z.Account.Name, z.Name)
 	return nil
 }
@@ -1057,4 +1066,35 @@ func splitList(s string) []string {
 		parts[i] = strings.TrimSpace(parts[i])
 	}
 	return parts
+}
+
+// cloudflareConnect publishes the deployment: it enables the cloudflared
+// profile and restarts the stack so the connector dials out.
+//
+// This is deliberately the last phase. Until it runs, no connector is
+// running and no DNS record exists, so a failure in sign-in or Access
+// leaves the origin unreachable from the internet rather than reachable
+// and unprotected.
+func (o *Options) cloudflareConnect(ctx context.Context, st *state.State, u *ui.UI) error {
+	if st.Config["cloudflare-access-app-id"] == "" {
+		return errors.New("refusing to start the Cloudflare connector: no verified Access application protects this hostname")
+	}
+	st.Config["compose-profiles"] = "cloudflare"
+	cfg := o.stackConfig(st)
+	if err := stack.Render(cfg); err != nil {
+		return err
+	}
+	password, token, err := o.stackSecrets(st, u)
+	if err != nil {
+		return err
+	}
+	if token == "" {
+		return errors.New("refusing to start the Cloudflare connector without a tunnel connector token")
+	}
+	u.Say("Starting the Cloudflare connector; the deployment becomes reachable at https://%s/ behind Access.", st.Config["guac-hostname"])
+	if err := stack.Up(ctx, o.stackRun(), cfg, password, token); err != nil {
+		return err
+	}
+	u.Say("Deployment published. Sign-in goes through Cloudflare Access, then Entra.")
+	return nil
 }

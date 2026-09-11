@@ -462,7 +462,7 @@ func TestStackPhasesFullPipelineUnattended(t *testing.T) {
 	// Sign-in provisioning has its own tests; this one covers the local stack.
 	opts.Phases = withoutPhases(Phases(&opts),
 		"cloudflare-select", "cloudflare-tunnel", "cloudflare-dns",
-		"entra-signin", "cloudflare-access")
+		"cloudflare-connect", "entra-signin", "cloudflare-access")
 	if err := Run(context.Background(), opts); err != nil {
 		t.Fatalf("full pipeline: %v\n%s", err, out.String())
 	}
@@ -766,5 +766,91 @@ func TestAccessAllowListNeverEmpty(t *testing.T) {
 	}
 	if got := splitList("   "); got != nil {
 		t.Fatalf("blank list must be nil, got %v", got)
+	}
+}
+
+// TestNoPublicConnectorWhenProtectionIsIncomplete is the exposure guard.
+// Publishing DNS or starting the cloudflared connector before SAML sign-in
+// and a verified Access policy exist would leave a reachable Guacamole
+// origin with nothing in front of it. The phase order must make that
+// impossible, and a failure in sign-in or Access must stop before
+// publication.
+func TestNoPublicConnectorWhenProtectionIsIncomplete(t *testing.T) {
+	order := []string{}
+	for _, p := range Phases(&Options{}) {
+		order = append(order, p.Name)
+	}
+	idx := func(name string) int {
+		for i, n := range order {
+			if n == name {
+				return i
+			}
+		}
+		t.Fatalf("phase %q missing from the registry: %v", name, order)
+		return -1
+	}
+	// Everything that protects the service must come before publication.
+	for _, protector := range []string{"entra-signin", "cloudflare-access"} {
+		for _, publisher := range []string{"cloudflare-dns", "cloudflare-connect"} {
+			if idx(protector) > idx(publisher) {
+				t.Fatalf("%s runs after %s: a failure would leave an unprotected origin reachable", protector, publisher)
+			}
+		}
+	}
+
+	// A failure in sign-in must stop before any publication phase runs.
+	dir := t.TempDir()
+	ran := map[string]bool{}
+	var phases []Phase
+	for _, p := range Phases(&Options{}) {
+		name := p.Name
+		switch name {
+		case "entra-signin":
+			phases = append(phases, Phase{Name: name, Run: func(context.Context, *state.State, *ui.UI) error {
+				ran[name] = true
+				return errors.New("no Graph token")
+			}})
+		case "cloudflare-dns", "cloudflare-connect":
+			phases = append(phases, Phase{Name: name, Run: func(context.Context, *state.State, *ui.UI) error {
+				ran[name] = true
+				return nil
+			}})
+		default:
+			phases = append(phases, Phase{Name: name, Run: func(context.Context, *state.State, *ui.UI) error {
+				ran[name] = true
+				return nil
+			}})
+		}
+	}
+	u, _ := testUI(false, "")
+	if err := Run(context.Background(), Options{StateDir: dir, UI: u, Phases: phases}); err == nil {
+		t.Fatal("sign-in failure should stop the session")
+	}
+	if !ran["entra-signin"] {
+		t.Fatal("the sign-in phase never ran")
+	}
+	if ran["cloudflare-dns"] || ran["cloudflare-connect"] {
+		t.Fatal("the deployment was published despite sign-in failing")
+	}
+	st, _ := state.Read(dir)
+	if strings.Contains(st.Config["compose-profiles"], "cloudflare") {
+		t.Fatal("the cloudflared connector profile was enabled despite sign-in failing")
+	}
+}
+
+// TestConnectorRefusesWithoutVerifiedAccess guards the same rule at the
+// phase itself, not just at the ordering: even if the phase were reached
+// out of order, it must refuse to publish without a verified Access
+// application.
+func TestConnectorRefusesWithoutVerifiedAccess(t *testing.T) {
+	o := &Options{}
+	st := &state.State{Config: map[string]string{"guac-hostname": "guac.example.test"}}
+	u, _ := testUI(false, "")
+	err := o.cloudflareConnect(context.Background(), st, u)
+	if err == nil || !strings.Contains(err.Error(), "Access application") {
+		t.Fatalf("want refusal naming the missing Access application, got %v", err)
+	}
+	if strings.Contains(st.Config["compose-profiles"], "cloudflare") {
+		t.Fatal("the connector profile was enabled by a refused publication")
 	}
 }

@@ -331,3 +331,10 @@ identity provider is bound to the same tenant; otherwise it falls back to
 `--access-emails`. It never publishes an application that allows
 everyone. Once Access is on, the public hostname answers with the Access
 challenge, so setup checks health against the local origin instead.
+
+**The deployment is published last.** The tunnel is created early, but no
+connector runs and no DNS record exists until sign-in is configured and
+the Access policy is verified. If any earlier phase fails, the service
+stays unreachable from the internet rather than reachable without
+protection. The connector refuses to start at all unless a verified
+Access application already covers the hostname.
