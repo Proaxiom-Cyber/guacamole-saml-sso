@@ -210,6 +210,20 @@ func (s *Store) Save(st *State) error {
 	return nil
 }
 
+// EnsureResource appends a resource unless an entry with the same provider,
+// type, and name already exists, so re-run phases never double-record.
+func (s *State) EnsureResource(r Resource) {
+	for _, e := range s.Resources {
+		if e.Provider == r.Provider && e.Type == r.Type && e.Name == r.Name {
+			return
+		}
+	}
+	if r.ID == "" {
+		r.ID = NewID()
+	}
+	s.Resources = append(s.Resources, r)
+}
+
 // Read loads state without taking the mutation lock, for read-only display.
 func Read(dir string) (*State, error) {
 	s := &Store{dir: dir}

@@ -102,6 +102,33 @@ func (u *UI) Choose(prompt string, choices []Choice) (rune, error) {
 	}
 }
 
+// Line reads one non-secret line, offering a default. Empty input takes the
+// default; with no default it re-asks.
+func (u *UI) Line(prompt, def string) (string, error) {
+	if !u.Interactive {
+		return "", fmt.Errorf("%w: %s", ErrInputRequired, prompt)
+	}
+	for {
+		if def != "" {
+			fmt.Fprintf(u.Out, "%s [%s]: ", prompt, def)
+		} else {
+			fmt.Fprintf(u.Out, "%s: ", prompt)
+		}
+		line, err := u.In.ReadString('\n')
+		if err != nil {
+			return "", err
+		}
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return line, nil
+		}
+		if def != "" {
+			return def, nil
+		}
+		u.Say("A value is required.")
+	}
+}
+
 // Confirm asks a yes/no question.
 func (u *UI) Confirm(prompt string) (bool, error) {
 	k, err := u.Choose(prompt, []Choice{{'y', "Yes"}, {'n', "No"}})

@@ -16,6 +16,7 @@ import (
 
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/creds"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/host"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/stack"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/ui"
 )
@@ -41,7 +42,155 @@ func Phases(opts *Options) []Phase {
 		{Name: "credential-mode", Run: opts.credentialMode},
 		{Name: "credential-check", Run: opts.credentialCheck},
 		{Name: "host-dependencies", Run: opts.hostDependencies},
+		{Name: "stack-configure", Run: opts.stackConfigure},
+		{Name: "stack-render", Run: opts.stackRender},
+		{Name: "stack-schema", Run: opts.stackSchema},
+		{Name: "stack-up", Run: opts.stackUp},
+		{Name: "stack-health", Run: opts.stackHealth},
 	}
+}
+
+func (o *Options) installDir() string {
+	if o.InstallDir != "" {
+		return o.InstallDir
+	}
+	return "/opt/guacamole"
+}
+
+func (o *Options) stackRun() stack.Runner {
+	if o.StackRun != nil {
+		return o.StackRun
+	}
+	return stack.ExecRunner
+}
+
+func (o *Options) stackConfig(st *state.State) stack.Config {
+	return stack.Config{
+		InstallDir:      o.installDir(),
+		Hostname:        st.Config["guac-hostname"],
+		AdminGroup:      st.Config["admin-group"],
+		OperatorGroup:   st.Config["operator-group"],
+		SAMLMetadataURL: st.Config["saml-metadata-url"],
+		ComposeProfiles: st.Config["compose-profiles"],
+	}
+}
+
+func (o *Options) stackConfigure(ctx context.Context, st *state.State, u *ui.UI) error {
+	if st.Config == nil {
+		st.Config = map[string]string{}
+	}
+	items := []struct {
+		key, flag, prompt, def string
+	}{
+		{"guac-hostname", o.Hostname, "Public hostname for this deployment (for example guac.example.com)", ""},
+		{"admin-group", o.AdminGroup, "Identity-provider group for administrators", "Guacamole Administrators"},
+		{"operator-group", o.OperatorGroup, "Identity-provider group for operators", "Guacamole Operators"},
+	}
+	for _, it := range items {
+		v := st.Config[it.key]
+		if v == "" {
+			v = it.flag
+		}
+		if v == "" {
+			if !u.Interactive {
+				return errors.New("unattended setup needs explicit configuration: pass --hostname, --admin-group, and --operator-group")
+			}
+			var err error
+			v, err = u.Line(it.prompt, it.def)
+			if err != nil {
+				return err
+			}
+		}
+		if strings.ContainsAny(v, " /") || v == "" {
+			return fmt.Errorf("%s %q is not valid: use a bare DNS name or group name without spaces or slashes", it.key, v)
+		}
+		st.Config[it.key] = v
+	}
+	u.Say("Configuration: hostname %s, administrator group %q, operator group %q.",
+		st.Config["guac-hostname"], st.Config["admin-group"], st.Config["operator-group"])
+	return nil
+}
+
+func (o *Options) stackRender(ctx context.Context, st *state.State, u *ui.UI) error {
+	cfg := o.stackConfig(st)
+	if err := stack.Render(cfg); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	st.EnsureResource(state.Resource{
+		Provider: "host", Type: "config-directory", Name: cfg.InstallDir,
+		Ownership: "rendered by this deployment", CreatedAt: now,
+	})
+	st.EnsureResource(state.Resource{
+		// Data survives ordinary teardown; permanent deletion needs
+		// explicit intent (spec: teardown contract).
+		Provider: "host", Type: "data-directory", Name: filepath.Join(cfg.InstallDir, "data"),
+		Ownership: "created by this deployment; preserved by default at teardown", CreatedAt: now,
+	})
+	u.Say("Stack configuration rendered under %s (a temporary self-signed certificate serves until the origin certificate is issued).", cfg.InstallDir)
+	return nil
+}
+
+func (o *Options) stackSchema(ctx context.Context, st *state.State, u *ui.UI) error {
+	if err := stack.GenerateSchema(ctx, o.stackRun(), o.stackConfig(st)); err != nil {
+		return err
+	}
+	u.Say("Database schema generated from guacamole/guacamole:%s and validated.", stack.GuacVersion)
+	return nil
+}
+
+// stackSecrets resolves the credentials the stack needs at start time.
+func (o *Options) stackSecrets(st *state.State, u *ui.UI) (password, tunnelToken string, err error) {
+	m := o.manager(st, u)
+	for _, s := range o.credSpecs() {
+		switch s.Name {
+		case "postgres-password":
+			if password, err = m.Get(s); err != nil {
+				return "", "", err
+			}
+		}
+	}
+	// Tunnel token arrives with the Cloudflare slice; empty until then.
+	return password, "", nil
+}
+
+func (o *Options) stackUp(ctx context.Context, st *state.State, u *ui.UI) error {
+	password, token, err := o.stackSecrets(st, u)
+	if err != nil {
+		return err
+	}
+	cfg := o.stackConfig(st)
+	u.Say("Starting the Guacamole stack (guacd, PostgreSQL, Guacamole, nginx) and waiting for container health.")
+	if err := stack.Up(ctx, o.stackRun(), cfg, password, token); err != nil {
+		return err
+	}
+	names, err := stack.Containers(ctx, o.stackRun(), cfg, password, token)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	for _, n := range names {
+		st.EnsureResource(state.Resource{
+			Provider: "docker", Type: "container", Name: n,
+			Ownership: "created by this deployment", CreatedAt: now,
+		})
+	}
+	u.Say("Containers healthy: %s.", strings.Join(names, ", "))
+	return nil
+}
+
+func (o *Options) stackHealth(ctx context.Context, st *state.State, u *ui.UI) error {
+	cfg := o.stackConfig(st)
+	if o.ProbeCheck != nil {
+		if err := o.ProbeCheck(ctx, cfg); err != nil {
+			return err
+		}
+	} else if err := (stack.Probe{}).Check(ctx, cfg); err != nil {
+		return err
+	}
+	u.Say("Guacamole answers through nginx: https://%s/ (representative local connection checked).", cfg.Hostname)
+	u.Say("Sign-in requires the identity-provider configuration from the Entra slice; local containers restart automatically with Docker after reboot.")
+	return nil
 }
 
 func (o *Options) credentialMode(ctx context.Context, st *state.State, u *ui.UI) error {
@@ -106,15 +255,24 @@ func (o *Options) credSpecs() []creds.Spec {
 
 func (o *Options) credentialCheck(ctx context.Context, st *state.State, u *ui.UI) error {
 	m := o.manager(st, u)
-	missing := m.Missing(o.credSpecs())
-	if m.Mode == creds.ModeFile && u.Interactive && len(missing) > 0 {
+	if m.Mode == creds.ModeFile {
 		for _, s := range o.credSpecs() {
 			if _, err := os.Stat(filepath.Join(m.Dir, s.Name)); err == nil {
 				continue
 			}
-			v, err := u.SecretReader()(fmt.Sprintf("Enter %s (%s)", s.Name, s.Purpose))
-			if err != nil {
-				return err
+			var v string
+			switch {
+			case s.Generate:
+				v = creds.NewSecret()
+				u.Say("Generated %s in memory and storing it in the approved credential directory.", s.Name)
+			case u.Interactive:
+				var err error
+				v, err = u.SecretReader()(fmt.Sprintf("Enter %s (%s)", s.Name, s.Purpose))
+				if err != nil {
+					return err
+				}
+			default:
+				continue // reported by Missing below with instructions
 			}
 			createdDir, err := m.StoreFile(s, v)
 			if err != nil {
@@ -132,8 +290,8 @@ func (o *Options) credentialCheck(ctx context.Context, st *state.State, u *ui.UI
 				Ownership: "written by this deployment", CreatedAt: now,
 			})
 		}
-		missing = m.Missing(o.credSpecs())
 	}
+	missing := m.Missing(o.credSpecs())
 	if len(missing) > 0 {
 		return fmt.Errorf("credentials are not available yet:\n  %s\nSupply them and resume", strings.Join(missing, "\n  "))
 	}
@@ -230,8 +388,14 @@ type Options struct {
 	Resume              bool   // unattended only: explicit consent to continue interrupted work
 	InstallDependencies bool   // unattended only: explicit consent to install missing dependencies
 	CredentialMode      string // explicit credential mode; guided asks when empty
+	Hostname            string // explicit configuration; guided asks when empty
+	AdminGroup          string
+	OperatorGroup       string
+	InstallDir          string // default /opt/guacamole
 	CredSpecs           []creds.Spec
 	Host                *host.Probes
+	StackRun            stack.Runner                              // injectable for tests
+	ProbeCheck          func(context.Context, stack.Config) error // injectable for tests
 	Phases              []Phase
 }
 

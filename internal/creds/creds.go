@@ -6,6 +6,8 @@
 package creds
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -28,6 +30,11 @@ var Modes = []string{ModePrompt, ModeEnv, ModeFile}
 type Spec struct {
 	Name    string // kebab-case identifier, also the file name in file mode
 	Purpose string
+	// Generate marks a machine credential the tool can create itself. In
+	// file mode a missing value is generated and stored instead of asked
+	// for. In env and prompt modes the administrator supplies it, because
+	// those modes give the tool nowhere durable to keep a generated value.
+	Generate bool
 }
 
 // EnvVar is where env mode reads a spec from.
@@ -35,9 +42,19 @@ func (s Spec) EnvVar() string {
 	return "GUACDEPLOY_CRED_" + strings.ToUpper(strings.ReplaceAll(s.Name, "-", "_"))
 }
 
-// Required is the V1 registry of administrator-supplied credentials.
+// Required is the V1 registry of deployment credentials.
 var Required = []Spec{
 	{Name: "cloudflare-api-token", Purpose: "Cloudflare Tunnel, DNS and Access configuration"},
+	{Name: "postgres-password", Purpose: "local PostgreSQL database used by Guacamole", Generate: true},
+}
+
+// NewSecret returns a generated 256-bit hex secret for Generate specs.
+func NewSecret() string {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(err) // crypto/rand failure is not recoverable
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // Manager resolves credential values for one selected mode.
@@ -68,7 +85,7 @@ func (m *Manager) Missing(specs []Spec) []string {
 				out = append(out, fmt.Sprintf("%s: set environment variable %s", s.Name, s.EnvVar()))
 			}
 		case ModeFile:
-			if _, err := os.Stat(m.path(s)); err != nil {
+			if _, err := os.Stat(m.path(s)); err != nil && !s.Generate {
 				out = append(out, fmt.Sprintf("%s: place the value in %s (owner-only permissions)", s.Name, m.path(s)))
 			}
 		}

@@ -60,6 +60,22 @@ service) and asks before installing. Unattended runs need
 are recorded as changes made by this deployment. Docker that was already
 present is pre-existing and is never offered for removal at teardown.
 
+## The Guacamole stack
+
+Setup renders the container configuration under `/opt/guacamole` and starts
+four containers: guacd, PostgreSQL, the Guacamole web application, and
+nginx. The database schema is generated from the pinned Guacamole image and
+validated before use. nginx serves HTTPS with a temporary self-signed
+certificate until the origin certificate is issued. Setup checks container
+health and then checks that Guacamole answers through nginx.
+
+Unattended runs supply `--hostname`, `--admin-group`, and
+`--operator-group`. The database password travels to Compose through an
+in-memory override, never through a rendered file or a command argument.
+Containers restart automatically with Docker after a reboot. The database
+data directory is recorded as data to preserve: ordinary teardown keeps it,
+and only an explicit deletion request removes it.
+
 ## Credentials
 
 Setup asks how the deployment receives credentials and shows the choice:

@@ -37,6 +37,9 @@ Flags for setup:
   --resume                 Non-interactive only: consent to continue interrupted work
   --install-dependencies   Non-interactive only: consent to install missing dependencies
   --credentials MODE       Credential mode: prompt, env, or file
+  --hostname NAME          Public hostname for the deployment
+  --admin-group NAME       Identity-provider group for administrators
+  --operator-group NAME    Identity-provider group for operators
   --state-dir DIR          Override the state directory (default ` + "/var/lib/guacdeploy" + `)
 `
 
@@ -53,6 +56,9 @@ func run(args []string) int {
 	resume := fs.Bool("resume", false, "non-interactive: continue interrupted work")
 	installDeps := fs.Bool("install-dependencies", false, "non-interactive: consent to install missing dependencies")
 	credMode := fs.String("credentials", "", "credential mode: prompt, env, or file")
+	hostname := fs.String("hostname", "", "public hostname for the deployment")
+	adminGroup := fs.String("admin-group", "", "identity-provider group for administrators")
+	operatorGroup := fs.String("operator-group", "", "identity-provider group for operators")
 	verify := fs.Bool("verify", false, "backup-key: demonstrate recovery from the existing export")
 	stateDir := fs.String("state-dir", state.DefaultDir(), "state directory")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
@@ -78,7 +84,11 @@ func run(args []string) int {
 	var err error
 	switch cmd {
 	case "setup":
-		opts := session.Options{StateDir: *stateDir, UI: u, Resume: *resume, InstallDependencies: *installDeps, CredentialMode: *credMode}
+		opts := session.Options{
+			StateDir: *stateDir, UI: u, Resume: *resume,
+			InstallDependencies: *installDeps, CredentialMode: *credMode,
+			Hostname: *hostname, AdminGroup: *adminGroup, OperatorGroup: *operatorGroup,
+		}
 		if s := os.Getenv("GUACDEPLOY_TEST_SLEEP_PHASE"); s != "" {
 			// Test hook: replace the registry with a slow phase so session
 			// interruption is testable end to end on any development host.
