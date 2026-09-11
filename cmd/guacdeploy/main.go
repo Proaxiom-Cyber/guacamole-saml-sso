@@ -29,6 +29,7 @@ const usage = `Usage: guacdeploy [command] [flags]
 Commands:
   setup    Start or resume the deployment (default)
   status   Show the deployment record
+  backup-key  Generate the backup recovery key (guided only); --verify demonstrates recovery
   version  Print the tool version
 
 Flags for setup:
@@ -52,6 +53,7 @@ func run(args []string) int {
 	resume := fs.Bool("resume", false, "non-interactive: continue interrupted work")
 	installDeps := fs.Bool("install-dependencies", false, "non-interactive: consent to install missing dependencies")
 	credMode := fs.String("credentials", "", "credential mode: prompt, env, or file")
+	verify := fs.Bool("verify", false, "backup-key: demonstrate recovery from the existing export")
 	stateDir := fs.String("state-dir", state.DefaultDir(), "state directory")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	if err := fs.Parse(args); err != nil {
@@ -97,6 +99,8 @@ func run(args []string) int {
 		err = session.Run(ctx, opts)
 	case "status":
 		err = session.Status(*stateDir, u)
+	case "backup-key":
+		err = backupKey(*stateDir, *verify, u)
 	case "version":
 		u.Say("guacdeploy %s", version)
 	default:
