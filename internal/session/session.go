@@ -1536,6 +1536,9 @@ func (o *Options) backupSchedule(ctx context.Context, st *state.State, u *ui.UI)
 // upload failed, and that such a deletion can permanently lose a
 // recording, so setup says that plainly rather than burying it.
 func (o *Options) recordingSchedule(ctx context.Context, st *state.State, u *ui.UI) error {
+	if st.Config == nil {
+		st.Config = map[string]string{}
+	}
 	// Same rule as the backup schedule: a repeat run without the flag keeps
 	// the budget the operator already chose.
 	o.RecordingBudget = firstNonEmpty(o.RecordingBudget, st.Config["recording-budget"])

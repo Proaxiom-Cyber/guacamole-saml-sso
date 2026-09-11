@@ -1949,3 +1949,13 @@ func TestRepeatSetupKeepsTheApprovedBackupProtections(t *testing.T) {
 		t.Fatalf("the approved booleans were not recorded back: %+v", st.Config)
 	}
 }
+
+// The phase records the budget, and a deployment record with no config map at
+// all must not panic on the way there.
+func TestRecordingScheduleSurvivesAnEmptyRecord(t *testing.T) {
+	u, _ := testUI(false, "")
+	o := &Options{StateDir: t.TempDir()}
+	if err := o.recordingSchedule(context.Background(), &state.State{DeploymentID: "d1"}, u); err != nil {
+		t.Fatal(err)
+	}
+}
