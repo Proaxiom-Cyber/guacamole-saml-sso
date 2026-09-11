@@ -457,3 +457,34 @@ simply restart itself. `guacdeploy stack-start` repopulates the files and
 starts the stack, and the boot unit installed with a persistent
 credential mode calls it. A deployment using prompt-mode credentials
 cannot start unattended, and the command says so instead of waiting.
+
+## Teardown
+
+`guacdeploy teardown` shows every resource this deployment created, with
+its dependencies, and removes them only after you approve. Unattended
+runs need `--yes`, and anything ambiguous still stops.
+
+Only resources this deployment created are ever offered. Each provider
+re-checks its ownership marker at the moment of deletion, so a resource
+that lost the marker, or never had it, is reported as retained rather
+than removed — and the run is not reported as complete.
+
+The order matters and is fixed: the boot unit stops first, so nothing can
+restart the stack mid-teardown; then the connector, the DNS record, the
+Access application and the tunnel; then the Entra application and groups;
+then the host timers and the deployment-owned binary copy; then the
+containers, their runtime credential files, and the rendered
+configuration.
+
+Changed pre-existing settings are restored first, because restoring a
+field needs the object that carries it to still exist. A setting that has
+drifted since is preserved and reported.
+
+**Data, recordings and backups are kept.** Ordinary teardown never
+deletes them, and neither remote backups nor the storage holding them are
+touched. `--delete-data` removes them, and only after the plan has shown
+exactly what would go.
+
+Anything that could not be removed is listed at the end and stays in the
+record, so a later run can try again. Teardown is never reported complete
+while residue remains.

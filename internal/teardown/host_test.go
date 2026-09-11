@@ -15,8 +15,13 @@ import (
 // under a unit that is still installed.
 func TestHostUnitsRemovesBinaryLast(t *testing.T) {
 	unitDir, runtimeDir := t.TempDir(), t.TempDir()
-	marker := "# guacdeploy deployment=dep1\n[Unit]\n"
+	binary := filepath.Join(runtimeDir, schedule.RuntimeBinaryName)
+	// Real units name the binary in ExecStart, and that is exactly what the
+	// shared-binary guard looks for: a unit that still exists must still be
+	// runnable, so the copy cannot be removed while one references it.
+	marker := "# guacdeploy deployment=dep1\n[Unit]\n[Service]\nExecStart=" + binary + " run\n"
 	units := []string{
+		"guacdeploy-stack.service",
 		"guacdeploy-renewcert.timer", "guacdeploy-renewcert.service",
 		"guacdeploy-recordings.timer", "guacdeploy-recordings.service",
 		"guacdeploy-backup.timer", "guacdeploy-backup.service",
@@ -26,7 +31,6 @@ func TestHostUnitsRemovesBinaryLast(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	binary := filepath.Join(runtimeDir, schedule.RuntimeBinaryName)
 	if err := os.WriteFile(binary, []byte("ELF"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +56,14 @@ func TestHostUnitsRemovesBinaryLast(t *testing.T) {
 		t.Fatalf("HostUnits: %v", err)
 	}
 
-	want := []string{"guacdeploy-renewcert.timer", "guacdeploy-recordings.timer", "guacdeploy-backup.timer"}
+	// The boot unit goes first: it is the one that would restart the stack
+	// after a reboot, so nothing it depends on may be removed before it is
+	// stopped. The backup schedule goes last, because its uninstall is the
+	// one that removes the shared binary copy.
+	want := []string{
+		"guacdeploy-stack.service",
+		"guacdeploy-renewcert.timer", "guacdeploy-recordings.timer", "guacdeploy-backup.timer",
+	}
 	if strings.Join(disabled, ",") != strings.Join(want, ",") {
 		t.Fatalf("units were stopped in the wrong order: %v", disabled)
 	}

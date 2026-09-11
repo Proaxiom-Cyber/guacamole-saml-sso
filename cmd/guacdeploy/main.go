@@ -23,6 +23,7 @@ import (
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/session"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/settings"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/teardown"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/ui"
 )
 
@@ -43,6 +44,7 @@ Commands:
   settings    Show (--list) or restore (--restore) changes made to pre-existing settings
   backup-run  Take the scheduled backup, then expire old backups
   backup-status Show the scheduled backup destination and last-run result
+  teardown    Remove what this deployment created, after showing the plan
   stack-start Start the stack after a reboot (used by the installed boot unit)
   renew-cert  Renew the origin certificate now (used by the installed timer)
   cert-status Show the origin certificate and its last renewal result
@@ -75,6 +77,10 @@ Flags for restore:
   --file PATH              Backup file to restore (required)
   --identity-file PATH     age identity file instead of the passphrase prompt
   --yes                    Unattended consent to replace the database
+
+Flags for teardown:
+  --yes                    Unattended consent to remove the listed resources
+  --delete-data            Also delete the database, recordings and backups
 
 Flags for settings:
   --list                   Show pending restorations; changes nothing
@@ -131,7 +137,8 @@ func run(args []string) int {
 	plaintext := fs.Bool("plaintext", false, "backup: explicitly write an unencrypted backup")
 	file := fs.String("file", "", "restore: backup file to restore")
 	identityFile := fs.String("identity-file", "", "restore: age identity file instead of the passphrase prompt")
-	yes := fs.Bool("yes", false, "restore: unattended consent to replace the database")
+	yes := fs.Bool("yes", false, "restore/teardown: unattended consent")
+	deleteData := fs.Bool("delete-data", false, "teardown: also delete the database, recordings and backups")
 	stateDir := fs.String("state-dir", state.DefaultDir(), "state directory")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	if err := fs.Parse(args); err != nil {
@@ -218,6 +225,8 @@ func run(args []string) int {
 			return 2
 		}
 		err = settingsCmd(ctx, *stateDir, *restore, u)
+	case "teardown":
+		err = teardownCmd(ctx, *stateDir, *yes, *deleteData, u)
 	case "stack-start":
 		err = stackStartCmd(ctx, *stateDir, u)
 	case "renew-cert":
@@ -235,7 +244,8 @@ func run(args []string) int {
 	case err == nil:
 		return 0
 	case errors.Is(err, session.ErrApprovalRequired), errors.Is(err, ui.ErrInputRequired),
-		errors.Is(err, settings.ErrApprovalRequired):
+		errors.Is(err, settings.ErrApprovalRequired),
+		errors.Is(err, teardown.ErrApprovalRequired), errors.Is(err, teardown.ErrReviewRequired):
 		fmt.Fprintf(os.Stderr, "guacdeploy: %v\n", err)
 		return 3
 	case errors.Is(err, context.Canceled):

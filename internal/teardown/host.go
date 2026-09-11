@@ -10,8 +10,10 @@ import (
 
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/backup"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/certs"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/creds"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recording"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/schedule"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/stack"
 )
 
 // Runner is the command seam, the same shape internal/backup,
@@ -67,6 +69,15 @@ func HostUnits(ctx context.Context, o HostOptions) (removed []string, err error)
 			errs = append(errs, e)
 		}
 	}
+	// The boot unit goes first: it is what would restart the stack after a
+	// reboot, so it must stop before anything it depends on is removed. It
+	// shares the binary copy with the others and has its own guard, so
+	// removing it here never takes that copy away from a unit still
+	// installed.
+	add(creds.UninstallBoot(ctx, creds.BootOptions{
+		Run: creds.Runner(o.Run), DeploymentID: o.DeploymentID, StateDir: o.StateDir,
+		UnitDir: o.UnitDir, RuntimeDir: o.RuntimeDir,
+	}))
 	add(certs.Uninstall(ctx, certs.InstallOptions{
 		Run: certs.Runner(o.Run), DeploymentID: o.DeploymentID, StateDir: o.StateDir,
 		UnitDir: o.UnitDir, RuntimeDir: o.RuntimeDir,
@@ -197,7 +208,10 @@ func DefaultOps(o HostOptions) Ops {
 			if err != nil {
 				return fmt.Errorf("%v: %s", err, strings.TrimSpace(stderr))
 			}
-			return nil
+			// The containers are gone, so their credential files on
+			// memory-backed storage have no reader left. Remove them here
+			// rather than waiting for a reboot to clear the tmpfs.
+			return stack.RemoveRuntimeSecrets(stack.Config{InstallDir: o.InstallDir})
 		},
 		RemoveRendered:    RemoveRendered,
 		RemoveCredentials: RemoveCredentials,
