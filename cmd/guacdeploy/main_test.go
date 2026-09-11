@@ -78,3 +78,19 @@ func TestInterruptedSetupIsResumable(t *testing.T) {
 		t.Fatalf("pending after resume: %+v", st.Pending())
 	}
 }
+
+// A live resume skipped stack-configure, so a check placed in that phase never
+// ran and the certificate authority refused the run again. A malformed contact
+// has to be caught where it is always seen: parsing the flag.
+func TestSetupRefusesAContactTheCertificateAuthorityWillNot(t *testing.T) {
+	dir := t.TempDir()
+	if code := run([]string{"setup", "--non-interactive", "--state-dir", dir,
+		"--acme-contact", "tel:+61000"}); code != 2 {
+		t.Fatalf("want exit 2 for a usage error, got %d", code)
+	}
+	// Nothing may have been written: the refusal comes before the session runs.
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 0 {
+		t.Fatalf("the refused run wrote %d entries into the state directory", len(entries))
+	}
+}

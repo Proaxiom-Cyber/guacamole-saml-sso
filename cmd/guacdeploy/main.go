@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/backup"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/certs"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recording"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/schedule"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/session"
@@ -190,6 +191,15 @@ func run(args []string) int {
 	var err error
 	switch cmd {
 	case "setup":
+		// Checked here rather than in a phase, because a phase that already
+		// succeeded is skipped on resume and would never re-check it. A
+		// malformed address is a usage error and costs nothing to catch.
+		normalised, cerr := certs.NormaliseContact(*acmeContact)
+		if cerr != nil {
+			fmt.Fprintf(os.Stderr, "guacdeploy: %v\n", cerr)
+			return 2
+		}
+		*acmeContact = normalised
 		// Full screen where the terminal supports it, plain lines otherwise.
 		// Only setup: every other command prints a report and exits, so a
 		// full screen that closed immediately would help nobody.
