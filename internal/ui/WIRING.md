@@ -86,13 +86,76 @@ While the wizard runs:
   colour only repeats it, and `NO_COLOR` turns colour off.
 - Prompts accept the arrow keys or `j`/`k`, `Enter` to confirm, and the letter shown in
   brackets as a shortcut. The letter wins over `j`/`k` if a prompt ever offers those keys.
-- The footer always shows `Ctrl-C  Cancel. Completed work is retained.`
+- The footer always shows `Ctrl-C  Cancel. Completed work is retained.`, and on Linux that
+  is true at every moment, not only at a prompt.
+- Output from a phase, a change of phase status and a resize all keep an unanswered
+  question on screen. Answering one takes it off.
 - A failed phase prints three labelled lines: the action that failed, the work that was
   retained, and the recovery choices.
 
-## Exit codes
+## Cancelling and exit codes
 
-`Ctrl-C` inside the wizard does not raise `SIGINT`, because raw mode delivers it as a key.
-The wizard restores the terminal, prints the same notice `main` prints for a signal, and
-returns `context.Canceled`. `main` already maps that to exit code 130, so no change is
-needed. `SIGTERM`, and `SIGINT` outside a prompt, still reach the existing handler.
+On Linux the wizard keeps the terminal's signal characters while it holds raw mode, so
+`Ctrl-C` raises `SIGINT` from anywhere, a long running phase included, and reaches the
+existing handler in `main`. That handler restores the terminal, prints its notice and
+exits 130. Nothing in `main` needs to change for this.
+
+Full raw mode would have made `Ctrl-C` an ordinary key. That is enough at a prompt, where
+the wizard is reading the keyboard, but during a phase nothing reads it, so the key was
+never seen and the footer's offer to cancel was false. A pseudo-terminal test proves both
+cases now exit 130 with the terminal restored.
+
+`Ctrl-Z` and `Ctrl-\` are switched off while the wizard runs. Either would leave the
+terminal raw and on the alternate screen with nothing left running to put it back.
+
+`Escape` still cancels as a key. The wizard restores the terminal, prints the same notice,
+and returns `context.Canceled`, which `main` already maps to 130. That path is also the
+fallback on platforms other than Linux, where the signal characters cannot be kept.
+
+## One change still needed in main.go
+
+**The final error message is lost.** `run` prints `guacdeploy: <err>` to stderr and only
+then returns, so the deferred `u.RestoreTerminal()` runs afterwards. The message is drawn
+on the alternate screen and destroyed when the wizard leaves it. On a failure before the
+first phase the operator sees exit code 1 and an empty terminal.
+
+Reproduce it on a terminal:
+
+```sh
+TERM=xterm-256color script -qec "guacdeploy setup --state-dir /proc/nope/x" /dev/null | cat -v
+```
+
+The fix is to leave the full-screen view before writing the message. `RestoreTerminal` is
+idempotent, so an explicit call costs nothing:
+
+```go
+	// Leave the full-screen view before anything is written about the result:
+	// the alternate screen is discarded when it closes, and a message drawn on
+	// it goes with it.
+	u.RestoreTerminal()
+
+	switch {
+	case err == nil:
+		return 0
+	...
+```
+
+A failed phase is less badly affected, because the wizard replays its own transcript,
+including the three-line error block, when it leaves the alternate screen. The final
+`guacdeploy: <err>` line is still lost.
+
+## Resizing
+
+The wizard follows `SIGWINCH` and redraws at the new size. Without that the frame keeps
+the width it started with, and a narrower window wraps every rule so the top of the screen
+scrolls away. Below 20 rows or 40 columns the frame is deliberately not shrunk further; it
+is taller than the window at that point, which is the documented floor.
+
+## Running the terminal tests
+
+The unit tests run everywhere. The acceptance tests need a real terminal and are Linux
+only, because macOS does not report the `/dev/ptmx` master as a terminal:
+
+```sh
+go test ./internal/ui/ -run PTY -v
+```

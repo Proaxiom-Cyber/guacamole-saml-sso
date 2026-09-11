@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 
 	"golang.org/x/term"
 )
@@ -39,8 +41,8 @@ const (
 )
 
 // cancelNotice is the wording main.go prints when a signal cancels the run.
-// Raw mode turns Ctrl-C into a key rather than a signal, so the wizard says
-// the same thing itself.
+// Where the terminal cannot keep its signal characters, Ctrl-C arrives as an
+// ordinary key instead, and the wizard says the same thing itself.
 const cancelNotice = "Cancelled. Completed work is saved; run guacdeploy again to resume or clean up."
 
 // logCap bounds the retained transcript. It is replayed when the wizard
@@ -72,22 +74,31 @@ type Wizard struct {
 	names   []string
 	state   map[string]string
 	log     []string
+	prompt  []string // the question on screen now, redrawn with everything else
 	stopped bool
 
-	stopOnce sync.Once
-	restore  func() // undoes raw mode; nil when no real terminal is attached
+	stopOnce   sync.Once
+	restore    func() // undoes raw mode; nil when no real terminal is attached
+	stopResize func() // stops following the window size; nil when not following
 }
 
-func newWizard(in *bufio.Reader, out io.Writer, rows, cols int, colour bool) *Wizard {
-	// ponytail: below about twenty rows the frame is taller than the screen
-	// and the top scrolls away. Treat that as the floor rather than build a
-	// second compact layout.
+// clampSize holds the frame to a usable minimum.
+//
+// ponytail: below about twenty rows the frame is taller than the screen and
+// the top scrolls away. Treat that as the floor rather than build a second
+// compact layout.
+func clampSize(rows, cols int) (int, int) {
 	if rows < 20 {
 		rows = 20
 	}
 	if cols < 40 {
 		cols = 40
 	}
+	return rows, cols
+}
+
+func newWizard(in *bufio.Reader, out io.Writer, rows, cols int, colour bool) *Wizard {
+	rows, cols = clampSize(rows, cols)
 	return &Wizard{out: out, in: in, rows: rows, cols: cols, colour: colour, state: map[string]string{}}
 }
 
@@ -106,6 +117,11 @@ func (u *UI) StartWizard() bool {
 	if err != nil {
 		return false
 	}
+	// Raw mode would make Ctrl-C an ordinary key, which nothing reads while a
+	// phase runs. Put the signal characters back so cancelling works from
+	// anywhere, not only at a prompt.
+	keepSignalKeys(u.fd)
+
 	rows, cols := 24, 80
 	if c, r, err := term.GetSize(u.fd); err == nil && r > 0 && c > 0 {
 		rows, cols = r, c
@@ -114,8 +130,30 @@ func (u *UI) StartWizard() bool {
 	w.restore = func() { term.Restore(u.fd, prev) }
 	io.WriteString(u.Out, enterAltScreen)
 	u.wiz = w
+	w.followResize(u.fd)
 	w.draw(nil)
 	return true
+}
+
+// followResize redraws at the new size when the window changes. Without it
+// the frame keeps the width it started with, so a narrower window wraps every
+// line and pushes the top of the screen away.
+func (w *Wizard) followResize(fd int) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGWINCH)
+	w.stopResize = func() { signal.Stop(ch); close(ch) }
+	go func() {
+		for range ch {
+			c, r, err := term.GetSize(fd)
+			if err != nil || r <= 0 || c <= 0 {
+				continue
+			}
+			w.mu.Lock()
+			w.rows, w.cols = clampSize(r, c)
+			w.mu.Unlock()
+			w.redraw()
+		}
+	}()
 }
 
 // fullScreenCapable reports whether control codes may be written to out. A
@@ -159,25 +197,30 @@ func (w *Wizard) done() bool {
 // through a deferred UI.RestoreTerminal.
 func (w *Wizard) stop() {
 	w.stopOnce.Do(func() {
+		if w.stopResize != nil {
+			w.stopResize()
+		}
+		// The lock is held across the writes so a draw already under way
+		// cannot interleave with the replay below. Any draw that arrives
+		// meanwhile waits, then sees the wizard stopped and writes nothing.
 		w.mu.Lock()
+		defer w.mu.Unlock()
 		w.stopped = true
-		lines := append([]string(nil), w.log...)
-		w.mu.Unlock()
 		// Cooked mode first: the replayed lines below need a newline to
 		// mean carriage return and line feed.
 		if w.restore != nil {
 			w.restore()
 		}
 		io.WriteString(w.out, leaveAltScreen)
-		for _, l := range lines {
+		for _, l := range w.log {
 			io.WriteString(w.out, l+"\n")
 		}
 	})
 }
 
-// cancelled ends the session on the explicit cancel key. Raw mode consumed
-// the signal, so the wizard prints the notice main.go would have printed and
-// returns the error main.go already maps to exit code 130.
+// cancelled ends the session on an explicit cancel key that arrived as a key
+// rather than a signal. The wizard prints the notice main.go would have
+// printed and returns the error main.go already maps to exit code 130.
 func (w *Wizard) cancelled() error {
 	w.stop()
 	io.WriteString(w.out, cancelNotice+"\n")
@@ -193,14 +236,14 @@ func (w *Wizard) say(s string) {
 		w.log = append([]string(nil), w.log[n:]...)
 	}
 	w.mu.Unlock()
-	w.draw(nil)
+	w.redraw()
 }
 
 func (w *Wizard) setPhases(names []string) {
 	w.mu.Lock()
 	w.names = append([]string(nil), names...)
 	w.mu.Unlock()
-	w.draw(nil)
+	w.redraw()
 }
 
 func (w *Wizard) setPhase(name, state string) {
@@ -219,7 +262,7 @@ func (w *Wizard) setPhase(name, state string) {
 	}
 	w.state[name] = state
 	w.mu.Unlock()
-	w.draw(nil)
+	w.redraw()
 }
 
 // failed records the failure and writes the three things the specification
@@ -430,12 +473,23 @@ func (w *Wizard) paint(line string) string {
 	return line
 }
 
+// redraw repaints with whatever question is currently on screen. Output from
+// a phase, a change of phase status and a resize all go through it, so none of
+// them wipes a prompt the operator is part way through answering.
+func (w *Wizard) redraw() {
+	w.mu.Lock()
+	p := w.prompt
+	w.mu.Unlock()
+	w.draw(p)
+}
+
 func (w *Wizard) draw(prompt []string) {
 	w.mu.Lock()
 	if w.stopped {
 		w.mu.Unlock()
 		return
 	}
+	w.prompt = prompt
 	lines := w.frame(prompt)
 	w.mu.Unlock()
 
@@ -492,6 +546,7 @@ func (w *Wizard) readKey() (rune, error) {
 }
 
 func (w *Wizard) choose(prompt string, choices []Choice) (rune, error) {
+	defer w.draw(nil) // the question is answered; take it off the screen
 	sel := 0
 	for {
 		lines := []string{prompt, ""}
@@ -539,6 +594,7 @@ func lowerASCII(r rune) rune {
 // readLine edits one line of input. hidden suppresses the echo for
 // credential prompts: the value is never drawn, logged or retained.
 func (w *Wizard) readLine(prompt, def string, hidden bool) (string, error) {
+	defer w.draw(nil) // the question is answered; take it off the screen
 	var buf []rune
 	note := ""
 	for {

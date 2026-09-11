@@ -98,18 +98,40 @@ func TestChooseShowsCursorAndCancelAction(t *testing.T) {
 	if _, err := u.Choose("What do you want to do?", resumeChoices); err != nil {
 		t.Fatalf("Choose: %v", err)
 	}
-	// The last frame drawn before Enter had the cursor on the second option
-	// and the cancel action visible.
+	// Answering draws one more frame without the question, so the frame that
+	// was on screen when Enter was pressed is the one before it.
+	frames := strings.Split(out.String(), homeAndClear)
+	answered, asking := frames[len(frames)-1], frames[len(frames)-2]
+	if !strings.Contains(asking, "> [c] Clean up") {
+		t.Errorf("selection cursor missing from the frame that asked:\n%s", asking)
+	}
+	if !strings.Contains(asking, "  [r] Resume") {
+		t.Errorf("unselected option missing from the frame that asked:\n%s", asking)
+	}
+	if !strings.Contains(asking, "Ctrl-C  Cancel") {
+		t.Errorf("cancel action not visible:\n%s", asking)
+	}
+	// An answered question leaves the screen, so a later phase message does
+	// not appear under a prompt that no longer applies.
+	if strings.Contains(answered, "[c] Clean up") {
+		t.Errorf("the answered question is still on screen:\n%s", answered)
+	}
+}
+
+func TestOutputKeepsAnUnansweredPromptOnScreen(t *testing.T) {
+	// A phase that reports progress, or a resize, must not wipe a question
+	// the operator is part way through answering.
+	u, out, _ := newTestUI("")
+	u.wiz.draw([]string{"Public hostname", "", "  guac_"})
+	u.Say("Creating the Cloudflare tunnel.")
+
 	frames := strings.Split(out.String(), homeAndClear)
 	last := frames[len(frames)-1]
-	if !strings.Contains(last, "> [c] Clean up") {
-		t.Errorf("selection cursor missing from the last frame:\n%s", last)
+	if !strings.Contains(last, "Public hostname") {
+		t.Errorf("output wiped the prompt that is still being answered:\n%s", last)
 	}
-	if !strings.Contains(last, "  [r] Resume") {
-		t.Errorf("unselected option missing from the last frame:\n%s", last)
-	}
-	if !strings.Contains(last, "Ctrl-C  Cancel") {
-		t.Errorf("cancel action not visible:\n%s", last)
+	if !strings.Contains(last, "Creating the Cloudflare tunnel.") {
+		t.Errorf("the new output is missing:\n%s", last)
 	}
 }
 
