@@ -10,8 +10,10 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/host"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/ui"
 )
@@ -27,10 +29,78 @@ type Phase struct {
 	Run  func(ctx context.Context, st *state.State, u *ui.UI) error
 }
 
-// SetupPhases is the ordered registry. Later tickets append their phases
-// (host preparation, credentials, stack, integrations) here.
-var SetupPhases = []Phase{
-	{Name: "initialise-deployment", Run: initialiseDeployment},
+// Phases builds the ordered registry for one session. Later tickets append
+// their phases (credentials, stack, integrations) here.
+func Phases(opts *Options) []Phase {
+	return []Phase{
+		{Name: "initialise-deployment", Run: initialiseDeployment},
+		{Name: "host-preflight", Run: opts.hostPreflight},
+		{Name: "host-dependencies", Run: opts.hostDependencies},
+	}
+}
+
+func (o *Options) probes() *host.Probes {
+	if o.Host == nil {
+		o.Host = &host.Probes{}
+	}
+	return o.Host
+}
+
+func (o *Options) hostPreflight(ctx context.Context, st *state.State, u *ui.UI) error {
+	f, err := o.probes().Gather(ctx)
+	if err != nil {
+		return err
+	}
+	if err := host.Preflight(f); err != nil {
+		return err
+	}
+	if st.Config == nil {
+		st.Config = map[string]string{}
+	}
+	st.Config["os"] = f.OSID + " " + f.VersionID
+	u.Say("Host checks passed: %s, root privileges, no existing installation, required endpoints reachable.", st.Config["os"])
+	return nil
+}
+
+func (o *Options) hostDependencies(ctx context.Context, st *state.State, u *ui.UI) error {
+	f, err := o.probes().Gather(ctx)
+	if err != nil {
+		return err
+	}
+	missing := host.MissingDependencies(f)
+	if len(missing) == 0 {
+		u.Say("Docker and the Compose plugin are already present. They are pre-existing and will not be offered for removal at teardown.")
+		return nil
+	}
+	u.Say("Missing dependencies: %s", strings.Join(missing, ", "))
+	u.Say("Plan: add Docker's RHEL repository, install the packages with dnf, then enable and start the docker service.")
+	if u.Interactive {
+		ok, err := u.Confirm("Install these dependencies now?")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("dependency installation declined; setup cannot continue without Docker")
+		}
+	} else if !o.InstallDependencies {
+		return fmt.Errorf("%w: missing dependencies (%s) need approval; pass --install-dependencies to consent", ErrApprovalRequired, strings.Join(missing, ", "))
+	}
+	if err := o.probes().InstallDependencies(ctx, missing); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	for _, pkg := range missing {
+		st.Resources = append(st.Resources, state.Resource{
+			ID: state.NewID(), Provider: "host", Type: "package", Name: pkg,
+			Ownership: "installed by this deployment", CreatedAt: now,
+		})
+	}
+	st.Resources = append(st.Resources, state.Resource{
+		ID: state.NewID(), Provider: "host", Type: "service-enablement", Name: "docker",
+		Ownership: "enabled by this deployment", CreatedAt: now,
+	})
+	u.Say("Dependencies installed and recorded as host changes made by this deployment.")
+	return nil
 }
 
 func initialiseDeployment(ctx context.Context, st *state.State, u *ui.UI) error {
@@ -49,17 +119,19 @@ func initialiseDeployment(ctx context.Context, st *state.State, u *ui.UI) error 
 
 // Options selects the session behaviour.
 type Options struct {
-	StateDir string
-	UI       *ui.UI
-	Resume   bool // unattended only: explicit consent to continue interrupted work
-	Phases   []Phase
+	StateDir            string
+	UI                  *ui.UI
+	Resume              bool // unattended only: explicit consent to continue interrupted work
+	InstallDependencies bool // unattended only: explicit consent to install missing dependencies
+	Host                *host.Probes
+	Phases              []Phase
 }
 
 func (o *Options) phases() []Phase {
 	if o.Phases != nil {
 		return o.Phases
 	}
-	return SetupPhases
+	return Phases(o)
 }
 
 // Run is the setup entry point for both guided and unattended modes.

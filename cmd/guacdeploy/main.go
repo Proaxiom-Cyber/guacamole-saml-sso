@@ -32,9 +32,10 @@ Commands:
   version  Print the tool version
 
 Flags for setup:
-  --non-interactive   Never prompt; exit 3 where approval is required
-  --resume            Non-interactive only: consent to continue interrupted work
-  --state-dir DIR     Override the state directory (default ` + "/var/lib/guacdeploy" + `)
+  --non-interactive        Never prompt; exit 3 where approval is required
+  --resume                 Non-interactive only: consent to continue interrupted work
+  --install-dependencies   Non-interactive only: consent to install missing dependencies
+  --state-dir DIR          Override the state directory (default ` + "/var/lib/guacdeploy" + `)
 `
 
 func main() { os.Exit(run(os.Args[1:])) }
@@ -48,6 +49,7 @@ func run(args []string) int {
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	nonInteractive := fs.Bool("non-interactive", false, "never prompt")
 	resume := fs.Bool("resume", false, "non-interactive: continue interrupted work")
+	installDeps := fs.Bool("install-dependencies", false, "non-interactive: consent to install missing dependencies")
 	stateDir := fs.String("state-dir", state.DefaultDir(), "state directory")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	if err := fs.Parse(args); err != nil {
@@ -72,22 +74,23 @@ func run(args []string) int {
 	var err error
 	switch cmd {
 	case "setup":
-		opts := session.Options{StateDir: *stateDir, UI: u, Resume: *resume}
+		opts := session.Options{StateDir: *stateDir, UI: u, Resume: *resume, InstallDependencies: *installDeps}
 		if s := os.Getenv("GUACDEPLOY_TEST_SLEEP_PHASE"); s != "" {
-			// Test hook: append a slow phase so interruption behaviour can
-			// be exercised end to end. No effect unless the variable is set.
+			// Test hook: replace the registry with a slow phase so session
+			// interruption is testable end to end on any development host.
+			// No effect unless the variable is set.
 			secs, _ := strconv.Atoi(s)
-			opts.Phases = append(append([]session.Phase{}, session.SetupPhases...), session.Phase{
-				Name: "test-sleep",
-				Run: func(ctx context.Context, _ *state.State, _ *ui.UI) error {
+			opts.Phases = []session.Phase{
+				{Name: "initialise-deployment", Run: session.Phases(&opts)[0].Run},
+				{Name: "test-sleep", Run: func(ctx context.Context, _ *state.State, _ *ui.UI) error {
 					select {
 					case <-time.After(time.Duration(secs) * time.Second):
 						return nil
 					case <-ctx.Done():
 						return ctx.Err()
 					}
-				},
-			})
+				}},
+			}
 		}
 		err = session.Run(ctx, opts)
 	case "status":

@@ -11,6 +11,7 @@ guide arrive with the final wizard work.
 | `guacdeploy` or `guacdeploy setup` | Start a fresh deployment, or resume or clean up an interrupted one |
 | `guacdeploy setup --non-interactive` | Unattended setup. Never waits for input |
 | `guacdeploy setup --non-interactive --resume` | Unattended consent to continue interrupted work |
+| `guacdeploy setup --non-interactive --install-dependencies` | Unattended consent to install missing dependencies |
 | `guacdeploy status` | Show the deployment record without changing anything |
 | `guacdeploy version` | Print the tool version |
 
@@ -33,6 +34,22 @@ only a record that created no resources; anything more requires teardown.
 
 Only one mutating operation can run at a time on a host. A second
 invocation reports that an operation is already running.
+
+## Host preparation
+
+Setup checks the host before it changes anything: Rocky Linux 10 on Intel
+or AMD 64-bit, root privileges, no existing installation, and outbound
+TCP 443 to `mirrors.rockylinux.org`, `download.docker.com`, and
+`registry-1.docker.io`. Unsupported platforms, hosts where the `docker`
+command runs Podman, and hosts with an existing installation are rejected
+with an explanation. Nothing is adopted or overwritten.
+
+If Docker or the Compose plugin is missing, setup shows the installation
+plan (Docker's RHEL repository via dnf, then enable and start the docker
+service) and asks before installing. Unattended runs need
+`--install-dependencies`. Installed packages and the service enablement
+are recorded as changes made by this deployment. Docker that was already
+present is pre-existing and is never offered for removal at teardown.
 
 ## State
 
