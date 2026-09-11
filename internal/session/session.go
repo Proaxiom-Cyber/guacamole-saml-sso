@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/creds"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/entra"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/host"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/stack"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
@@ -90,8 +91,25 @@ func (o *Options) stackConfig(st *state.State) stack.Config {
 		AdminGroup:      st.Config["admin-group"],
 		OperatorGroup:   st.Config["operator-group"],
 		SAMLMetadataURL: st.Config["saml-metadata-url"],
-		ComposeProfiles: st.Config["compose-profiles"],
+		// Entra's groups claim is a full URI. Fall back to it whenever a
+		// metadata URL exists but nothing recorded the attribute, so the
+		// compose default "groups" can never silently apply to Entra.
+		SAMLGroupAttribute: samlGroupAttribute(st),
+		ComposeProfiles:    st.Config["compose-profiles"],
 	}
+}
+
+// samlGroupAttribute returns the SAML group attribute for the rendered
+// .env: whatever the identity slice recorded, else Entra's claim URI once
+// SAML is configured, else empty (no SAML block is rendered).
+func samlGroupAttribute(st *state.State) string {
+	if v := st.Config["saml-group-attribute"]; v != "" {
+		return v
+	}
+	if st.Config["saml-metadata-url"] != "" {
+		return entra.GroupClaimAttribute
+	}
+	return ""
 }
 
 func (o *Options) stackConfigure(ctx context.Context, st *state.State, u *ui.UI) error {

@@ -51,7 +51,12 @@ type Config struct {
 	OperatorGroup   string
 	HTTPSPort       string // default 443
 	SAMLMetadataURL string // empty until the Entra slice configures it
-	ComposeProfiles string // e.g. "cloudflare" once the tunnel slice lands
+	// SAMLGroupAttribute is the SAML attribute carrying group membership.
+	// Entra names it with a full claim URI, not "groups"; leaving the
+	// compose default in place means group membership never reaches
+	// Guacamole and every sign-in lands with no permissions.
+	SAMLGroupAttribute string
+	ComposeProfiles    string // e.g. "cloudflare" once the tunnel slice lands
 }
 
 func (c *Config) defaults() {
@@ -127,8 +132,8 @@ func Render(cfg Config) error {
 	env := fmt.Sprintf(
 		"# Non-secret configuration rendered by guacdeploy. Credentials never\n"+
 			"# belong in this file; the database password arrives at start time.\n"+
-			"GUAC_VERSION=%s\nGUAC_HOSTNAME=%s\nGUAC_ADMIN_GROUP=%s\nGUAC_OPERATOR_GROUP=%s\nHTTPS_PORT=%s\nSAML_IDP_METADATA_URL=%s\nCOMPOSE_PROFILES=%s\n",
-		GuacVersion, cfg.Hostname, cfg.AdminGroup, cfg.OperatorGroup, cfg.HTTPSPort, cfg.SAMLMetadataURL, cfg.ComposeProfiles)
+			"GUAC_VERSION=%s\nGUAC_HOSTNAME=%s\nGUAC_ADMIN_GROUP=%s\nGUAC_OPERATOR_GROUP=%s\nHTTPS_PORT=%s\nSAML_IDP_METADATA_URL=%s\nSAML_GROUP_ATTRIBUTE=%s\nCOMPOSE_PROFILES=%s\n",
+		GuacVersion, cfg.Hostname, cfg.AdminGroup, cfg.OperatorGroup, cfg.HTTPSPort, cfg.SAMLMetadataURL, cfg.SAMLGroupAttribute, cfg.ComposeProfiles)
 
 	files := map[string]struct {
 		content string

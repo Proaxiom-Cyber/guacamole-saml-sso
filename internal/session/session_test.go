@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/creds"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/entra"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/host"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/stack"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
@@ -594,5 +595,46 @@ func TestAlwaysPhaseRerunsOnResume(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "once: already complete") {
 		t.Fatalf("ordinary phase should have been skipped:\n%s", out.String())
+	}
+}
+
+// TestSAMLGroupAttributeNeverSilentlyDefaults pins the integration gap the
+// Entra module flagged: Entra names the groups claim with a full URI, so
+// leaving the compose default "groups" in place means group membership
+// never reaches Guacamole and every sign-in lands with no permissions.
+func TestSAMLGroupAttributeNeverSilentlyDefaults(t *testing.T) {
+	// No SAML configured: nothing to set, and no SAML block is rendered.
+	if got := samlGroupAttribute(&state.State{Config: map[string]string{}}); got != "" {
+		t.Fatalf("without SAML want empty, got %q", got)
+	}
+	// SAML configured by the Entra slice: the claim URI must be used.
+	withSAML := &state.State{Config: map[string]string{"saml-metadata-url": "https://login.example/metadata"}}
+	if got := samlGroupAttribute(withSAML); got != entra.GroupClaimAttribute {
+		t.Fatalf("with SAML want the Entra claim URI, got %q", got)
+	}
+	// An explicitly recorded attribute always wins (another identity provider).
+	explicit := &state.State{Config: map[string]string{
+		"saml-metadata-url":    "https://idp.example/metadata",
+		"saml-group-attribute": "memberOf",
+	}}
+	if got := samlGroupAttribute(explicit); got != "memberOf" {
+		t.Fatalf("explicit attribute ignored, got %q", got)
+	}
+
+	// And it must actually reach the rendered .env.
+	dir := t.TempDir()
+	if err := stack.Render(stack.Config{
+		InstallDir: dir, Hostname: "guac.example.test",
+		SAMLMetadataURL:    "https://login.example/metadata",
+		SAMLGroupAttribute: samlGroupAttribute(withSAML),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	env, err := os.ReadFile(filepath.Join(dir, ".env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(env), "SAML_GROUP_ATTRIBUTE="+entra.GroupClaimAttribute) {
+		t.Fatalf("rendered .env does not carry the Entra claim URI:\n%s", env)
 	}
 }
