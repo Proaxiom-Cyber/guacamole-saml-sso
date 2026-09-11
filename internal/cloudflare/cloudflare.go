@@ -390,7 +390,8 @@ func (p *Provisioner) ConfigureIngress(ctx context.Context, tunnelID string) err
 }
 
 // TunnelToken fetches the connector token — the stack's TUNNEL_TOKEN secret.
-// It is for in-memory use only: pass it to stack.Up's override; never
+// It is for in-memory use only: pass it to stack.Up, which writes it to an
+// owner-only file on memory-backed storage for the connector to read; never
 // journal, log, persist, or place it in command arguments.
 func (p *Provisioner) TunnelToken(ctx context.Context, tunnelID string) (string, error) {
 	var tok string

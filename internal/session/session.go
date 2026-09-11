@@ -258,7 +258,7 @@ func (o *Options) stackSecrets(st *state.State, u *ui.UI) (password, tunnelToken
 		}
 	}
 	// The connector token is fetched at start time and delivered through
-	// the in-memory Compose override. It never reaches state, .env, logs or
+	// an owner-only file on memory-backed storage. It never reaches state, .env, logs or
 	// command arguments, and a rotated token needs no local change.
 	if id := st.Config["cloudflare-tunnel-id"]; id != "" && strings.Contains(st.Config["compose-profiles"], "cloudflare") {
 		tunnelToken, err = o.provisioner(st, u).TunnelToken(context.Background(), id)

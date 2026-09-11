@@ -104,7 +104,8 @@ return password, tunnelToken, err
 ```
 
 The token goes straight into `stack.Up(ctx, run, cfg, password, tunnelToken)`, which
-delivers it through the in-memory Compose override as `TUNNEL_TOKEN`. It must never
+writes it to an owner-only file on memory-backed storage that the connector reads as
+`TUNNEL_TOKEN_FILE`. It must never
 reach state, logs, `.env`, or command arguments. Fetching at start time also means a
 rotated tunnel token needs no local change.
 
