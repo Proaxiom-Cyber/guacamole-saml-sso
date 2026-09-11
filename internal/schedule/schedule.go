@@ -72,6 +72,11 @@ type Options struct {
 }
 
 func (o *Options) defaults() error {
+	// A nil runner is a caller that forgot the seam, not a request to
+	// crash mid-deployment.
+	if o.Run == nil {
+		o.Run = ExecRunner
+	}
 	if o.OnCalendar == "" {
 		o.OnCalendar = DefaultOnCalendar
 	}

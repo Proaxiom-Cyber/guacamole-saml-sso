@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/backup"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/certs"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/cloudflare"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/creds"
@@ -1190,6 +1191,7 @@ func (o *Options) originCertificate(ctx context.Context, st *state.State, u *ui.
 		return nil
 	}
 	installed, err := certs.Install(ctx, certs.InstallOptions{
+		Run:          certs.ExecRunner,
 		DeploymentID: st.DeploymentID,
 		StateDir:     o.StateDir,
 	})
@@ -1285,6 +1287,7 @@ func (o *Options) recordingSchedule(ctx context.Context, st *state.State, u *ui.
 	}
 	dest := st.Config["backup-dest"]
 	in, err := recording.Install(ctx, recording.InstallOptions{
+		Run:          backup.ExecRunner,
 		DeploymentID: st.DeploymentID,
 		StateDir:     o.StateDir,
 		Dir:          filepath.Join(o.installDir(), "recordings"),

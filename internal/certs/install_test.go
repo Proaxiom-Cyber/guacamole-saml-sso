@@ -197,3 +197,17 @@ func TestInstallRefusesPathsSystemdCannotQuote(t *testing.T) {
 		t.Fatal("Install accepted a path with a space in it")
 	}
 }
+
+// TestInstallDefaultsTheRunner pins that a caller which omits the command
+// seam gets the real one rather than a nil-pointer panic. A panic here
+// aborted a live deployment after the certificate had already been issued
+// successfully.
+func TestInstallDefaultsTheRunner(t *testing.T) {
+	o := InstallOptions{StateDir: t.TempDir(), UnitDir: t.TempDir(), RuntimeDir: t.TempDir(), Exe: os.Args[0]}
+	if err := o.defaults(); err != nil {
+		t.Fatal(err)
+	}
+	if o.Run == nil {
+		t.Fatal("a nil runner was left nil, so Install would panic")
+	}
+}

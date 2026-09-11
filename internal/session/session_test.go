@@ -12,10 +12,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/certs"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/cloudflare"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/creds"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/entra"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/host"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recording"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/schedule"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/stack"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/ui"
@@ -1016,5 +1019,30 @@ func TestGroupNamesMayContainSpaces(t *testing.T) {
 	slash := &Options{StateDir: dir, Hostname: "guac.example.com", AdminGroup: "a/b", OperatorGroup: "c"}
 	if err := slash.stackConfigure(context.Background(), &state.State{Config: map[string]string{}}, u); err == nil {
 		t.Fatal("a group name with a slash must be rejected")
+	}
+}
+
+// TestInstallersNeverReceiveANilRunner pins the wiring mistake that
+// aborted a live deployment: a phase built an installer's options without
+// the command seam, and the installer dereferenced it. Each installer now
+// defaults it, so a forgotten seam degrades to the real runner instead of
+// a panic in the middle of a deployment.
+func TestInstallersNeverReceiveANilRunner(t *testing.T) {
+	dir := t.TempDir()
+	units := t.TempDir()
+	runtime := t.TempDir()
+
+	certOpts := certs.InstallOptions{StateDir: dir, UnitDir: units, RuntimeDir: runtime, Exe: os.Args[0]}
+	if _, err := certs.Install(context.Background(), certOpts); err == nil {
+		// An error is fine (systemd is absent in tests); a panic is not.
+		t.Log("certs.Install returned no error")
+	}
+	schedOpts := schedule.Options{StateDir: dir, Dest: dir, UnitDir: units, RuntimeDir: runtime, Exe: os.Args[0], DeploymentID: "d"}
+	if _, err := schedule.Install(context.Background(), schedOpts); err == nil {
+		t.Log("schedule.Install returned no error")
+	}
+	recOpts := recording.InstallOptions{StateDir: dir, Dir: dir, Budget: 1 << 20, UnitDir: units, RuntimeDir: runtime, Exe: os.Args[0], DeploymentID: "d"}
+	if _, err := recording.Install(context.Background(), recOpts); err == nil {
+		t.Log("recording.Install returned no error")
 	}
 }

@@ -130,6 +130,11 @@ type InstallOptions struct {
 }
 
 func (o *InstallOptions) defaults() error {
+	// A nil runner is a caller that forgot the seam, not a request to
+	// crash mid-deployment.
+	if o.Run == nil {
+		o.Run = backup.ExecRunner
+	}
 	if o.OnCalendar == "" {
 		o.OnCalendar = DefaultOnCalendar
 	}

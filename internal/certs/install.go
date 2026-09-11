@@ -50,6 +50,11 @@ type InstallOptions struct {
 }
 
 func (o *InstallOptions) defaults() error {
+	// A nil runner is the caller forgetting a seam, not a request to
+	// crash: default it the way every other entry point does.
+	if o.Run == nil {
+		o.Run = ExecRunner
+	}
 	if o.OnCalendar == "" {
 		o.OnCalendar = DefaultOnCalendar
 	}
