@@ -118,6 +118,30 @@ deployment state, logs, or command arguments. Files written by the tool
 are recorded as material owned by this deployment, so teardown can offer
 their removal; files you placed yourself are pre-existing and stay.
 
+## Recovering onto a replacement host
+
+When the host is lost, `guacdeploy recover --file <backup>` rebuilds the
+deployment record on a replacement machine. It reads the backup, asks
+Cloudflare and Entra what of the lost deployment is still there, and writes
+the record that an ordinary `guacdeploy setup` then works from.
+
+It creates nothing, changes nothing at any provider and deletes nothing.
+Each resource is looked up by this deployment's ownership marker, so one
+that survived is adopted rather than created a second time, and one that
+only matches by name is reported for a person to look at rather than
+touched. A provider that cannot be asked stops the run: recreating on an
+unanswered question is how a duplicate tunnel gets made.
+
+The credentials died with the host, so recovery asks for the Cloudflare API
+token again, at a hidden prompt or from `GUACDEPLOY_CRED_CLOUDFLARE_API_TOKEN`,
+and needs a Microsoft Graph token in `GUACDEPLOY_GRAPH_TOKEN`. A credential
+sealed to the old host's TPM cannot be decrypted on a replacement at all;
+that is the point of the mode, and it is why the guide says to keep an
+independent record of anything you cannot recreate.
+
+The database is restored separately, with `guacdeploy restore`, once the
+stack is running.
+
 ## Backup recovery key
 
 Backups are encrypted with a key pair. `guacdeploy backup-key` generates

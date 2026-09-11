@@ -47,6 +47,7 @@ Commands:
   azure-upload  Copy published backups and completed recordings to Azure Blob
   azure-status  Show the Azure destination and the last upload result
   teardown    Remove what this deployment created, after showing the plan
+  recover     Rebuild the deployment record on a replacement host from a backup
   stack-start Start the stack after a reboot (used by the installed boot unit)
   renew-cert  Renew the origin certificate now (used by the installed timer)
   cert-status Show the origin certificate and its last renewal result
@@ -79,6 +80,12 @@ Flags for restore:
   --file PATH              Backup file to restore (required)
   --identity-file PATH     age identity file instead of the passphrase prompt
   --yes                    Unattended consent to replace the database
+
+Flags for recover:
+  --file PATH              Backup to rebuild the deployment record from (required)
+  --key-export PATH        Recovery key export from the lost host
+                           (default <state-dir>/recovery/backup-key.age)
+  --yes                    Unattended consent to write the deployment record
 
 Flags for azure-upload:
   --dest DIR               The local published backup directory to copy from (required)
@@ -142,7 +149,8 @@ func run(args []string) int {
 	plaintext := fs.Bool("plaintext", false, "backup: explicitly write an unencrypted backup")
 	file := fs.String("file", "", "restore: backup file to restore")
 	identityFile := fs.String("identity-file", "", "restore: age identity file instead of the passphrase prompt")
-	yes := fs.Bool("yes", false, "restore/teardown: unattended consent")
+	yes := fs.Bool("yes", false, "restore/teardown/recover: unattended consent")
+	keyExport := fs.String("key-export", "", "recover: the passphrase-encrypted recovery key export from the lost host")
 	deleteData := fs.Bool("delete-data", false, "teardown: also delete the database, recordings and backups")
 	stateDir := fs.String("state-dir", state.DefaultDir(), "state directory")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
@@ -236,6 +244,8 @@ func run(args []string) int {
 		err = settingsCmd(ctx, *stateDir, *restore, u)
 	case "teardown":
 		err = teardownCmd(ctx, *stateDir, *yes, *deleteData, u)
+	case "recover":
+		err = recoverCmd(ctx, *stateDir, *file, *keyExport, *yes, u)
 	case "azure-upload":
 		err = azureUploadCmd(ctx, *stateDir, *dest, u)
 	case "azure-status":
