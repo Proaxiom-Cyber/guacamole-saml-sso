@@ -639,3 +639,40 @@ func TestSafePathRefusesTopLevel(t *testing.T) {
 		}
 	}
 }
+
+// Setup can now generate the backup key, which records the passphrase-encrypted
+// export. Without a rule for it, teardown fell to "no removal is defined" —
+// which is ActionReview, and review makes the whole run refuse and remove
+// nothing. It must be preserved instead: it is the only key that can read the
+// encrypted backups, and teardown keeps those.
+func TestRecoveryKeyExportIsKeptAndDoesNotBlockTeardown(t *testing.T) {
+	st := &state.State{DeploymentID: "d1", Resources: []state.Resource{
+		{ID: "r-key", Provider: "host", Type: "recovery-key-export",
+			Name:      "/var/lib/guacdeploy/recovery/backup-key.age",
+			Ownership: "written by this deployment"},
+		{ID: "r-rec", Provider: "cloudflare", Type: "dns-record",
+			ProviderID: "rec1", Name: "guac.example.com", Ownership: "marker comment"},
+	}}
+	plan := BuildPlan(st, nil, false)
+	if rv := plan.Review(); len(rv) > 0 {
+		t.Fatalf("the key export forced the whole teardown into review: %+v", rv)
+	}
+	var kept bool
+	for _, it := range plan.Preserved() {
+		if it.Resource.ID == "r-key" {
+			kept = true
+			if !strings.Contains(it.Detail, "encrypted backups") {
+				t.Errorf("the reason does not say why it is kept: %q", it.Detail)
+			}
+		}
+	}
+	if !kept {
+		t.Fatal("the key export was not reported as kept")
+	}
+	// And it is never offered for removal.
+	for _, it := range plan.Removable() {
+		if it.Resource.ID == "r-key" {
+			t.Fatal("the key export was offered for removal")
+		}
+	}
+}

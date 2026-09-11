@@ -233,6 +233,12 @@ func classify(r state.Resource) (Kind, Action, string) {
 		return KindCredential, ActionWithParent, "removed with the credential directory that holds it"
 	case "host/config-directory":
 		return KindConfigDir, ActionRemove, "remove the files this deployment rendered; the directory itself stays if anything else is still in it"
+	case "host/recovery-key-export":
+		// Never deleted, and never merely "unknown". It is the only thing
+		// that can read this deployment's encrypted backups, and those
+		// backups outlive the deployment by design. Deleting it with the
+		// deployment would quietly destroy every backup's readability.
+		return KindHostChange, ActionPreserve, "kept: it is the only key that can read this deployment's encrypted backups, which teardown preserves. Delete it yourself once you are sure no backup needs it"
 	case "host/data-directory":
 		return KindData, ActionPreserve, "the Guacamole database, preserved by default"
 	case "host/package":
