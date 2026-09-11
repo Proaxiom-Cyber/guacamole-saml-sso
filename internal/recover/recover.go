@@ -19,6 +19,14 @@
 //     anything is created. "A matching name alone never establishes
 //     ownership. Ambiguous results require review."
 //
+// Ownership metadata is both halves of the restored record: the recorded
+// resources, and the journal. A phase that failed before it could save
+// created resources that no recorded resource mentions, and they are still
+// at the provider carrying this deployment's marker. Reconcile asks by
+// marker through internal/teardown's Finder seam, so it sees both, and an
+// unfinished intent whose provider cannot be asked stops the recovery
+// instead of passing as "nothing found".
+//
 // The deployment ID is kept, not minted. Every surviving cloud resource
 // carries the marker built from it, so a new ID would turn the whole
 // deployment into unowned strangers and duplicate all of it.
@@ -49,6 +57,7 @@ import (
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/creds"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recoverykey"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/teardown"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/ui"
 )
 
@@ -323,31 +332,41 @@ const (
 	WithParent Disposition = "with-parent"
 )
 
-// Live is what a provider reports about one recorded resource. A Finder
-// fills it in; the marker rules are applied here, not there.
-type Live struct {
-	// Present is whether the resource still exists at the provider.
-	Present bool
-	// ProviderID is its identifier now. It can differ from the recorded one.
-	ProviderID string
-	// Marker is the guacdeploy ownership marker found on it, "" when there
-	// is none. A name match without the marker leaves this empty, which is
-	// what sends the resource to review.
-	Marker string
-	// Detail is optional wording for the report.
+// Obligation is a journalled phase from the lost host that intended to
+// create provider resources and whose latest attempt did not succeed.
+//
+// It is the half of the truth the recorded resource list cannot hold. A
+// phase creates several resources and can fail before any of them is saved:
+// entra.Apply creates an application, a service principal, two groups and
+// their role assignments, and an error partway through returns with no
+// resource ID in the record. Those resources are still in the tenant, still
+// carrying this deployment's marker, and a recovery that ignored them would
+// create a second set beside them. That is the failure teardown already had
+// to fix, and dropping the journal on a replacement host brings it back.
+//
+// internal/teardown.Obligations decides which intents these are, from its
+// own map of which phase creates at which provider. Nothing here keeps a
+// second copy of that list.
+type Obligation struct {
+	Intent   string
+	Provider string
+	// Result is the journalled result of the latest attempt on the lost
+	// host: failed, uncertain, or interrupted.
+	Result string
+	// Answered is whether the provider could be asked at all. An
+	// unanswered obligation stops the recovery; it is not an empty answer.
+	Answered bool
+	// Detail is what reconciliation determined, or why it could not.
 	Detail string
 }
 
-// Finder asks one provider, read only, whether a recorded resource is still
-// there and whether it still carries the marker. It must create nothing,
-// change nothing and delete nothing.
-//
-// An error is not a licence to recreate: it sends the resource to review.
-type Finder func(ctx context.Context, r state.Resource) (Live, error)
-
-// Finders maps Key(resource) to its lookup. A missing entry means the
-// question cannot be asked here, which is review, never a guess.
-type Finders map[string]Finder
+// sweep is one provider's answer to "what of this deployment's is there?",
+// or the reason there is no answer.
+type sweep struct {
+	found teardown.Found
+	err   error
+	wired bool
+}
 
 // withParent are the recorded resources whose ownership follows a parent.
 var withParent = map[string]string{
@@ -365,6 +384,11 @@ type Item struct {
 	// Retarget marks an adopted DNS record whose tunnel is being recreated:
 	// the record is updated in place to the new tunnel, never duplicated.
 	Retarget bool
+	// Recovered marks a resource the provider reported that the record did
+	// not hold: a phase on the lost host created it and failed before
+	// saving it. It goes into the record so recovery does not create a
+	// second one.
+	Recovered bool
 }
 
 func (i Item) String() string {
@@ -390,11 +414,25 @@ type Report struct {
 	TakenAt      time.Time
 	Items        []Item
 	Needs        []Need
+	// Obligations are the lost host's unfinished creation intents, and what
+	// asking the provider made of each one.
+	Obligations []Obligation
 }
 
-// Reconcile classifies every recorded resource against what its provider
-// actually reports. It is read only at every provider and writes nothing.
-func Reconcile(ctx context.Context, l Loaded, finders Finders) Report {
+// Reconcile classifies the restored record against what the providers
+// actually report. It is read only at every provider and writes nothing.
+//
+// It asks each provider once, by this deployment's ownership marker, through
+// internal/teardown's Finder seam — the same query, the same marker
+// conventions and the same "a name match alone establishes nothing" rule
+// that teardown reconciliation uses, so a resource judged ours here is
+// judged ours identically there.
+//
+// One sweep per provider answers two questions the recorded resource list
+// cannot answer by itself: which recorded resources are still there, and
+// what a failed phase created and never saved. Both matter on a replacement
+// host, because either one recreated blindly is a duplicate.
+func Reconcile(ctx context.Context, l Loaded, find teardown.Finders) Report {
 	st := l.Snapshot.State
 	rep := Report{
 		DeploymentID: st.DeploymentID,
@@ -403,8 +441,72 @@ func Reconcile(ctx context.Context, l Loaded, finders Finders) Report {
 		TakenAt:      l.Snapshot.TakenAt,
 		Needs:        needs(st),
 	}
+
+	// Ask every provider the record mentions, and every provider an
+	// unfinished phase may have created at. The second set is the one that
+	// matters here: such a phase can have left a resource with no entry in
+	// the record at all, so nothing in st.Resources would ever ask about it.
+	var order []string
+	asked := map[string]*sweep{}
+	ask := func(provider string) *sweep {
+		s, seen := asked[provider]
+		if seen {
+			return s
+		}
+		s = &sweep{}
+		if f := find[provider]; f != nil {
+			s.wired = true
+			s.found, s.err = f(ctx)
+		}
+		asked[provider] = s
+		order = append(order, provider)
+		return s
+	}
 	for _, r := range st.Resources {
-		rep.Items = append(rep.Items, classify(ctx, r, st.DeploymentID, finders))
+		if r.Provider != "host" && r.Provider != "docker" {
+			ask(r.Provider)
+		}
+	}
+	obligations := teardown.Obligations(st)
+	for _, ob := range obligations {
+		ask(ob.Provider)
+	}
+
+	for _, r := range st.Resources {
+		rep.Items = append(rep.Items, classify(r, st.DeploymentID, asked[r.Provider]))
+	}
+
+	// What the providers hold that the record does not. A phase that failed
+	// before it could save is the reason this is not always empty.
+	for _, provider := range order {
+		s := asked[provider]
+		if !s.wired || s.err != nil {
+			continue
+		}
+		for _, res := range s.found.Owned {
+			if _, ok := match(res, st.Resources); ok {
+				continue // already in the record, already classified above
+			}
+			if res.Ownership == "" {
+				res.Ownership = "found at the provider by this deployment's ownership marker"
+			}
+			rep.Items = append(rep.Items, Item{Resource: res, Disposition: Adopt, Recovered: true,
+				ProviderID: res.ProviderID,
+				Detail: "found at " + provider + " carrying marker " + Marker(st.DeploymentID) +
+					", and missing from the record because a phase failed before it could be saved. It goes into the record as it is, so recovery does not create a second one"})
+		}
+		for _, res := range s.found.Unowned {
+			if _, ok := match(res, st.Resources); ok {
+				continue
+			}
+			rep.Items = append(rep.Items, Item{Resource: res, Disposition: Review, Recovered: true,
+				ProviderID: res.ProviderID,
+				Detail:     "found at " + provider + " under this deployment's naming but carrying no ownership marker. A matching name alone never establishes ownership, so it is neither adopted nor removed, and this deployment cannot be brought back onto a name something else holds"})
+		}
+	}
+
+	for _, ob := range obligations {
+		rep.Obligations = append(rep.Obligations, answer(ob, asked[ob.Provider], rep.Items, st.DeploymentID))
 	}
 
 	// The DNS record must end up pointing at whichever tunnel is actually in
@@ -433,8 +535,8 @@ func has(items []Item, key string, d Disposition) bool {
 // classify applies the ownership rules to one recorded resource. The rules
 // are the specification's: a verified marker adopts, an absent resource is
 // recreated, and everything else — a name match without the marker, a
-// provider that cannot be asked, a lookup that failed — is review.
-func classify(ctx context.Context, r state.Resource, deploymentID string, finders Finders) Item {
+// provider that cannot be asked, a provider with no query wired — is review.
+func classify(r state.Resource, deploymentID string, s *sweep) Item {
 	it := Item{Resource: r, ProviderID: r.ProviderID}
 
 	if detail, ok := withParent[Key(r)]; ok {
@@ -447,45 +549,103 @@ func classify(ctx context.Context, r state.Resource, deploymentID string, finder
 		return it
 	}
 
-	find := finders[Key(r)]
-	if find == nil {
-		it.Disposition = Review
-		it.Detail = fmt.Sprintf("no read-only lookup is wired for a %s %s, so whether it still exists cannot be established here. It is neither recreated nor removed", r.Provider, r.Type)
-		return it
-	}
-	live, err := find(ctx, r)
 	switch {
-	case err != nil:
+	case s == nil || !s.wired:
 		it.Disposition = Review
-		it.Detail = fmt.Sprintf("%s could not be asked about it: %v. Nothing is recreated while that is unknown, because a duplicate would be the result", r.Provider, err)
-	case !live.Present:
-		it.Disposition = Recreate
-		it.Detail = "gone at the provider: created again, with the intent journalled first"
-		it.ProviderID = ""
-		if live.Detail != "" {
-			it.Detail = live.Detail
-		}
-	case live.Marker == Marker(deploymentID):
-		it.Disposition = Adopt
-		it.ProviderID = live.ProviderID
-		it.Detail = "still there and carrying marker " + Marker(deploymentID) + ": reused as it is, not created again"
-		if live.Detail != "" {
-			it.Detail = live.Detail
-		}
+		it.Detail = fmt.Sprintf("no %s query is wired into this run, so whether it still exists cannot be established here. It is neither recreated nor removed", r.Provider)
+	case s.err != nil:
+		it.Disposition = Review
+		it.Detail = fmt.Sprintf("%s could not be asked: %v. Nothing is recreated while that is unknown, because a duplicate would be the result", r.Provider, s.err)
 	default:
-		found := "it carries no guacdeploy marker at all"
-		if live.Marker != "" {
-			found = "it carries " + live.Marker
+		if live, ok := match(r, s.found.Owned); ok {
+			it.Disposition = Adopt
+			it.ProviderID = live.ProviderID
+			it.Detail = "still there and proven ours by this deployment's ownership marker: reused as it is, not created again"
+			if live.Ownership != "" {
+				it.Detail = "still there and proven ours: " + live.Ownership + ". Reused as it is, not created again"
+			}
+			return it
 		}
-		it.Disposition = Review
-		it.ProviderID = live.ProviderID
-		it.Detail = fmt.Sprintf("something is there under this name, but %s, not %s. A matching name alone never establishes ownership, so it is neither adopted nor removed",
-			found, Marker(deploymentID))
-		if r.Ownership != "" {
-			it.Detail += ". The lost host recorded it as: " + r.Ownership
+		if live, ok := match(r, s.found.Unowned); ok {
+			it.Disposition = Review
+			it.ProviderID = live.ProviderID
+			it.Detail = fmt.Sprintf("something is there under this name, but it carries no %s ownership marker. A matching name alone never establishes ownership, so it is neither adopted nor removed",
+				Marker(deploymentID))
+			if r.Ownership != "" {
+				it.Detail += ". The lost host recorded it as: " + r.Ownership
+			}
+			return it
 		}
+		it.Disposition = Recreate
+		it.ProviderID = ""
+		it.Detail = "gone at the provider: created again, with the intent journalled first"
 	}
 	return it
+}
+
+// match finds r in a provider's answer. The identifier decides when both
+// sides have one, so a resource renamed at the provider but still carrying
+// the marker is recognised rather than recreated beside itself. Otherwise it
+// is the provider/type/name identity state.EnsureResource already uses.
+func match(r state.Resource, list []state.Resource) (state.Resource, bool) {
+	if r.ProviderID != "" {
+		for _, e := range list {
+			if e.ProviderID == r.ProviderID {
+				return e, true
+			}
+		}
+	}
+	for _, e := range list {
+		if e.Provider == r.Provider && e.Type == r.Type && e.Name == r.Name {
+			return e, true
+		}
+	}
+	return state.Resource{}, false
+}
+
+// answer says what asking the provider made of one unfinished creation
+// intent. A provider that could not be asked leaves it unanswered, which
+// stops the recovery: an unreachable provider is uncertain work, not proof
+// that the phase created nothing.
+func answer(ob teardown.Obligation, s *sweep, items []Item, deploymentID string) Obligation {
+	o := Obligation{Intent: ob.Intent, Provider: ob.Provider, Result: ob.Result}
+	lead := fmt.Sprintf("the %s phase on the lost host ended %s, so it may have created resources at %s that never reached the record",
+		ob.Intent, ob.Result, ob.Provider)
+	switch {
+	case s == nil || !s.wired:
+		o.Detail = lead + fmt.Sprintf(". No %s query is wired into this run, so that cannot be checked. Wire one, or check %s by hand for resources carrying marker %s, before recovering again",
+			ob.Provider, ob.Provider, Marker(deploymentID))
+	case s.err != nil:
+		o.Detail = lead + fmt.Sprintf(". %s could not be asked: %v. Check it for resources carrying marker %s before recovering again",
+			ob.Provider, s.err, Marker(deploymentID))
+	default:
+		o.Answered = true
+		var recovered int
+		for _, it := range items {
+			if it.Recovered && it.Disposition == Adopt && it.Resource.Provider == ob.Provider {
+				recovered++
+			}
+		}
+		switch recovered {
+		case 0:
+			o.Detail = lead + fmt.Sprintf(". %s was asked, and holds nothing of this deployment's that the record was missing", ob.Provider)
+		default:
+			o.Detail = lead + fmt.Sprintf(". %s was asked: %d resource(s) it created are listed above and go into the record, so they are not created a second time", ob.Provider, recovered)
+		}
+	}
+	return o
+}
+
+// Unanswered is the unfinished creation intents whose provider could not be
+// asked. Each one is work that may be sitting at a provider right now.
+func (r Report) Unanswered() []Obligation {
+	var out []Obligation
+	for _, o := range r.Obligations {
+		if !o.Answered {
+			out = append(out, o)
+		}
+	}
+	return out
 }
 
 // needs lists what a backup cannot carry. Credential values are excluded
@@ -567,17 +727,35 @@ func (r Report) Automatic() []Need {
 
 // RequiresReview reports the ambiguity that stops a recovery. Explicit
 // consent does not override it.
+//
+// Two things stop it, and the second is the one a resource list cannot see:
+// an unfinished creation intent whose provider could not be asked. Treating
+// that as "nothing found" is how a recovery creates a second Entra
+// application beside the one the failed phase already made.
 func (r Report) RequiresReview() error {
-	rv := r.Of(Review)
-	if len(rv) == 0 {
+	rv, un := r.Of(Review), r.Unanswered()
+	if len(rv) == 0 && len(un) == 0 {
 		return nil
 	}
-	var names []string
-	for _, it := range rv {
-		names = append(names, it.String())
+	var parts []string
+	if len(rv) > 0 {
+		var names []string
+		for _, it := range rv {
+			names = append(names, it.String())
+		}
+		parts = append(parts, fmt.Sprintf("%d resource(s) could not be shown to be this deployment's own work: %s",
+			len(rv), strings.Join(names, ", ")))
 	}
-	return fmt.Errorf("%w: %d recorded resource(s) could not be shown to be this deployment's own work: %s. Nothing was created, changed or removed",
-		ErrReviewRequired, len(rv), strings.Join(names, ", "))
+	if len(un) > 0 {
+		var intents []string
+		for _, o := range un {
+			intents = append(intents, o.Intent+" at "+o.Provider)
+		}
+		parts = append(parts, fmt.Sprintf("%d unfinished creation intent(s) could not be checked at their provider: %s",
+			len(un), strings.Join(intents, ", ")))
+	}
+	return fmt.Errorf("%w: %s. Nothing was created, changed or removed",
+		ErrReviewRequired, strings.Join(parts, "; and "))
 }
 
 // Print shows the classification before anything happens.
@@ -586,10 +764,32 @@ func (r Report) Print(u *ui.UI) {
 	u.Say("Deployment record read from %s%s. Nothing has been created, changed or removed yet.",
 		r.BackupFile, stamp(r.TakenAt))
 
-	section(u, "Still in the cloud and proven ours by its ownership marker. Reused, not created again:", r.Of(Adopt))
+	var adopted, recovered []Item
+	for _, it := range r.Of(Adopt) {
+		if it.Recovered {
+			recovered = append(recovered, it)
+			continue
+		}
+		adopted = append(adopted, it)
+	}
+	section(u, "Still in the cloud and proven ours by its ownership marker. Reused, not created again:", adopted)
+	section(u, "At a provider, carrying this deployment's marker, and missing from the record: a phase on the lost host created these and failed before it could save them. Adopted, not created a second time:", recovered)
 	section(u, "Gone, and created again after the intent is journalled:", r.Of(Recreate))
 	section(u, "On this host rather than in the cloud. Setup builds these again:", r.Of(Rebuild))
 	section(u, "Recovered with their parent, never separately:", r.Of(WithParent))
+
+	if len(r.Obligations) > 0 {
+		u.Say("")
+		u.Say("The lost host left unfinished work at a provider. Each one was checked before anything else:")
+		for _, o := range r.Obligations {
+			status := "ANSWERED"
+			if !o.Answered {
+				status = "NOT ANSWERED"
+			}
+			u.Say("  %s (%s)", o.Intent, status)
+			u.Say("       %s", o.Detail)
+		}
+	}
 
 	if rv := r.Of(Review); len(rv) > 0 {
 		u.Say("")
@@ -651,13 +851,24 @@ func stamp(t time.Time) string {
 // journalled, unfinished intent, so state.Pending drives the caller's
 // provisioning and a second interruption still cannot duplicate it.
 //
-// The action journal from the lost host is deliberately not carried over.
-// Its unfinished intents describe attempts on a machine that no longer
-// exists, and reconciliation has just answered every one of those questions
-// with a definite disposition. Recorded setting changes are kept: the
-// objects they changed are pre-existing ones that outlived the host, and
-// internal/settings drift-checks each against the live value before it
-// offers to restore anything.
+// The lost host's unfinished creation intents are carried over as answered
+// entries, one per obligation, recording what asking the provider found.
+// They must not be dropped: a phase that failed before saving can have left
+// a marked resource at a provider, and that evidence is the only thing
+// standing between a recovery and a duplicate. They must not be carried over
+// unfinished either — the original phase did not succeed, and a pending
+// intent naming a machine that no longer exists can never resolve — so each
+// becomes a finished "recover:reconciled:<intent>" entry that says what was
+// determined and keeps the original phase name inside it.
+//
+// A pending intent that creates nothing at any provider is not carried over.
+// The host it ran on is gone, so there is nothing left to reconcile; the
+// restore entry records how many there were.
+//
+// Recorded setting changes are kept: the objects they changed are
+// pre-existing ones that outlived the host, and internal/settings
+// drift-checks each against the live value before it offers to restore
+// anything.
 func Restore(l Loaded, rep Report, now time.Time) (*state.State, error) {
 	if err := rep.RequiresReview(); err != nil {
 		return nil, err
@@ -678,13 +889,20 @@ func Restore(l Loaded, rep Report, now time.Time) (*state.State, error) {
 
 	corr := state.NewID()
 	finished := now.UTC()
-	var adopted, recreate int
+	var adopted, recovered, recreate int
 	for _, it := range rep.Items {
 		r := it.Resource
 		switch it.Disposition {
 		case Adopt:
 			adopted++
 			r.ProviderID = it.ProviderID
+			if it.Recovered {
+				recovered++
+				r.CorrelationID = corr
+				if r.CreatedAt.IsZero() {
+					r.CreatedAt = finished
+				}
+			}
 			r.Ownership = strings.TrimSuffix(r.Ownership, ".") +
 				"; marker re-verified on this replacement host at " + finished.Format(time.RFC3339)
 		case Recreate:
@@ -696,16 +914,35 @@ func Restore(l Loaded, rep Report, now time.Time) (*state.State, error) {
 				Intent: "recover:recreate:" + Key(r) + ":" + r.Name,
 			})
 		}
-		st.Resources = append(st.Resources, r)
+		// EnsureResource gives a recovered resource the identifier it never
+		// got, and refuses to record the same provider/type/name twice.
+		st.EnsureResource(r)
 	}
 
-	// The restore itself, journalled ahead of the pending intents above so
-	// the record says where this deployment came from.
+	// Every obligation the lost host left, and what was made of it. Restore
+	// refuses while any is unanswered, so each one here has an answer.
+	for _, o := range rep.Obligations {
+		st.Actions = append(st.Actions, state.Action{
+			ID: state.NewID(), CorrelationID: corr,
+			Intent:    "recover:reconciled:" + o.Intent,
+			StartedAt: finished, FinishedAt: &finished, Result: state.ResultOK,
+			Detail: o.Detail,
+		})
+	}
+
+	// Pending intents that create nothing at a provider die with the host.
+	dropped := len(old.Pending()) - len(rep.Obligations)
+	if dropped < 0 {
+		dropped = 0
+	}
+
+	// The restore itself, journalled ahead of everything above so the record
+	// says where this deployment came from.
 	st.Actions = append([]state.Action{{
 		ID: state.NewID(), CorrelationID: corr, Intent: "recover:restore",
 		StartedAt: finished, FinishedAt: &finished, Result: state.ResultOK,
-		Detail: fmt.Sprintf("recovered onto a replacement host from %s: %d resource(s) adopted on a verified ownership marker, %d to create again",
-			rep.BackupFile, adopted, recreate),
+		Detail: fmt.Sprintf("recovered onto a replacement host from %s: %d resource(s) adopted on a verified ownership marker (%d of them found at a provider and missing from the record), %d to create again, %d unfinished creation intent(s) reconciled, %d host-local pending intent(s) not carried over",
+			rep.BackupFile, adopted, recovered, recreate, len(rep.Obligations), dropped),
 	}}, st.Actions...)
 	return st, nil
 }
