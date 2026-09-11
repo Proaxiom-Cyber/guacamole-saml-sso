@@ -743,3 +743,114 @@ func TestServicePrincipalWaitsForReplication(t *testing.T) {
 		t.Fatalf("want a replication error, got %v", err)
 	}
 }
+
+// The live lab failure: the application is created, and creating its service
+// principal moments later is refused because the directory has not made the
+// appId resolvable yet. Entra reports it as a generic Request_BadRequest, so
+// it reads like a wrong appId rather than a delay. It is a delay, and
+// retrying is safe because the refusal created nothing.
+func TestServicePrincipalWaitsForTheApplicationToReplicate(t *testing.T) {
+	old, oldPoll := ReplicationWait, replicationPoll
+	ReplicationWait, replicationPoll = time.Second, time.Millisecond
+	defer func() { ReplicationWait, replicationPoll = old, oldPoll }()
+
+	refusals, groups := 0, 0
+	f := &fake{t: t, routes: map[string]func(*testing.T, *http.Request) *http.Response{
+		"GET /v1.0/applications": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(200, map[string]any{"value": []any{}})
+		},
+		"GET /v1.0/groups": groupsByFilter(nil),
+		"GET /v1.0/organization": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(200, map[string]any{"value": []map[string]string{{"id": "tenant-1"}}})
+		},
+		"POST /v1.0/applications": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(201, map[string]string{"id": "obj-1", "appId": "app-1"})
+		},
+		"GET /v1.0/servicePrincipals": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(200, map[string]any{"value": []any{}})
+		},
+		"POST /v1.0/servicePrincipals": func(t *testing.T, r *http.Request) *http.Response {
+			if refusals < 2 {
+				refusals++
+				return graphErr(400, "Request_BadRequest",
+					"The appId 'app-1' of the service principal does not reference a valid application object.")
+			}
+			return jsonResp(201, map[string]string{"id": "sp-1"})
+		},
+		"PATCH /v1.0/servicePrincipals/sp-1": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(204, map[string]any{})
+		},
+		"POST /v1.0/servicePrincipals/sp-1/addTokenSigningCertificate": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(200, map[string]any{"thumbprint": "AA11"})
+		},
+		"POST /v1.0/groups": func(t *testing.T, r *http.Request) *http.Response {
+			groups++
+			return jsonResp(201, map[string]string{"id": "grp-" + string(rune('0'+groups))})
+		},
+		"POST /v1.0/servicePrincipals/sp-1/appRoleAssignedTo": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(201, map[string]any{})
+		},
+		"GET /v1.0/servicePrincipals/sp-1/appRoleAssignedTo": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(200, map[string]any{"value": []any{}})
+		},
+	}}
+	c := newClient(f, jwt(t, map[string]any{"scp": "Application.ReadWrite.All"}))
+	cfg := Config{Hostname: "guac.example.com", DeploymentID: "dep1",
+		AdminGroup: "Guacamole Administrators", OperatorGroup: "Guacamole Operators"}
+	p, err := c.Plan(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.Apply(context.Background(), p)
+	if err != nil {
+		t.Fatalf("a replication delay must not fail the deployment: %v", err)
+	}
+	if refusals != 2 {
+		t.Fatalf("the test did not exercise the delay: %d refusals", refusals)
+	}
+	if res.App.SPObjectID != "sp-1" {
+		t.Fatalf("service principal not created after the delay: %+v", res.App)
+	}
+	// The application itself is waited for too, before the reference is used.
+	if f.count("GET /v1.0/applications/obj-1") == 0 {
+		t.Error("the created application was never read back for replication")
+	}
+}
+
+// A genuinely wrong appId must still be reported, not retried for ever.
+func TestServicePrincipalGivesUpOnAnApplicationThatNeverAppears(t *testing.T) {
+	old := ReplicationWait
+	ReplicationWait = 10 * time.Millisecond
+	defer func() { ReplicationWait = old }()
+
+	f := &fake{t: t, routes: map[string]func(*testing.T, *http.Request) *http.Response{
+		"GET /v1.0/applications": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(200, map[string]any{"value": []any{}})
+		},
+		"GET /v1.0/groups": groupsByFilter(nil),
+		"GET /v1.0/organization": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(200, map[string]any{"value": []map[string]string{{"id": "tenant-1"}}})
+		},
+		"POST /v1.0/applications": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(201, map[string]string{"id": "obj-1", "appId": "app-1"})
+		},
+		"GET /v1.0/servicePrincipals": func(t *testing.T, r *http.Request) *http.Response {
+			return jsonResp(200, map[string]any{"value": []any{}})
+		},
+		"POST /v1.0/servicePrincipals": func(t *testing.T, r *http.Request) *http.Response {
+			return graphErr(400, "Request_BadRequest",
+				"The appId 'app-1' of the service principal does not reference a valid application object.")
+		},
+	}}
+	c := newClient(f, jwt(t, map[string]any{"scp": "Application.ReadWrite.All"}))
+	cfg := Config{Hostname: "guac.example.com", DeploymentID: "dep1",
+		AdminGroup: "Guacamole Administrators", OperatorGroup: "Guacamole Operators"}
+	p, _ := c.Plan(context.Background(), cfg)
+	_, err := c.Apply(context.Background(), p)
+	if err == nil {
+		t.Fatal("an appId that never resolves must be reported")
+	}
+	if !strings.Contains(err.Error(), "did not become usable within") {
+		t.Fatalf("the error does not explain the wait: %v", err)
+	}
+}

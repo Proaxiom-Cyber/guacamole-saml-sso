@@ -363,6 +363,10 @@ const DefaultReplicationWait = 90 * time.Second
 // not sleep.
 var ReplicationWait = DefaultReplicationWait
 
+// replicationPoll is how long to wait between attempts while the directory
+// catches up. A variable for the same reason.
+var replicationPoll = 2 * time.Second
+
 // waitVisible polls a freshly created object until Graph can read it.
 //
 // Entra is eventually consistent. A create call returns an object ID, and a
@@ -386,7 +390,7 @@ func (c *Client) waitVisible(ctx context.Context, path string) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(2 * time.Second):
+		case <-time.After(replicationPoll):
 		}
 	}
 }

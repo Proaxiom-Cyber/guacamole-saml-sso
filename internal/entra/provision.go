@@ -3,11 +3,13 @@ package entra
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 )
 
 const (
@@ -473,6 +475,16 @@ func (c *Client) Apply(ctx context.Context, plan *Plan) (*Result, error) {
 		res.App = Applied{ObjectID: created.ID, AppID: created.AppID,
 			DisplayName: AppDisplayName(cfg.Hostname), CreatedApp: true,
 			Evidence: "created by this deployment; marker " + marker + " in notes and tags from the creation request"}
+		// The service principal below is created from this application's
+		// appId, and the directory has to have replicated the application
+		// before that reference resolves. A live run failed here with
+		// "The appId ... does not reference a valid application object
+		// (Request_BadRequest)" moments after the application was created
+		// successfully. Wait for the application the same way the service
+		// principal and the groups are waited for.
+		if err := c.waitVisible(ctx, "/applications/"+created.ID); err != nil {
+			return nil, err
+		}
 	} else {
 		res.App = Applied{ObjectID: plan.App.ObjectID, AppID: plan.App.AppID, DisplayName: plan.App.DisplayName}
 		if plan.App.ProvenOurs {
@@ -502,10 +514,7 @@ func (c *Client) Apply(ctx context.Context, plan *Plan) (*Result, error) {
 		}
 	}
 	if sp == nil {
-		out, err := c.call(ctx, http.MethodPost, "/servicePrincipals", map[string]any{
-			"appId": res.App.AppID,
-			"tags":  []string{spTagSSO, marker},
-		})
+		out, err := c.createSP(ctx, res.App.AppID, marker)
 		if err != nil {
 			return nil, err
 		}
@@ -721,4 +730,53 @@ func (c *Client) CleanupGroup(ctx context.Context, cfg Config, groupObjectID str
 	}
 	_, err = c.call(ctx, http.MethodDelete, "/groups/"+groupObjectID, nil)
 	return err
+}
+
+// appNotYetReplicated reports whether Graph refused a write because the
+// application this appId names has not replicated yet. The message is the
+// only thing that distinguishes it: Entra returns the generic
+// Request_BadRequest code for a genuinely wrong appId and for one that is
+// merely too new, so the code alone cannot be used, and a real typo would
+// exhaust the wait and then be reported.
+func appNotYetReplicated(err error) bool {
+	var ge *GraphError
+	if !errors.As(err, &ge) {
+		return false
+	}
+	return ge.Code == "Request_BadRequest" &&
+		strings.Contains(ge.Message, "does not reference a valid application object")
+}
+
+// createSP creates the service principal for a freshly created application,
+// waiting out the directory replication that makes its appId resolvable.
+//
+// waitVisible on the application is not sufficient on its own: reading
+// /applications/<id> and resolving an appId reference are different lookups,
+// and a live run failed here with "The appId ... does not reference a valid
+// application object" after the application had been created successfully.
+// Retrying is safe for exactly this error because it is a rejection: Graph
+// created nothing, so there is no duplicate to make.
+func (c *Client) createSP(ctx context.Context, appID, marker string) (json.RawMessage, error) {
+	deadline := time.Now().Add(ReplicationWait)
+	for {
+		out, err := c.call(ctx, http.MethodPost, "/servicePrincipals", map[string]any{
+			"appId": appID,
+			"tags":  []string{spTagSSO, marker},
+		})
+		if err == nil {
+			return out, nil
+		}
+		if !appNotYetReplicated(err) {
+			return nil, err
+		}
+		if !time.Now().Before(deadline) {
+			return nil, fmt.Errorf("the application was created but its appId did not become usable within %s, so the directory has not replicated it: %w",
+				ReplicationWait, err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(replicationPoll):
+		}
+	}
 }
