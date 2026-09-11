@@ -482,15 +482,20 @@ func TestStackPhasesFullPipelineUnattended(t *testing.T) {
 		t.Fatal("password leaked into .env")
 	}
 
-	// Password travels via stdin only, escaped for Compose.
+	// The password no longer travels through a Compose override at all. It
+	// is written to an owner-only file on memory-backed storage that the
+	// container reads for itself, because an override sets a container
+	// environment field and Docker keeps those on disk. See
+	// internal/stack/secrets.go. Nothing secret may reach docker's stdin or
+	// its arguments.
 	var sawUp bool
 	for _, c := range calls {
 		joined := strings.Join(c.args, " ")
 		if strings.Contains(joined, " up ") || strings.HasSuffix(joined, " up") || strings.Contains(joined, "up --detach") {
 			sawUp = true
-			if !strings.Contains(c.stdin, "pa$$s-Xy1-secret") {
-				t.Fatalf("stdin override missing escaped password: %q", c.stdin)
-			}
+		}
+		if strings.Contains(c.stdin, dbPassword) || strings.Contains(c.stdin, "pa$$s-Xy1-secret") {
+			t.Fatal("password reached docker on stdin")
 		}
 		for _, a := range c.args {
 			if strings.Contains(a, dbPassword) {

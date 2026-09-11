@@ -1,7 +1,26 @@
 # Apache Guacamole behind nginx. Rendered by guacdeploy; do not edit by
 # hand — the tool overwrites this file. Non-secret settings come from .env.
-# The database password arrives through an in-memory Compose override at
-# start time and never lives in this directory.
+#
+# No credential is an environment field anywhere in this file. Docker keeps a
+# container's environment in its own metadata under
+# /var/lib/docker/containers/<id>/config.v2.json, so an environment field is a
+# plaintext copy of the credential on persistent disk, kept even when the
+# deployment's own credential store is sealed to the TPM. Every credential is
+# delivered as a file instead, through a memory-backed directory that
+# guacdeploy fills at start time:
+#
+#   postgres     POSTGRES_PASSWORD_FILE      (official image, file_env)
+#   guacamole    POSTGRESQL_PASSWORD_FILE    (ENABLE_FILE_ENVIRONMENT_PROPERTIES)
+#   cloudflared  TUNNEL_TOKEN_FILE           (--token-file)
+#
+# Only the paths appear here and in Docker's metadata. The files themselves
+# live on tmpfs, are owner-only, and are gone after a cold boot; the
+# guacdeploy-stack.service boot unit writes them again before it starts the
+# stack. The SELinux option is the lowercase, shared "z": guacdeploy writes
+# these files from outside the container after Docker has labelled the
+# directory, and a private "Z" label would put them in a different MCS
+# category. Access control here is the file owner and mode 0600, not the
+# label.
 
 name: guacamole
 
@@ -42,7 +61,10 @@ services:
       PGDATA: /var/lib/postgresql/data/guacamole
       POSTGRES_DB: guacamole_db
       POSTGRES_USER: guacamole_user
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      # docker-entrypoint.sh reads this file through its file_env helper while
+      # it is still root, before it drops to the postgres account, so the file
+      # can stay root-owned and mode 0600.
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres-password
       # Read by init/002-groups.sh on first start only.
       GUAC_ADMIN_GROUP: ${GUAC_ADMIN_GROUP:?}
       GUAC_OPERATOR_GROUP: ${GUAC_OPERATOR_GROUP:?}
@@ -51,10 +73,15 @@ services:
     volumes:
       - ./init:/docker-entrypoint-initdb.d:ro,Z
       - ./data:/var/lib/postgresql/data:Z
+      - {{ .RuntimeSecretsDir }}/postgres:/run/secrets:ro,z
     healthcheck:
       # TCP checks the password. Query the schema too: PostgreSQL can restart
       # after an init script fails and accept connections with no Guacamole tables.
-      test: ["CMD-SHELL", "PGPASSWORD=\"$$POSTGRES_PASSWORD\" psql --host=127.0.0.1 --username=\"$$POSTGRES_USER\" --dbname=\"$$POSTGRES_DB\" --no-password --set=ON_ERROR_STOP=1 --command='SELECT entity_id FROM guacamole_entity LIMIT 0; SELECT user_group_id FROM guacamole_user_group LIMIT 0;' >/dev/null 2>&1"]
+      #
+      # The check reads the same file the entrypoint did. It cannot read
+      # $POSTGRES_PASSWORD: the entrypoint exports that inside its own process
+      # tree only, and the container environment no longer carries it.
+      test: ["CMD-SHELL", "PGPASSWORD=\"$$(cat /run/secrets/postgres-password)\" psql --host=127.0.0.1 --username=\"$$POSTGRES_USER\" --dbname=\"$$POSTGRES_DB\" --no-password --set=ON_ERROR_STOP=1 --command='SELECT entity_id FROM guacamole_entity LIMIT 0; SELECT user_group_id FROM guacamole_user_group LIMIT 0;' >/dev/null 2>&1"]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -72,7 +99,13 @@ services:
       POSTGRESQL_HOSTNAME: postgres
       POSTGRESQL_DATABASE: guacamole_db
       POSTGRESQL_USERNAME: guacamole_user
-      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD:-}
+      # guacamole/guacamole:1.6.0 already sets this in its own Dockerfile. It
+      # is repeated here because the whole delivery depends on it: with it
+      # false, the web application never looks at POSTGRESQL_PASSWORD_FILE,
+      # the postgresql extension fails to load, and every sign-in is refused
+      # while the container still looks healthy.
+      ENABLE_FILE_ENVIRONMENT_PROPERTIES: "true"
+      POSTGRESQL_PASSWORD_FILE: /run/secrets/postgresql-password
 {{- if .SAMLMetadataURL }}
       # SAML authenticates. The database only authorises.
       SAML_IDP_METADATA_URL: ${SAML_IDP_METADATA_URL:?}
@@ -100,17 +133,22 @@ services:
       # Read-only: guacd owns these files, and the web application must never
       # be able to alter or delete session evidence.
       - ./recordings:/recordings:ro,z
+      - {{ .RuntimeSecretsDir }}/guacamole:/run/secrets:ro,z
 
   # Started only when COMPOSE_PROFILES in .env contains "cloudflare".
   cloudflared:
     image: cloudflare/cloudflared:latest
     command: tunnel --no-autoupdate --metrics 127.0.0.1:2000 run
     environment:
-      # Not ":?" — Compose interpolates every service, even ones outside the active profile.
-      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+      # "cloudflared tunnel run" reads the connector token from this file
+      # (--token-file), trimming surrounding whitespace. The container runs as
+      # uid 65532, so the file is owned by 65532 rather than root.
+      TUNNEL_TOKEN_FILE: /run/secrets/tunnel-token
     networks: [guacnet]
     profiles: [cloudflare]
     restart: always
+    volumes:
+      - {{ .RuntimeSecretsDir }}/cloudflared:/run/secrets:ro,z
     healthcheck:
       test: ["CMD", "cloudflared", "tunnel", "--metrics", "127.0.0.1:2000", "ready"]
       interval: 5s

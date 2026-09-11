@@ -129,9 +129,9 @@ and the action summary can tell them apart.
 
 `stackSecrets` already calls `m.Get(spec)`. For the two new modes `Get` reads the blob,
 pipes it into `systemd-creds decrypt` through stdin, and returns the plaintext in memory.
-The value then travels to Compose exactly as it does today, through the in-memory stdin
-override built by `stack.override()` and passed to `stack.Up` as `-f -`. It never reaches a
-rendered file, a command argument, or the `.env` file.
+The value then travels to `stack.Up`, which writes it to an owner-only file on tmpfs that
+the container reads for itself. It never reaches a rendered file, a command argument, the
+`.env` file, or Docker's stored container environment. See `internal/stack/WIRING.md`.
 
 `Get` has no `context` parameter, because callers predate this slice. It applies its own
 30-second timeout so a TPM that stops answering fails the boot unit with a message instead
@@ -231,17 +231,16 @@ to revoke: the key never left the host.
 
 ## 7. What this does not do, and you should know it
 
-- **Docker keeps its own copy of the password.** The compose services carry
-  `restart: always`, so after a reboot Docker restarts the containers itself, using the
-  environment recorded in `/var/lib/docker/containers/<id>/config.v2.json`. That file is
-  root-only, but it is a persistent plaintext copy of the database password that this tool
-  does not manage and cannot encrypt. It is a property of delivering credentials through
-  Compose at all, not of this slice, and it applies identically to all five modes. The boot
-  unit matters for the cases where Docker's restart policy is not enough: after
-  `docker compose down`, after an image change, after a credential rotation, and whenever
-  a container has to be recreated rather than restarted. Decide whether the Docker-side
-  copy is acceptable and say so in the operator guide; do not let acceptance criterion 2
-  ("no unapproved persistent plaintext copies") be signed off without naming it.
+- **Docker no longer keeps its own copy of the password.** It used to: the compose
+  services carry `restart: always`, and Docker records a container's environment in
+  `/var/lib/docker/containers/<id>/config.v2.json`, so delivering the password as an
+  environment field left a persistent plaintext copy on disk that this package could not
+  encrypt. `internal/stack` now writes each credential to an owner-only file on tmpfs and
+  the containers read it for themselves; see `internal/stack/WIRING.md` for the mechanism
+  per image and for `stack.CheckDelivery`, which proves no copy reached Docker's metadata.
+  The boot unit is what repopulates that tmpfs after a cold boot, so it is now load-bearing
+  rather than a convenience: without it the containers Docker restarts by itself come up
+  with no credential.
 - **`host+tpm2`, not `tpm2` alone.** Both bind to one machine, so neither survives a move
   to a replacement host. `host+tpm2` additionally requires the root-only host secret, so
   reading the TPM is not sufficient by itself. It is systemd's own default.

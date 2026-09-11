@@ -12,15 +12,6 @@ import (
 	"time"
 )
 
-func TestOverrideEscapesDollarsAndCarriesSecrets(t *testing.T) {
-	o := override("pa$s", "tok$en")
-	if !strings.Contains(o, `"POSTGRES_PASSWORD":"pa$$s"`) ||
-		!strings.Contains(o, `"POSTGRESQL_PASSWORD":"pa$$s"`) ||
-		!strings.Contains(o, `"TUNNEL_TOKEN":"tok$$en"`) {
-		t.Fatalf("override = %s", o)
-	}
-}
-
 func TestRenderWritesAssetsAndCertOnce(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{InstallDir: dir, Hostname: "guac.example.test", AdminGroup: "GA", OperatorGroup: "GO"}
@@ -99,23 +90,23 @@ func TestGenerateSchemaValidatesAndCaches(t *testing.T) {
 	}
 }
 
-func TestUpKeepsPasswordOutOfArguments(t *testing.T) {
+func TestUpKeepsPasswordOutOfArgumentsAndStdin(t *testing.T) {
 	var gotStdin string
 	var gotArgs []string
 	run := func(_ context.Context, stdin, name string, args ...string) (string, error) {
 		gotStdin, gotArgs = stdin, append([]string{name}, args...)
 		return "ok", nil
 	}
-	cfg := Config{InstallDir: t.TempDir()}
-	if err := Up(context.Background(), run, cfg, "pa$sword", ""); err != nil {
+	cfg := Config{InstallDir: t.TempDir(), RuntimeSecretsDir: filepath.Join(t.TempDir(), "run")}
+	if err := Up(context.Background(), run, cfg, "pa$sword", "tok$en"); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(gotStdin, "pa$$sword") {
-		t.Fatalf("password not delivered via stdin override: %q", gotStdin)
+	if strings.Contains(gotStdin, "pa$sword") || strings.Contains(gotStdin, "tok$en") {
+		t.Fatal("a credential was piped to docker on stdin")
 	}
 	for _, a := range gotArgs {
-		if strings.Contains(a, "pa$sword") || strings.Contains(a, "pa$$sword") {
-			t.Fatalf("password leaked into argv: %v", gotArgs)
+		if strings.Contains(a, "pa$sword") || strings.Contains(a, "tok$en") {
+			t.Fatalf("a credential leaked into argv: %v", gotArgs)
 		}
 	}
 }

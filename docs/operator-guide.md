@@ -72,9 +72,15 @@ certificate until the origin certificate is issued. Setup checks container
 health and then checks that Guacamole answers through nginx.
 
 Unattended runs supply `--hostname`, `--admin-group`, and
-`--operator-group`. The database password travels to Compose through an
-in-memory override, never through a rendered file or a command argument.
-Containers restart automatically with Docker after a reboot. The database
+`--operator-group`. No credential is given to a container as an environment
+variable. Docker keeps a container's environment in its own metadata on disk
+and re-reads it on every boot, so an environment variable is a permanent
+plaintext copy of the credential. Each credential is written instead to an
+owner-only file under `/run/guacdeploy/secrets`, which is memory-backed: the
+container reads the file itself, and a reboot leaves nothing behind. The
+`guacdeploy-stack.service` boot unit writes the files again and restarts the
+containers after each boot. Containers restart automatically with Docker
+after a reboot. The database
 data directory is recorded as data to preserve: ordinary teardown keeps it,
 and only an explicit deletion request removes it.
 
@@ -317,10 +323,12 @@ Until the origin certificate is issued, the public hostname returns a
 Cloudflare origin-TLS error, because nginx still serves the temporary
 self-signed certificate. Verification is never disabled to hide that.
 
-The connector token is fetched when the stack starts and delivered
-through the in-memory Compose override. It is never written to the
-deployment record, `.env`, logs or command arguments, so rotating it in
-Cloudflare needs no local change.
+The connector token is fetched when the stack starts and written to
+`/run/guacdeploy/secrets/cloudflared/tunnel-token`, an owner-only file on
+memory-backed storage that cloudflared reads for itself through
+`TUNNEL_TOKEN_FILE`. It is never written to the deployment record, `.env`,
+logs, command arguments, or the container's stored environment, so rotating
+it in Cloudflare needs no local change.
 
 A DNS record that already occupies the hostname without this
 deployment's marker is never overwritten: setup stops and asks.
