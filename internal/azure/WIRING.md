@@ -6,23 +6,28 @@ for that**, checks three permissions separately, grants the unattended uploader 
 data role, and uploads published backups. It deletes nothing except its own marked blobs.
 
 It imports `internal/backup` (the published-completion contract), `internal/schedule` (the
-valid-backup listing) and `internal/recording` (where recording copies live), and nothing
-else from the deployment. The parent wires it into the phase registry, the status command,
-and a timer. Nothing under `internal/session`, `internal/stack`, `internal/host`,
-`internal/creds`, `internal/backup`, `internal/schedule`, `internal/recording`,
-`internal/certs`, `internal/settings`, `internal/entra`, `internal/cloudflare`,
-`internal/teardown`, or `cmd/guacdeploy/main.go` was modified.
+valid-backup listing, the runner seam and the unit names it extends) and
+`internal/recording` (where recording copies live and what the last local cleanup deleted),
+and nothing else from the deployment. The parent wires it into the phase registry, the
+status command, and a timer. Nothing under `internal/session`, `internal/stack`,
+`internal/host`, `internal/creds`, `internal/backup`, `internal/schedule`,
+`internal/recording`, `internal/certs`, `internal/settings`, `internal/entra`,
+`internal/cloudflare`, `internal/teardown`, or `cmd/guacdeploy/main.go` was modified.
 
 Files: `internal/azure/{azure.go,auth.go,blob.go,check.go,upload.go}` (issue #17),
-`internal/azure/{create.go,role.go}` (issue #18), `cmd/guacdeploy/azure.go`.
+`internal/azure/{create.go,role.go}` (issue #18), `internal/azure/unit.go` (issue #19),
+`cmd/guacdeploy/azure.go`.
 
-## The two slices
+## The three slices
 
 Issue #17 is **using storage that already exists**: `Resolve` selects it and fails, naming
 what does exist, when it is not there. Issue #18 is **creating it**: `PlanCreate` /
 `ApplyCreate`, plus the role assignment the unattended uploader needs. Both end with the
 same `Destination`, and everything after selection — permission checks, upload,
 completeness, retrieval — is shared.
+
+Issue #19 is **running the upload on the backup timer**, unattended: `InstallUpload` adds
+one drop-in to the scheduled backup's service, and `Upload` is the run it starts.
 
 The management plane is reached through exactly two helpers: `armGet`, which only reads,
 and `armPut`, which only writes with PUT. There is no third.
@@ -118,7 +123,37 @@ creation — it is somebody else's resource — and the answer is `ErrRequiresRe
 way, before or after a lost response. (`internal/entra` needs its `AfterUncertainCreate`
 flag because Graph cannot do this; ARM can.)
 
-### 4. Naming
+### 4. The scheduled run extends the backup timer instead of adding its own (issue #19)
+
+The upload copies files the scheduled database backup has just published. A timer of its
+own would have to be set to a later hour and *hope* the backup had finished. So
+`InstallUpload` writes one systemd drop-in,
+`/etc/systemd/system/guacdeploy-backup.service.d/10-azure-upload.conf`, adding a second
+`ExecStart=` to that service. The service is `Type=oneshot`, which runs its `ExecStart`
+lines one after another in order, and a drop-in appends to that list. The upload therefore
+runs on the same timer as the backup and always after it.
+
+`internal/schedule` is not modified: a drop-in is systemd's own mechanism for extending a
+unit somebody else owns, and `UninstallUpload` removes only the drop-in, never the service.
+Both files carry the same `# guacdeploy deployment=<id>` first line the other units use, and
+neither is removed unless that line matches.
+
+**What this costs, stated plainly.** systemd stops a `oneshot` service at the first
+`ExecStart` that fails, so a night when the *database backup* fails is also a night when
+nothing is uploaded. That is the specified behaviour rather than a new hazard — the local
+recording budget deletes on its own hourly timer either way, and any resulting loss is
+reported (see below) — but an operator whose database backup has been failing for a week
+should run `guacdeploy azure-upload --dest <dest>` by hand. If that trade ever stops being
+acceptable, the change is a separate timer ordered `After=guacdeploy-backup.service`, not a
+change to the completion contract.
+
+The upload needs nothing from the provisioning run: the command line carries only
+`--state-dir` and `--dest`, the destination comes from deployment state, the retention
+period comes from deployment state, and the client secret is read from the credential store
+at the point of use. **No credential is ever on the command line, in the unit, or in an
+environment file**, and a test fails if one appears.
+
+### 5. Naming
 
 | Resource | Candidate | Why |
 |---|---|---|
@@ -191,10 +226,25 @@ ra, err := c.AssignUploaderRole(ctx, d, servicePrincipalObjectID)  // idempotent
 k := azure.WaitRoleEffective(ctx, uploaderClient, d, st.DeploymentID, azure.RoleWait{})
 
 // Upload and status.
-rep, err := azure.Upload(ctx, c, azure.Options{...})
+rep, err := azure.Upload(ctx, c, azure.Options{
+        Dest: dest, StateDir: stateDir, DeploymentID: st.DeploymentID, Destination: d,
+        ClientID: appID, AuthMode: "service-principal",
+        OnCalendar: st.Config["azure-upload-schedule"],
+})
+rep.Database / rep.Recordings          // never merged; each {Uploaded, AlreadyThere, Failed}
+rep.DeletedWithoutRemoteCopy           // recordings the local budget lost for good
 azure.Summary(stateDir)                                            // destination + last result
 c.RemoteComplete(ctx, d, dir, name, deploymentID, azure.AreaDatabase) // retrieval proof
 c.DeleteOwnedBlob(ctx, d, blobName, deploymentID)                  // marker-verified, prefix-scoped
+
+// Make the backup timer upload as well. Install AFTER schedule.Install: it
+// extends that service and refuses when it is not there.
+in, err := azure.InstallUpload(ctx, azure.UnitOptions{
+        Run: schedule.ExecRunner, DeploymentID: st.DeploymentID,
+        StateDir: stateDir, Dest: st.Config["backup-dest"]})
+in.DropInPath / in.ExecStart / in.Changed
+removed, err := azure.UninstallUpload(ctx, azure.UnitOptions{
+        Run: schedule.ExecRunner, DeploymentID: st.DeploymentID})
 ```
 
 `azure.Destination` holds only non-secret references and is safe in deployment state and in
@@ -268,7 +318,7 @@ Non-secret references only, as usual. The constants live in `cmd/guacdeploy/azur
 | `azure-blob-endpoint` | the account's blob endpoint, taken from Azure (sovereign clouds differ) |
 | `azure-tenant-id` | directory the unattended principal signs in to |
 | `azure-client-id` | the unattended application's client ID |
-| `azure-upload-schedule` | `OnCalendar` expression actually installed |
+| `azure-upload-schedule` | `OnCalendar` expression actually installed (the backup timer's) |
 | `azure-location` | region the storage was created in (creation path only) |
 | `azure-role-assignment` | the uploader's role assignment name, a GUID (creation path only) |
 
@@ -336,22 +386,81 @@ specification forbids.
 
 ## Scheduling the upload
 
-The upload copies already-published local files, so it must run **after** the backup and
-the recording run. Two ways, both fine:
+`InstallUpload` does it, and the parent calls it **after** `schedule.Install` — it extends
+that service and refuses, naming the fix, when the backup schedule is not installed.
 
-- Add `azure-upload` to the existing backup timer's service as a second `ExecStart=` line
-  (systemd runs them in order, and the unit is `Type=oneshot`). This is the recommended
-  one: it cannot run before the backup it is meant to upload.
-- Install a separate timer at a later hour, the same way `schedule.Install` does.
+```go
+in, err := azure.InstallUpload(ctx, azure.UnitOptions{
+        Run:          schedule.ExecRunner,
+        DeploymentID: st.DeploymentID,
+        StateDir:     stateDir,
+        Dest:         st.Config["backup-dest"],   // the same destination the backup publishes to
+})
+```
 
-Either way the installed routine calls the deployment-owned runtime copy of the binary
-(`/usr/local/lib/guacdeploy/guacdeploy`), not the provisioning binary — see
-`internal/schedule/WIRING.md`. This package needs nothing else from the provisioning run:
-the destination comes from state and the credential from the credential store.
+It writes one drop-in on the backup service and reloads systemd only when the file changed,
+so a resumed or repeated setup does not churn. `UnitDir` and `RuntimeDir` stay zero in real
+runs; tests inject them. The installed command is
 
+```
+/usr/local/sbin/guacdeploy-runtime azure-upload --state-dir <dir> --dest <dest>
+```
+
+— the deployment-owned runtime copy `internal/schedule` installs, not the provisioning
+binary the operator may delete. That is what makes the schedule survive a reboot without the
+provisioning binary. This package needs nothing else from the provisioning run: the
+destination, the schedule and the retention period come from deployment state, and the
+client secret from the credential store at the point of use.
+
+Phase placement: immediately after the backup-schedule phase. Record the drop-in as one more
+created resource, the same way that phase records its units:
+
+```go
+st.EnsureResource(state.Resource{Provider: "host", Type: "systemd-dropin", Name: in.DropInPath,
+        CorrelationID: corrID,
+        Ownership: "file written by this deployment, first line marks deployment ID",
+        CreatedAt: time.Now().UTC()})
+```
+
+The recording timer is left alone. It runs hourly, publishes the local recording copies and
+applies the storage budget; this run uploads whatever complete copies it finds. The two are
+deliberately not chained — see the next section.
+
+## Local recording retention and remote copies are independent, in both directions
+
+This is the part that is easy to get wrong, and the specification states it twice.
+
+- **The local storage budget deletes whether or not the upload succeeded.** "Upload success
+  is not a condition for deletion. The local storage budget takes priority over preserving
+  unbacked recordings" (specification, "Local recording retention"). `internal/recording`
+  owns that and this package does not touch it: there is no call from here that could stop,
+  delay or condition a local deletion, and none may be added.
+- **The loss is reported, not prevented.** After uploading, `Upload` reads the last local
+  cleanup record and names every recording it deleted that has no confirmed copy in the
+  container, in `Report.DeletedWithoutRemoteCopy` and as a `LOST:` line in the summary.
+  That is the whole of the coupling: read-only, after the fact, and it never fails the run.
+- **An active recording cannot be uploaded**, structurally rather than by a check. This run
+  copies only *published* recording copies, and `internal/recording` publishes a copy only
+  for a recording no process still holds open. There is no path from a live session's file
+  to a blob.
+- **An in-progress upload is never reported as complete**, by the verify-then-manifest
+  contract above. A recording being uploaded right now has no completion manifest in the
+  container yet, so `RemoteComplete` says no, and the loss report treats it as unconfirmed.
 ## Teardown
 
-**Do nothing.** There is no teardown call here on purpose, and there is no account or
+**Do nothing in Azure**, and remove the drop-in on the host.
+
+```go
+removed, err := azure.UninstallUpload(ctx, azure.UnitOptions{
+        Run: schedule.ExecRunner, DeploymentID: st.DeploymentID})
+```
+
+It removes `.../guacdeploy-backup.service.d/10-azure-upload.conf` only when that file
+carries this deployment's marker, leaves the backup service itself to
+`schedule.Uninstall`, and is repeatable — a missing file is not an error. Drop the matching
+`state.Resource` for the path in `removed` only.
+
+There is no other teardown call here on purpose, and there is no account or
 container deletion path to call.
 
 "Preserve remote backups and their supporting storage resources during ordinary teardown"
@@ -386,7 +495,8 @@ u.Say("%s", azure.Summary(stateDir))
 
 It prints "No Azure upload has run yet." when the file is absent, so it is safe to call
 unconditionally. It shows the destination, the object prefix, which application signed in
-and how, the last run and result, and database and recording counts **separately**.
+and how, the last run and result, database and recording counts **separately**, and every
+recording the local budget lost for good.
 
 ## Behaviour the parent must not undo
 
@@ -412,6 +522,11 @@ and how, the last run and result, and database and recording counts **separately
 - **The completion manifest is written last.** Never write it before the read-back check;
   a blob with a manifest is counted as a complete backup.
 - **Database and recording results stay apart.** Never merge the two `Outcome` values.
+- **Local recording cleanup is never made conditional on an upload.** The budget wins, the
+  loss is reported. Do not add a "skip deletion when the upload failed" path anywhere.
+- **The scheduled upload carries no credential on its command line.** The client secret is
+  read from the credential store at the point of use. Do not pass it as a flag, an
+  environment variable in the unit, or an `EnvironmentFile=`.
 - **Blob names stay under `guacdeploy/<deployment-id>/`** and every object carries the
   `guacdeploy_deployment` metadata marker. Retention, scoping and deletion all depend on
   both.
@@ -449,6 +564,9 @@ needs. Retrieval tooling must therefore use Entra sign-in (`az storage blob down
 - **Blob listing does not follow continuation markers.** The two callers (a permission
   probe and a "what is already there" lookup) do not need the whole container. Issue #20
   will need paging.
+- **A failed database backup also skips that night's upload**, because systemd stops a
+  `oneshot` service at the first failing `ExecStart`. See decision 4 for the trade and the
+  manual command.
 - **The completion manifest is integrity evidence, not authentication.** Anything that can
   rewrite a blob can rewrite its manifest. It catches truncation, corruption and foreign
   objects, which is what retention needs. Signing is not V1.
@@ -475,6 +593,7 @@ needs. Retrieval tooling must therefore use Entra sign-in (`az storage blob down
   marker query and lead to a second create attempt, which the deterministic name would
   then turn into `ErrNameTaken` rather than a duplicate. Add `nextLink` following before
   that is likely.
-- **Everything here is unit-tested against a fake HTTP seam.** No call has been made to a
-  real Azure subscription. Live verification of sign-in, creation, role behaviour, upload
-  and retrieval is still required before acceptance (A18, A19, A23).
+- **Everything here is unit-tested against a fake HTTP seam and a temporary filesystem.**
+  No call has been made to a real Azure subscription, and no systemd unit has been loaded
+  by systemd. Live verification of sign-in, creation, role behaviour, upload, retrieval and
+  the timer actually firing is still required before acceptance (A18, A19, A20, A23).

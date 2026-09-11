@@ -24,6 +24,7 @@ const (
 	azureBlobEndpointConfig  = "azure-blob-endpoint"
 	azureTenantConfig        = "azure-tenant-id"
 	azureClientIDConfig      = "azure-client-id"
+	azureScheduleConfig      = "azure-upload-schedule"
 )
 
 // azureDestinationFrom rebuilds the selected destination from the deployment
@@ -72,7 +73,6 @@ func azureUploadCmd(ctx context.Context, stateDir, dest string, u *ui.UI) error 
 	if dest == "" {
 		return fmt.Errorf("an Azure upload needs --dest: the local backup destination it copies from")
 	}
-
 	m := &creds.Manager{Mode: st.Config["credential-mode"], Dir: filepath.Join(stateDir, "credentials")}
 	principal := &azure.ServicePrincipal{
 		App: azure.App{
@@ -91,7 +91,7 @@ func azureUploadCmd(ctx context.Context, stateDir, dest string, u *ui.UI) error 
 	rep, err := azure.Upload(ctx, c, azure.Options{
 		Dest: dest, StateDir: stateDir, DeploymentID: st.DeploymentID, Destination: d,
 		ClientID: st.Config[azureClientIDConfig], AuthMode: "service-principal",
-		OnCalendar: st.Config["azure-upload-schedule"],
+		OnCalendar: st.Config[azureScheduleConfig],
 	})
 	u.Say("%s", rep.Summary())
 	return err

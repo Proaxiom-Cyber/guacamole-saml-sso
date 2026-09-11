@@ -225,21 +225,52 @@ type Report struct {
 	Database   Outcome `json:"database"`
 	Recordings Outcome `json:"recordings"`
 
+	// DeletedWithoutRemoteCopy is every recording the local storage budget
+	// removed in the last cleanup run that has no confirmed copy in the
+	// container. That deletion can permanently lose a recording, so it is
+	// named rather than counted.
+	//
+	// It is a report, not a coupling. The local budget deletes whether or not
+	// an upload succeeded — "the local storage budget takes priority over
+	// preserving unbacked recordings" (specification, "Local recording
+	// retention") — and nothing here can or does stop it. This line exists so
+	// the loss is visible.
+	DeletedWithoutRemoteCopy []string `json:"deleted_without_remote_copy,omitempty"`
+	// CleanupRan is when the local cleanup run that DeletedWithoutRemoteCopy
+	// refers to happened. Local cleanup is on its own timer, so it is not
+	// this run's clock.
+	CleanupRan time.Time `json:"cleanup_ran,omitempty"`
+
 	Error      string `json:"error,omitempty"`
 	OnCalendar string `json:"on_calendar,omitempty"`
 }
 
-// Upload copies this deployment's complete local backups and recording copies
-// into the container, and records the outcome either way.
+// Upload is the whole scheduled Azure run: copy this deployment's complete
+// local backups and recording copies into the container, report what the local
+// storage budget lost, and record the outcome either way.
 //
 // It uploads from the local published destination rather than exporting
 // again: the local publish already carries the completion proof, so the
 // upload is a copy of something known to be whole, and a database export
 // never happens twice. Files already complete in the container are skipped,
-// so a run after an outage catches up rather than re-sending everything.
+// so a run after an outage catches up rather than re-sending everything —
+// that skip is how an interrupted transfer is retried, because an interrupted
+// one left no completion manifest and so does not count as already there.
 //
 // A failed recording upload does not stop the database result being recorded,
 // and neither result is ever merged into the other.
+//
+// # The order, and why
+//
+//  1. Database backups, then recordings, each into its own Outcome.
+//  2. The cross-check against the last local cleanup, whether or not the
+//     uploads succeeded: the budget has already deleted by then, and the
+//     point of the line is to say what that cost.
+//
+// An active recording cannot be uploaded here, structurally rather than by a
+// check: this run copies only published recording copies, and
+// internal/recording publishes a copy only for a recording no process still
+// holds open. There is no path from a live session's file to a blob.
 func Upload(ctx context.Context, c *Client, o Options) (Report, error) {
 	rep := Report{Ran: o.now().UTC(), Result: "ok", Destination: o.Destination,
 		ClientID: o.ClientID, AuthMode: o.AuthMode, OnCalendar: o.OnCalendar}
@@ -267,6 +298,8 @@ func Upload(ctx context.Context, c *Client, o Options) (Report, error) {
 	}
 	recErr := c.uploadAll(ctx, o, recDir, recNames, AreaRecordings, &rep.Recordings)
 
+	rep.noteLocalLosses(o.StateDir)
+
 	switch {
 	case dbErr != nil && recErr != nil:
 		return o.fail(rep, fmt.Errorf("%v; and %v", dbErr, recErr))
@@ -279,6 +312,64 @@ func Upload(ctx context.Context, c *Client, o Options) (Report, error) {
 		return rep, err
 	}
 	return rep, nil
+}
+
+// noteLocalLosses records which recordings the local storage budget deleted
+// without a confirmed copy in the container.
+//
+// The local cleanup run writes what it deleted; this run knows which copies
+// the container holds complete. The two together answer the question an
+// administrator actually has: did anything go for good? A recording with no
+// published local copy at all was recorded as lost by the cleanup itself and
+// is named here too, because it can have no remote copy either — nothing is
+// ever uploaded except from a published copy.
+//
+// It is deliberately read-only and never fails the run. The deletion has
+// already happened, on a different timer, and reporting it must not turn into
+// a second failure that hides the first.
+func (rep *Report) noteLocalLosses(stateDir string) {
+	r, err := recording.ReadReport(stateDir)
+	if err != nil || r == nil || len(r.Deleted) == 0 {
+		return
+	}
+	rep.CleanupRan = r.Ran
+	confirmed := make(map[string]bool, len(rep.Recordings.Uploaded)+len(rep.Recordings.AlreadyThere))
+	for _, n := range rep.Recordings.Uploaded {
+		confirmed[n] = true
+	}
+	for _, n := range rep.Recordings.AlreadyThere {
+		confirmed[n] = true
+	}
+	for _, name := range r.Deleted {
+		if !confirmedRemoteCopy(name, confirmed) {
+			rep.DeletedWithoutRemoteCopy = append(rep.DeletedWithoutRemoteCopy, name)
+		}
+	}
+}
+
+// confirmedRemoteCopy reports whether any published copy of one recording is
+// among the names this run confirmed complete in the container.
+//
+// The candidate names are enumerated from the recording's own name, in the
+// order internal/recording takes them: "<name><ext>", then "<name>-1<ext>"
+// and onwards, for both the encrypted and the plaintext mode. They are not
+// parsed back out of a copy name, for the reason internal/recording gives: a
+// recording is named after a session history UUID, and a UUID can end in
+// "-000000000001", which no pattern can tell apart from a collision suffix.
+// Asking the question this way round cannot be confused.
+func confirmedRemoteCopy(name string, confirmed map[string]bool) bool {
+	for _, e := range []string{recording.Ext, recording.Ext + ".age"} {
+		for i := 0; i <= 100; i++ {
+			cand := name + e
+			if i > 0 {
+				cand = fmt.Sprintf("%s-%d%s", name, i, e)
+			}
+			if confirmed[cand] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (o Options) fail(rep Report, err error) (Report, error) {
@@ -415,6 +506,9 @@ func (r Report) Summary() string {
 	}
 	for _, f := range r.Recordings.Failed {
 		fmt.Fprintf(&b, "Upload failed (rec):  %s: %s\n", f.Name, firstLine(f.Reason))
+	}
+	for _, n := range r.DeletedWithoutRemoteCopy {
+		fmt.Fprintf(&b, "LOST:                 %s was deleted locally to stay within the storage budget and has no confirmed copy in Azure; it cannot be recovered\n", n)
 	}
 	if r.Error != "" {
 		fmt.Fprintf(&b, "Reason:               %s\n", firstLine(r.Error))
