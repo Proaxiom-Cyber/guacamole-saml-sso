@@ -229,7 +229,7 @@ func classify(r state.Resource) (Kind, Action, string) {
 		return KindContainer, ActionRemove, "stop and remove the container with the rest of the stack"
 	case "host/credential-dir":
 		return KindCredential, ActionRemove, "remove the credential files this deployment wrote, and the directory if nothing else is in it"
-	case "host/credential-file":
+	case "host/credential-file", "host/credential-sealed":
 		return KindCredential, ActionWithParent, "removed with the credential directory that holds it"
 	case "host/config-directory":
 		return KindConfigDir, ActionRemove, "remove the files this deployment rendered; the directory itself stays if anything else is still in it"
@@ -876,7 +876,8 @@ func onDisk(path string) bool {
 func credentialNames(plan Plan) []string {
 	var out []string
 	for _, it := range plan.Items {
-		if it.Resource.Provider == "host" && it.Resource.Type == "credential-file" {
+		if it.Resource.Provider == "host" &&
+			(it.Resource.Type == "credential-file" || it.Resource.Type == "credential-sealed") {
 			out = append(out, it.Resource.Name)
 		}
 	}

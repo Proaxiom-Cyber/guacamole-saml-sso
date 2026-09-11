@@ -86,8 +86,18 @@ and only an explicit deletion request removes it.
 
 ## Credentials
 
-Setup asks how the deployment receives credentials and shows the choice:
+Setup asks how the deployment receives credentials, shows what each choice
+protects them with, and lists a mode this host cannot do with the reason:
 
+- **tpm** — sealed by `systemd-creds` with the host key and the TPM together
+  (`--with-key=host+tpm2`), so both the TPM and a root-only host secret are
+  needed to read the value back. Preferred where a TPM exists. On a virtual
+  machine the hypervisor holds the TPM's secrets, so a compromised hypervisor
+  can read them, and a sealed credential cannot be decrypted on a replacement
+  host.
+- **host** — sealed by `systemd-creds` with the host key alone
+  (`--with-key=host`), for a host with no usable TPM. Also bound to this
+  machine.
 - **prompt** — hidden interactive prompts at the moment of use. Nothing is
   stored on disk. This mode cannot support unattended operation.
 - **env** — `GUACDEPLOY_CRED_*` environment variables supplied to each
@@ -97,7 +107,11 @@ Setup asks how the deployment receives credentials and shows the choice:
   and is never chosen silently: selecting it requires explicit approval
   (guided confirmation or the explicit `--credentials file` flag).
 
-Unattended runs select the mode with `--credentials prompt|env|file`.
+Unattended runs select the mode with `--credentials tpm|host|env|prompt|file`.
+A mode this host cannot do is refused with the reason — no TPM device, systemd
+older than 250, or a TPM the firmware or driver cannot use — and setup stops
+there. It never answers an unavailable encrypted mode by writing the value in
+plaintext instead. Choose another mode yourself.
 Setup checks that required credentials are available and names exactly
 what to supply when one is missing. Credential values never appear in
 deployment state, logs, or command arguments. Files written by the tool

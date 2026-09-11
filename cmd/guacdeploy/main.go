@@ -56,7 +56,7 @@ Flags for setup:
   --non-interactive        Never prompt; exit 3 where approval is required
   --resume                 Non-interactive only: consent to continue interrupted work
   --install-dependencies   Non-interactive only: consent to install missing dependencies
-  --credentials MODE       Credential mode: prompt, env, or file
+  --credentials MODE       Credential mode: tpm, host, env, prompt or file
   --hostname NAME          Public hostname for the deployment
   --admin-group NAME       Identity-provider group for administrators
   --operator-group NAME    Identity-provider group for operators
@@ -118,7 +118,7 @@ func run(args []string) int {
 	nonInteractive := fs.Bool("non-interactive", false, "never prompt")
 	resume := fs.Bool("resume", false, "non-interactive: continue interrupted work")
 	installDeps := fs.Bool("install-dependencies", false, "non-interactive: consent to install missing dependencies")
-	credMode := fs.String("credentials", "", "credential mode: prompt, env, or file")
+	credMode := fs.String("credentials", "", "credential mode: tpm, host, env, prompt or file")
 	hostname := fs.String("hostname", "", "public hostname for the deployment")
 	adminGroup := fs.String("admin-group", "", "identity-provider group for administrators")
 	operatorGroup := fs.String("operator-group", "", "identity-provider group for operators")

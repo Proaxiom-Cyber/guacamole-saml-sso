@@ -309,24 +309,36 @@ func (o *Options) stackHealth(ctx context.Context, st *state.State, u *ui.UI) er
 }
 
 func (o *Options) credentialMode(ctx context.Context, st *state.State, u *ui.UI) error {
+	// What this host can actually do decides what is offered. An unsupported
+	// mode is shown with its reason rather than hidden, so the operator can
+	// see that encrypted storage was considered and why it is unavailable —
+	// and is never answered with a weaker mode chosen on their behalf.
+	supported := o.CredDetector.Detect(ctx)
 	mode := o.CredentialMode
 	if mode == "" {
 		if !u.Interactive {
-			return fmt.Errorf("%w: no credential mode selected; pass --credentials prompt|env|file", ErrApprovalRequired)
+			return fmt.Errorf("%w: no credential mode selected; pass --credentials %s",
+				ErrApprovalRequired, strings.Join(creds.AllModes, "|"))
 		}
 		u.Say("Choose how this deployment receives credentials:")
-		for _, m := range creds.Modes {
-			u.Say("  %s — %s", m, creds.Explain(m))
+		var choices []ui.Choice
+		for _, s := range supported {
+			if !s.Supported {
+				u.Say("  %s — not available on this host: %s", s.Mode, s.Reason)
+				continue
+			}
+			u.Say("  %s — %s", s.Mode, creds.Explain(s.Mode))
+			choices = append(choices, ui.Choice{Key: modeKeys[s.Mode], Label: modeLabels[s.Mode]})
 		}
-		k, err := u.Choose("Credential mode?", []ui.Choice{
-			{Key: 'p', Label: "Hidden prompts"},
-			{Key: 'e', Label: "Environment variables"},
-			{Key: 'f', Label: "Owner-only plaintext files (explicit approval required)"},
-		})
+		k, err := u.Choose("Credential mode?", choices)
 		if err != nil {
 			return err
 		}
-		mode = map[rune]string{'p': creds.ModePrompt, 'e': creds.ModeEnv, 'f': creds.ModeFile}[k]
+		for _, s := range supported {
+			if modeKeys[s.Mode] == k {
+				mode = s.Mode
+			}
+		}
 		if mode == creds.ModeFile {
 			ok, err := u.Confirm("Plaintext storage is an approved exception, protected only by file permissions. Select it?")
 			if err != nil {
@@ -338,19 +350,42 @@ func (o *Options) credentialMode(ctx context.Context, st *state.State, u *ui.UI)
 		}
 	}
 	switch mode {
-	case creds.ModePrompt, creds.ModeEnv, creds.ModeFile:
+	case creds.ModeTPM, creds.ModeHostKey, creds.ModePrompt, creds.ModeEnv, creds.ModeFile:
 	default:
-		return fmt.Errorf("unknown credential mode %q; valid modes: prompt, env, file", mode)
+		return fmt.Errorf("unknown credential mode %q; valid modes: %s", mode, strings.Join(creds.AllModes, ", "))
 	}
 	if mode == creds.ModePrompt && !u.Interactive {
-		return errors.New("prompt-mode credentials cannot support unattended operation; choose env or file")
+		return errors.New("prompt-mode credentials cannot support unattended operation; choose tpm, host, env or file")
+	}
+	// A mode named on the command line gets the same check as one chosen from
+	// the menu. The error names the reason and offers no substitute: answering
+	// "this host has no TPM" by writing plaintext instead is the silent
+	// downgrade the specification forbids.
+	if err := o.CredDetector.Available(ctx, mode); err != nil {
+		return err
 	}
 	if st.Config == nil {
 		st.Config = map[string]string{}
 	}
 	st.Config["credential-mode"] = mode
-	u.Say("Credential storage method: %s. %s", mode, creds.Explain(mode))
+	u.Say("Credential storage method: %s.", mode)
+	u.Say("%s", creds.Detail(mode))
 	return nil
+}
+
+// modeKeys and modeLabels present the modes in creds.AllModes order: the
+// preferred persistent mode first, plaintext last.
+var modeKeys = map[string]rune{
+	creds.ModeTPM: 't', creds.ModeHostKey: 'h', creds.ModeEnv: 'e',
+	creds.ModePrompt: 'p', creds.ModeFile: 'f',
+}
+
+var modeLabels = map[string]string{
+	creds.ModeTPM:     "Sealed to this host's TPM",
+	creds.ModeHostKey: "Sealed to this host's key",
+	creds.ModeEnv:     "Environment variables",
+	creds.ModePrompt:  "Hidden prompts",
+	creds.ModeFile:    "Owner-only plaintext files (explicit approval required)",
 }
 
 func (o *Options) manager(st *state.State, u *ui.UI) *creds.Manager {
@@ -358,7 +393,15 @@ func (o *Options) manager(st *state.State, u *ui.UI) *creds.Manager {
 		Mode:       st.Config["credential-mode"],
 		Dir:        filepath.Join(o.StateDir, "credentials"),
 		ReadSecret: u.SecretReader(),
+		Run:        o.credsRun(),
 	}
+}
+
+func (o *Options) credsRun() creds.Runner {
+	if o.CredsRun != nil {
+		return o.CredsRun
+	}
+	return creds.ExecRunner
 }
 
 func (o *Options) credSpecs() []creds.Spec {
@@ -370,9 +413,11 @@ func (o *Options) credSpecs() []creds.Spec {
 
 func (o *Options) credentialCheck(ctx context.Context, st *state.State, u *ui.UI) error {
 	m := o.manager(st, u)
-	if m.Mode == creds.ModeFile {
+	if creds.Persistent(m.Mode) {
 		for _, s := range o.credSpecs() {
-			if _, err := os.Stat(filepath.Join(m.Dir, s.Name)); err == nil {
+			// The stored filename differs by mode: plaintext modes store the
+			// credential's own name, sealed modes store <name>.cred.
+			if _, err := os.Stat(m.Path(s)); err == nil {
 				continue
 			}
 			var v string
@@ -389,7 +434,9 @@ func (o *Options) credentialCheck(ctx context.Context, st *state.State, u *ui.UI
 			default:
 				continue // reported by Missing below with instructions
 			}
-			createdDir, err := m.StoreFile(s, v)
+			// A failed seal writes nothing at all — no blob, and above all no
+			// plaintext fallback — so a recorded resource always exists.
+			createdDir, err := m.Store(ctx, s, v)
 			if err != nil {
 				return err
 			}
@@ -400,8 +447,14 @@ func (o *Options) credentialCheck(ctx context.Context, st *state.State, u *ui.UI
 					Ownership: "created by this deployment", CreatedAt: now,
 				})
 			}
+			// Recorded by stored filename and by kind, so teardown removes the
+			// right file and the summary can tell plaintext from sealed.
+			kind := "credential-file"
+			if m.Mode != creds.ModeFile {
+				kind = "credential-sealed"
+			}
 			st.Resources = append(st.Resources, state.Resource{
-				ID: state.NewID(), Provider: "host", Type: "credential-file", Name: s.Name,
+				ID: state.NewID(), Provider: "host", Type: kind, Name: filepath.Base(m.Path(s)),
 				Ownership: "written by this deployment", CreatedAt: now,
 			})
 		}
@@ -503,26 +556,32 @@ type Options struct {
 	Resume              bool   // unattended only: explicit consent to continue interrupted work
 	InstallDependencies bool   // unattended only: explicit consent to install missing dependencies
 	CredentialMode      string // explicit credential mode; guided asks when empty
-	Hostname            string // explicit configuration; guided asks when empty
-	AdminGroup          string
-	OperatorGroup       string
-	InstallDir          string // default /opt/guacamole
-	CredSpecs           []creds.Spec
-	Host                *host.Probes
-	StackRun            stack.Runner    // injectable for tests
-	StackRunOut         stack.OutRunner // injectable for tests
-	Entra               *entra.Client   // injectable for tests; nil builds one from the environment token
-	Cloudflare          *cloudflare.Client
-	Zone                string // explicit Cloudflare zone name
-	ACMEContact         string // optional operator address for the ACME account
-	BackupDest          string // scheduled backup destination; default <state-dir>/backups
-	BackupSchedule      string // systemd OnCalendar expression; "" means daily
-	BackupKeep          int    // successful backups to retain; 0 means 7
-	BackupPlaintext     bool   // explicit choice; encryption is the default
-	BackupRequireMount  bool   // destination must sit on an approved mounted share
-	NoBackupSchedule    bool   // do not install the timer
-	RecordingBudget     string // local recording storage budget, e.g. "20GiB"; "" declines cleanup
-	AccessEmails        string // comma-separated Access allow-list fallback
+	// CredDetector answers what this host can actually protect a credential
+	// with. Its zero value uses the real systemd-creds and /dev/tpm* seams.
+	CredDetector creds.Detector
+	// CredsRun executes systemd-creds for the sealed modes; nil means the
+	// real one.
+	CredsRun           creds.Runner
+	Hostname           string // explicit configuration; guided asks when empty
+	AdminGroup         string
+	OperatorGroup      string
+	InstallDir         string // default /opt/guacamole
+	CredSpecs          []creds.Spec
+	Host               *host.Probes
+	StackRun           stack.Runner    // injectable for tests
+	StackRunOut        stack.OutRunner // injectable for tests
+	Entra              *entra.Client   // injectable for tests; nil builds one from the environment token
+	Cloudflare         *cloudflare.Client
+	Zone               string // explicit Cloudflare zone name
+	ACMEContact        string // optional operator address for the ACME account
+	BackupDest         string // scheduled backup destination; default <state-dir>/backups
+	BackupSchedule     string // systemd OnCalendar expression; "" means daily
+	BackupKeep         int    // successful backups to retain; 0 means 7
+	BackupPlaintext    bool   // explicit choice; encryption is the default
+	BackupRequireMount bool   // destination must sit on an approved mounted share
+	NoBackupSchedule   bool   // do not install the timer
+	RecordingBudget    string // local recording storage budget, e.g. "20GiB"; "" declines cleanup
+	AccessEmails       string // comma-separated Access allow-list fallback
 
 	// journalIntent persists what the running phase is about to do, before
 	// it does it. runPhases sets it; phases call it before any cloud
