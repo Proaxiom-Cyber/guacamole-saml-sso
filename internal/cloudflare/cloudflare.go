@@ -300,6 +300,9 @@ type Provisioner struct {
 	ZoneID       string
 	Hostname     string // full deployment hostname, e.g. guac.example.com
 	DeploymentID string // state.State.DeploymentID
+	// Resolve answers "what does this name resolve to", for WaitResolvable.
+	// nil means this host's resolver first, then the zone's authority.
+	Resolve func(ctx context.Context, host string) ([]string, error)
 }
 
 // marker is the DNS ownership marker carried in the record comment.

@@ -1174,6 +1174,14 @@ func (o *Options) cloudflareDNS(ctx context.Context, st *state.State, u *ui.UI) 
 	})
 	st.Config["cloudflare-record-id"] = rec.ID
 	u.Say("DNS record %s published. Unrelated records in this zone are untouched and the zone is preserved at teardown.", rec.Name)
+	// Access is verified against this hostname in the next phase, so the
+	// record has to be answered before that runs. On a first deployment it
+	// never is at the instant it is created, and the Access phase then
+	// reports an application it created but could not verify.
+	if err := p.WaitResolvable(ctx, 0, 0); err != nil {
+		return err
+	}
+	u.Say("%s is answered, so the Access policy can be verified against it.", rec.Name)
 	return nil
 }
 

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // appAUD is the audience tag the API reports for this deployment's Access
@@ -474,5 +475,50 @@ func TestVerifyLearnsTheAuthorityOnAResumedRun(t *testing.T) {
 	p.ensureAuthority(context.Background())
 	if len(p.Client.AuthorityNameServers) != 1 || p.Client.AuthorityNameServers[0] != "kept" {
 		t.Fatalf("a known authority was overwritten: %v", p.Client.AuthorityNameServers)
+	}
+}
+
+// The live defect: the record was published and Access was verified against
+// it in the same breath, before the zone's authority served it. The wait
+// belongs between the two, and it must succeed as soon as an answer appears.
+func TestWaitResolvableReturnsAsSoonAsTheRecordIsAnswered(t *testing.T) {
+	asked := 0
+	p := &Provisioner{
+		Client:   &Client{},
+		Hostname: "guac.example.com",
+		Resolve: func(context.Context, string) ([]string, error) {
+			asked++
+			if asked < 3 {
+				return nil, errors.New("no such host")
+			}
+			return []string{"104.21.0.1"}, nil
+		},
+	}
+	if err := p.WaitResolvable(context.Background(), time.Second, time.Millisecond); err != nil {
+		t.Fatalf("a record that appears on the third ask must satisfy the wait: %v", err)
+	}
+	if asked != 3 {
+		t.Fatalf("want three lookups, got %d", asked)
+	}
+}
+
+// A hostname that never resolves is reported, with what was asked, rather
+// than waited on for ever or passed to the probe as if it were fine.
+func TestWaitResolvableReportsAHostnameThatNeverAppears(t *testing.T) {
+	p := &Provisioner{
+		Client:   &Client{AuthorityNameServers: []string{"cash.ns.cloudflare.com"}},
+		Hostname: "guac.example.com",
+		Resolve: func(context.Context, string) ([]string, error) {
+			return nil, errors.New("no such host")
+		},
+	}
+	err := p.WaitResolvable(context.Background(), 10*time.Millisecond, time.Millisecond)
+	if err == nil {
+		t.Fatal("a hostname that never resolves must be reported")
+	}
+	for _, want := range []string{"was published but is not answered yet", "cash.ns.cloudflare.com"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the error does not say %q: %v", want, err)
+		}
 	}
 }
