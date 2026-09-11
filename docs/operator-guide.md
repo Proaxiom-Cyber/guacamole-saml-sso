@@ -407,3 +407,30 @@ exactly what would go.
 Anything that could not be removed is listed at the end and stays in the
 record, so a later run can try again. Teardown is never reported complete
 while residue remains.
+
+## Azure Blob as a backup destination
+
+Azure Blob is an optional destination alongside a local directory and an
+existing mounted share. The deployment can reuse storage you already have
+or create it, and scheduled uploads authenticate as a service principal
+so they do not depend on your interactive session.
+
+`guacdeploy azure-upload --dest DIR` copies the published backups and the
+completed recordings from that local directory to the configured
+container. It reports the database and the recordings separately, and it
+never counts a partial upload as complete: a copy is only complete once
+its length and hash have been read back and its completion manifest
+written.
+
+`guacdeploy azure-status` shows the configured destination and the last
+upload result.
+
+Remote recordings are expired by age when a retention period is
+configured. Database backups are not covered by that rule: they keep
+their own retention. Ordinary teardown removes nothing from Azure and
+never deletes a container or a storage account.
+
+**Not yet reachable from setup.** Choosing an Azure destination during a
+guided run is not wired in yet, so the destination has to be configured
+before these commands are useful. The steps are written up in
+`internal/azure/WIRING.md`.

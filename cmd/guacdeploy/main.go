@@ -44,6 +44,8 @@ Commands:
   settings    Show (--list) or restore (--restore) changes made to pre-existing settings
   backup-run  Take the scheduled backup, then expire old backups
   backup-status Show the scheduled backup destination and last-run result
+  azure-upload  Copy published backups and completed recordings to Azure Blob
+  azure-status  Show the Azure destination and the last upload result
   teardown    Remove what this deployment created, after showing the plan
   stack-start Start the stack after a reboot (used by the installed boot unit)
   renew-cert  Renew the origin certificate now (used by the installed timer)
@@ -77,6 +79,9 @@ Flags for restore:
   --file PATH              Backup file to restore (required)
   --identity-file PATH     age identity file instead of the passphrase prompt
   --yes                    Unattended consent to replace the database
+
+Flags for azure-upload:
+  --dest DIR               The local published backup directory to copy from (required)
 
 Flags for teardown:
   --yes                    Unattended consent to remove the listed resources
@@ -227,6 +232,10 @@ func run(args []string) int {
 		err = settingsCmd(ctx, *stateDir, *restore, u)
 	case "teardown":
 		err = teardownCmd(ctx, *stateDir, *yes, *deleteData, u)
+	case "azure-upload":
+		err = azureUploadCmd(ctx, *stateDir, *dest, u)
+	case "azure-status":
+		err = azureStatusCmd(*stateDir, u)
 	case "stack-start":
 		err = stackStartCmd(ctx, *stateDir, u)
 	case "renew-cert":
