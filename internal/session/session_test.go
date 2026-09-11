@@ -1261,3 +1261,65 @@ func TestAccessEvidenceNeverClaimsASignIn(t *testing.T) {
 		}
 	}
 }
+
+// TestConnectorRefusesWhenAccessIsNotVerifiableNow pins the publication
+// guard. A recorded Access application ID is not proof of protection: it
+// is written when the application is created, before verification runs, so
+// a run whose verification failed still leaves it set. And a policy that
+// verified correctly yesterday can have been widened since. The connector
+// must therefore re-verify at the moment it would publish, on every run
+// including a resume.
+func TestConnectorRefusesWhenAccessIsNotVerifiableNow(t *testing.T) {
+	base := func() *state.State {
+		return &state.State{DeploymentID: "dep-1", Config: map[string]string{
+			"guac-hostname": "guac.example.test",
+			// Set, as it would be after a run whose verification failed.
+			"cloudflare-access-app-id": "app-1",
+		}}
+	}
+
+	// Verification fails now (it failed earlier, or the policy has drifted).
+	var started bool
+	o := &Options{
+		StateDir:     t.TempDir(),
+		AccessVerify: func(context.Context, *state.State) error { return errors.New("policy now allows everyone") },
+		StackRun: func(context.Context, string, string, ...string) (string, error) {
+			started = true
+			return "", nil
+		},
+	}
+	st := base()
+	u, _ := testUI(false, "")
+	err := o.cloudflareConnect(context.Background(), st, u)
+	if err == nil {
+		t.Fatal("the connector started although Access could not be verified")
+	}
+	// The message must name the reason. Any other refusal (a missing
+	// tunnel token, say) would mean the guard never ran.
+	if !strings.Contains(err.Error(), "not verifiably protecting") {
+		t.Fatalf("the connector refused for some other reason, so the guard did not run: %v", err)
+	}
+	if started {
+		t.Fatal("the stack was started despite the refusal")
+	}
+	if strings.Contains(st.Config["compose-profiles"], "cloudflare") {
+		t.Fatal("the connector profile was enabled despite the refusal")
+	}
+
+	// A recorded ID with no verification at all is equally not proof.
+	o2 := &Options{StateDir: t.TempDir()}
+	st2 := base()
+	u2, _ := testUI(false, "")
+	if err := o2.accessEnforcing(context.Background(), st2, u2); err == nil {
+		t.Fatal("a recorded application ID must not pass as verification on its own")
+	}
+
+	// And with nothing recorded, the guard says so plainly.
+	o3 := &Options{StateDir: t.TempDir()}
+	st3 := &state.State{DeploymentID: "d", Config: map[string]string{}}
+	u3, _ := testUI(false, "")
+	err = o3.accessEnforcing(context.Background(), st3, u3)
+	if err == nil || !strings.Contains(err.Error(), "no Access application") {
+		t.Fatalf("want a clear refusal with nothing recorded, got %v", err)
+	}
+}

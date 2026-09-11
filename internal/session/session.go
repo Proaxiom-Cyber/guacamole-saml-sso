@@ -532,7 +532,10 @@ type Options struct {
 	// EnsureRecordingDirs is injectable for tests: the real one changes
 	// directory ownership, which needs root.
 	EnsureRecordingDirs func(installDir string) error
-	Phases              []Phase
+	// AccessVerify is injectable for tests: the real one re-reads the
+	// Access application, its policy and its identity provider.
+	AccessVerify func(ctx context.Context, st *state.State) error
+	Phases       []Phase
 }
 
 func (o *Options) phases() []Phase {
@@ -1097,8 +1100,11 @@ func (o *Options) cloudflareDNS(ctx context.Context, st *state.State, u *ui.UI) 
 	return nil
 }
 
-func (o *Options) cloudflareAccess(ctx context.Context, st *state.State, u *ui.UI) error {
-	p := o.provisioner(st, u)
+// accessAllow builds the allow-list this deployment intends to enforce.
+// Both the phase that creates the Access policy and the guard that runs
+// before the connector starts derive it the same way, so the guard
+// compares against the intent rather than against whatever is stored.
+func (o *Options) accessAllow(ctx context.Context, p *cloudflare.Provisioner, st *state.State, u *ui.UI) (cloudflare.Allow, error) {
 	allow := cloudflare.Allow{
 		Groups: nonEmpty(st.Config["entra-admin-group-id"], st.Config["entra-operator-group-id"]),
 		Emails: splitList(o.AccessEmails),
@@ -1106,7 +1112,7 @@ func (o *Options) cloudflareAccess(ctx context.Context, st *state.State, u *ui.U
 	if tenant := st.Config["entra-tenant-id"]; tenant != "" && len(allow.Groups) > 0 {
 		idps, err := p.Client.IdentityProviders(ctx, p.AccountID)
 		if err != nil {
-			return err
+			return allow, err
 		}
 		if idp, ok := cloudflare.FindEntraIdP(idps, tenant); ok {
 			allow.IdPID = idp.ID
@@ -1114,6 +1120,47 @@ func (o *Options) cloudflareAccess(ctx context.Context, st *state.State, u *ui.U
 			u.Say("No Cloudflare Access identity provider is bound to this Entra tenant; falling back to the email allow-list.")
 			allow.Groups = nil
 		}
+	}
+	return allow, nil
+}
+
+// accessEnforcing re-verifies that the Access application still protects
+// this hostname with the intended policy and identity provider.
+//
+// It runs immediately before the connector starts, on every run including a
+// resume. The recorded application ID is not proof: it is written when the
+// application is created, before verification, so a run whose verification
+// failed still leaves it set. And a policy verified yesterday can have been
+// widened since. This is a start-time guard, not monitoring.
+func (o *Options) accessEnforcing(ctx context.Context, st *state.State, u *ui.UI) error {
+	if o.AccessVerify != nil {
+		return o.AccessVerify(ctx, st)
+	}
+	appID := st.Config["cloudflare-access-app-id"]
+	if appID == "" {
+		return errors.New("no Access application is recorded for this deployment")
+	}
+	p := o.provisioner(st, u)
+	allow, err := o.accessAllow(ctx, p, st, u)
+	if err != nil {
+		return err
+	}
+	v, err := p.VerifyAccess(ctx, appID, cloudflare.AccessExpectation{
+		Allow:         allow,
+		EntraTenantID: st.Config["entra-tenant-id"],
+	})
+	if err != nil {
+		return err
+	}
+	u.Say("%s", v.String())
+	return nil
+}
+
+func (o *Options) cloudflareAccess(ctx context.Context, st *state.State, u *ui.UI) error {
+	p := o.provisioner(st, u)
+	allow, err := o.accessAllow(ctx, p, st, u)
+	if err != nil {
+		return err
 	}
 	plan, err := p.PlanAccess(allow)
 	if err != nil {
@@ -1200,8 +1247,13 @@ func splitList(s string) []string {
 // leaves the origin unreachable from the internet rather than reachable
 // and unprotected.
 func (o *Options) cloudflareConnect(ctx context.Context, st *state.State, u *ui.UI) error {
-	if st.Config["cloudflare-access-app-id"] == "" {
-		return errors.New("refusing to start the Cloudflare connector: no verified Access application protects this hostname")
+	// Re-verify now, every time. The recorded application ID is written
+	// before verification runs, so a failed verification leaves it set, and
+	// a policy that was correct on an earlier run can have been widened
+	// since. Publication must rest on a check made at this moment.
+	if err := o.accessEnforcing(ctx, st, u); err != nil {
+		return fmt.Errorf("refusing to start the Cloudflare connector: Access is not verifiably protecting %s right now: %w",
+			st.Config["guac-hostname"], err)
 	}
 	st.Config["compose-profiles"] = "cloudflare"
 	cfg := o.stackConfig(st)
