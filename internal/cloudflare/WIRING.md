@@ -121,7 +121,182 @@ only marker-owned records are ever eligible.
 
 | Condition | Meaning | Guided | Unattended |
 |---|---|---|---|
-| `ErrRequiresReview` | name-only tunnel match | show and ask | nonzero exit |
-| `ErrPreExisting` | foreign DNS record at hostname | show and ask | nonzero exit |
+| `ErrRequiresReview` | name-only tunnel match, or an Access application whose marker and hostname disagree | show and ask | nonzero exit |
+| `ErrPreExisting` | foreign DNS record at hostname, or a foreign Access application covering it | show and ask | nonzero exit |
 | `ErrNotOwned` | delete target lacks marker | report, keep resource | same |
+| `ErrNoAllowList` | nobody was named in the Access allow-list | ask for groups or emails | nonzero exit |
 | `*APIError` 403 on Apply | missing Edit scope | name the scope, stop | same |
+
+# Phase 4: cloudflare-access (issue #8)
+
+Cloudflare Access in front of the deployment hostname. This phase must run **after
+`entra-signin`**, because its allow-list is built from the Entra tenant and group
+object IDs that phase produced.
+
+**Turning Access on closes the hostname to anonymous requests.** Any health check the
+session makes against the public hostname after this phase will get the Access
+challenge, not Guacamole. Check health against the local origin instead.
+
+## Identity model — decided, and why
+
+The Access application is bound to the account's **existing** Entra-backed
+(`azureAD`) identity provider, found by matching `config.directory_id` against
+`Config["entra-tenant-id"]` from issue #6. The policy allow-list then names the exact
+**administrator and operator group object IDs** that issue #6 created. Access and
+Guacamole therefore authorise the same people from the same directory objects, and
+adding an operator is one Entra group membership.
+
+This package **discovers** the identity provider and never creates one:
+
+- An Access `azureAD` provider needs an OIDC client ID and client secret. The SAML
+  application from issue #6 has neither, so creating one means a second Entra
+  application registration plus a new long-lived secret for this tool to hold.
+- An Access identity provider is **account-wide**, shared by every application in the
+  account. Under ADR 0002 the tool could never delete it at teardown, so it would be
+  creating a resource it can never clean up.
+
+When the account has no Entra-backed provider, the fallback is an explicit list of
+operator **email addresses** (`Allow.Emails`), and setting up the identity provider
+stays a one-off account decision for a person. Either way the allow-list is explicit:
+`PlanAccess` returns `ErrNoAllowList` rather than produce an application anybody can
+reach. Never default to "allow everyone", not even unattended.
+
+Operators sign in **twice**: once to Cloudflare Access, once to Guacamole's Entra
+SAML. That is intended — two independent gates. Say so in the phase output so it does
+not read as a bug.
+
+## Ownership marker
+
+The Access application API has no writable comment, note or description field, and
+its `tags` are a separate account-level resource with its own lifecycle. So the marker
+is in the **name**, as it is for the tunnel:
+
+- Application: `Guacamole <hostname> (guacdeploy:<deployment-id>)` —
+  `p.AccessAppName()`, set inside the creation request body.
+- Policy: `Guacamole operators (guacdeploy:<deployment-id>)` —
+  `p.AccessPolicyName()`. The policy is created under the application, so its
+  ownership follows the application's.
+
+A name is only half a proof, so **adoption and deletion also require the
+application's `domain` to still cover this deployment's hostname**. A marker name on
+another hostname is `ErrRequiresReview`, never an adoption.
+
+## Phase flow
+
+```go
+p := &cloudflare.Provisioner{Client: cf, AccountID: ..., ZoneID: ...,
+        Hostname: st.Config["guac-hostname"], DeploymentID: st.DeploymentID}
+
+if err := cf.PreflightAccess(ctx, accountID); err != nil { ... }
+
+idps, err := cf.IdentityProviders(ctx, accountID)
+allow := cloudflare.Allow{}
+if idp, found := cloudflare.FindEntraIdP(idps, st.Config["entra-tenant-id"]); found {
+        allow.IdPID = idp.ID
+        allow.Groups = []string{st.Config["entra-admin-group-id"], st.Config["entra-operator-group-id"]}
+} else {
+        allow.Emails = operatorEmails // --access-allow-email, required in this case
+}
+
+plan, err := p.PlanAccess(allow)         // contacts nothing; journal it first
+app, pol, err := p.ApplyAccess(ctx, plan)
+v, err := p.VerifyAccess(ctx, app.ID)    // configuration AND live enforcement
+```
+
+**Stack gap the parent must close:** issue #6's `entra-signin` phase records the group
+object IDs as `state` resources but does not put them in `Config`. Add
+`Config["entra-admin-group-id"]` and `Config["entra-operator-group-id"]` there (from
+`res.Groups[i].ObjectID`), or read them back out of the resource journal. Without the
+object IDs the allow-list falls back to emails for no good reason.
+
+## Preflight
+
+`cf.PreflightAccess(ctx, accountID)` proves the **read** permissions only:
+
+| Endpoint | Proves |
+|---|---|
+| `GET /accounts/{acct}/access/organizations` | Access: Organizations, Identity Providers, and Groups: Read — **and** that a Zero Trust organization (team domain) exists at all |
+| `GET /accounts/{acct}/access/identity_providers` | the same permission, and supplies the provider list |
+| `GET /accounts/{acct}/access/apps?per_page=1` | Access: Apps and Policies: Read |
+
+Cloudflare grants apps and policies under one permission, so there is no separate
+policy read check. The **mutation** permission (Access: Apps and Policies: Edit) has
+no read-only proof — no dry run exists and a probe write would create a real Access
+application. The first `ApplyAccess` proves it, and a 403 there arrives as an
+`*APIError` naming the endpoint. An account with no Zero Trust organization is
+reported as that, not as a missing permission.
+
+## Reconciliation, and the pre-existing case
+
+`ApplyAccess` makes two reads before any write:
+
+1. **Marker lookup** — `?name=<AccessAppName>&exact=true`. A match whose domain also
+   covers the hostname is adopted: that is how a create whose response was lost is
+   recovered instead of duplicated. A marker name on another domain, or more than one
+   match, is `ErrRequiresReview`.
+2. **Hostname lookup** — `?domain=<hostname>`, filtered to exact host matches. An
+   application following this tool's naming convention with another deployment's ID is
+   `ErrRequiresReview`. Any other is `*PreExistingApp`.
+
+```go
+var pre *cloudflare.PreExistingApp
+if errors.As(err, &pre) {
+        // pre.AppID / pre.Name / pre.Domain identify it.
+        // pre.Changes is []FieldChange{Field, Original, Applied} — the same shape as
+        // internal/entra's — ready for state.SettingChange entries.
+}
+```
+
+`*PreExistingApp` unwraps to `ErrPreExisting`, so `errors.Is` still works. **This
+package has no path that changes an application it does not own.** The original values
+are recorded so that an operator's manual change is auditable; the tool itself stops.
+Guided: show the application and ask the operator to remove it, rename it, or choose
+another hostname. Unattended: nonzero exit.
+
+The policy is reconciled the same way, by its marker name under the adopted
+application. Between the two creates the application exists with no policy, which
+Access treats as deny-all — a lost response never leaves the hostname open.
+
+## What to record in state
+
+```go
+st.EnsureResource(state.Resource{Provider: "cloudflare", Type: "access-app",
+        ProviderID: app.ID, Name: app.Name, CorrelationID: corrID,
+        Ownership: "deployment ID in the application name, verified together with its domain",
+        CreatedAt: now})
+```
+
+Store `Config["cloudflare-access-app-id"] = app.ID`. Record the policy as **evidence
+on that resource** (`pol.ID`, `pol.Name`, `len(pol.Include)`), not as a resource of its
+own: it is scoped to the application and has no independent lifecycle. Also journal the
+verification evidence from `VerifyAccess` — `AppID`, `Domain`, `PolicyID`,
+`AllowRules`, `AuthDomain`, `Challenge`. None of it is secret.
+
+## Verification
+
+`VerifyAccess` re-reads the application and its policies (marker, domain, an allow
+policy with a non-empty allow-list), then makes **one unauthenticated request to
+`https://<hostname>/`** through the same injectable HTTP seam, not following
+redirects. A protected hostname answers with a redirect to the account's team domain;
+a page from the origin means the request got past Access, and is a failure.
+
+The probe sends no `Authorization` header — it must look exactly like an anonymous
+visitor's request. It works before the origin certificate exists (issue #9), because
+Access challenges the request before it is ever routed to the origin.
+
+A transport failure ("could not reach ...") is a timing problem — DNS or the tunnel is
+not up yet — and re-running the phase is the fix. "answered HTTP 200 with no Access
+challenge" is a security failure and must stop the run.
+
+## Teardown
+
+`p.DeleteAccessApp(ctx, appID)` re-fetches the application and verifies **both** halves
+of the marker — the name carries this deployment's ID, and the application still
+secures this deployment's hostname — before deleting. Anything else is `ErrNotOwned`:
+report it and leave it. The policy is scoped to the application and is removed with it,
+so there is nothing separate to delete. This package has no deletion for the zone or
+for any other Access application, so unrelated applications are preserved structurally.
+
+Order: stop the cloudflared container, delete the DNS record, **then** the Access
+application, then the tunnel. Removing Access first would leave the hostname still
+resolving to a running Guacamole with nothing in front of it.
