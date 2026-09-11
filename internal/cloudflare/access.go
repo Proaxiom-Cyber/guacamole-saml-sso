@@ -504,6 +504,11 @@ type AccessVerification struct {
 // challenges the request before it is ever routed to the origin.
 func (p *Provisioner) VerifyAccess(ctx context.Context, appID string) (AccessVerification, error) {
 	var v AccessVerification
+	// Learn the zone's authority now rather than relying on an earlier
+	// phase having recorded it: a resumed run skips the phase that
+	// selected the zone, and the probe would then have no way to resolve a
+	// hostname this host's resolver cannot see.
+	p.ensureAuthority(ctx)
 	var app accessAppRecord
 	if err := p.Client.do(ctx, "GET", "/accounts/"+p.AccountID+"/access/apps/"+appID, nil, &app); err != nil {
 		return v, err
@@ -668,4 +673,17 @@ func (c *Client) resolveAtAuthority(ctx context.Context, host string) ([]string,
 		}
 	}
 	return nil, errors.New("the zone's authoritative nameservers did not answer for " + host)
+}
+
+// ensureAuthority fills in the zone's authoritative nameservers when they
+// are not already known. A failure is not fatal: the probe simply falls
+// back to this host's resolver, and its error explains what it asked.
+func (p *Provisioner) ensureAuthority(ctx context.Context) {
+	if len(p.Client.AuthorityNameServers) > 0 || p.ZoneID == "" {
+		return
+	}
+	var z Zone
+	if err := p.Client.do(ctx, "GET", "/zones/"+p.ZoneID, nil, &z); err == nil {
+		p.Client.AuthorityNameServers = z.NameServers
+	}
 }

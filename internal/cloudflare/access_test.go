@@ -541,3 +541,30 @@ func TestChallengeProbeKeepsProxyAndTLSVerification(t *testing.T) {
 		t.Fatalf("want an explanatory error, got %v", err)
 	}
 }
+
+// TestVerifyLearnsTheAuthorityOnAResumedRun pins a live failure: on a
+// resumed deployment the phase that selected the zone is skipped, so
+// nothing had recorded the zone's nameservers and the probe had no way to
+// resolve a hostname this host's resolver cannot see. Verification must
+// learn the authority itself.
+func TestVerifyLearnsTheAuthorityOnAResumedRun(t *testing.T) {
+	f := newFake(t)
+	f.mux["GET /zones/zone1"] = ok(map[string]any{
+		"id": "zone1", "name": "example.com",
+		"name_servers": []any{"ns1.example.invalid", "ns2.example.invalid"},
+	})
+	p := f.prov()
+	if len(p.Client.AuthorityNameServers) != 0 {
+		t.Fatal("precondition: the authority should be unknown")
+	}
+	p.ensureAuthority(context.Background())
+	if len(p.Client.AuthorityNameServers) != 2 {
+		t.Fatalf("the authority was not learned: %v", p.Client.AuthorityNameServers)
+	}
+	// Already known: no second lookup, and the value is left alone.
+	p.Client.AuthorityNameServers = []string{"kept"}
+	p.ensureAuthority(context.Background())
+	if len(p.Client.AuthorityNameServers) != 1 || p.Client.AuthorityNameServers[0] != "kept" {
+		t.Fatalf("a known authority was overwritten: %v", p.Client.AuthorityNameServers)
+	}
+}

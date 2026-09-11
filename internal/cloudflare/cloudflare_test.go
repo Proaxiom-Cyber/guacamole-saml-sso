@@ -34,6 +34,9 @@ type fake struct {
 
 func newFake(t *testing.T) *fake {
 	f := &fake{t: t, mux: map[string]http.HandlerFunc{}, hits: map[string]int{}, lastBody: map[string][]byte{}}
+	// Reading the zone is a benign lookup any phase may make to learn the
+	// authoritative nameservers; a test that cares routes it itself.
+	f.mux["GET /zones/zone1"] = ok(map[string]any{"id": "zone1", "name": "example.com"})
 	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer "+testAPIToken {
 			t.Errorf("Authorization header = %q", got)
