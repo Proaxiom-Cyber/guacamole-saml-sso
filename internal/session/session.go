@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/cloudflare"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/creds"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/entra"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/host"
@@ -56,6 +57,9 @@ func Phases(opts *Options) []Phase {
 		{Name: "credential-check", Run: opts.credentialCheck},
 		{Name: "host-dependencies", Run: opts.hostDependencies},
 		{Name: "stack-configure", Run: opts.stackConfigure},
+		{Name: "cloudflare-select", Run: opts.cloudflareSelect},
+		{Name: "cloudflare-tunnel", Run: opts.cloudflareTunnel},
+		{Name: "cloudflare-dns", Run: opts.cloudflareDNS},
 		// Rendering is idempotent and also repairs configuration written by
 		// an earlier version, so it re-runs on every resume.
 		{Name: "stack-render", Run: opts.stackRender, Always: true},
@@ -66,6 +70,9 @@ func Phases(opts *Options) []Phase {
 		{Name: "stack-schema", Run: opts.stackSchema, Always: true},
 		{Name: "stack-up", Run: opts.stackUp},
 		{Name: "entra-signin", Run: opts.entraSignin},
+		// Access must follow entra-signin: its allow-list is built from the
+		// tenant and group object IDs that phase produces.
+		{Name: "cloudflare-access", Run: opts.cloudflareAccess},
 		{Name: "stack-health", Run: opts.stackHealth},
 	}
 }
@@ -194,8 +201,16 @@ func (o *Options) stackSecrets(st *state.State, u *ui.UI) (password, tunnelToken
 			}
 		}
 	}
-	// Tunnel token arrives with the Cloudflare slice; empty until then.
-	return password, "", nil
+	// The connector token is fetched at start time and delivered through
+	// the in-memory Compose override. It never reaches state, .env, logs or
+	// command arguments, and a rotated token needs no local change.
+	if id := st.Config["cloudflare-tunnel-id"]; id != "" {
+		tunnelToken, err = o.provisioner(st, u).TunnelToken(context.Background(), id)
+		if err != nil {
+			return "", "", fmt.Errorf("fetching the Cloudflare tunnel connector token failed: %w", err)
+		}
+	}
+	return password, tunnelToken, nil
 }
 
 func (o *Options) stackUp(ctx context.Context, st *state.State, u *ui.UI) error {
@@ -441,6 +456,9 @@ type Options struct {
 	StackRun            stack.Runner    // injectable for tests
 	StackRunOut         stack.OutRunner // injectable for tests
 	Entra               *entra.Client   // injectable for tests; nil builds one from the environment token
+	Cloudflare          *cloudflare.Client
+	Zone                string // explicit Cloudflare zone name
+	AccessEmails        string // comma-separated Access allow-list fallback
 
 	// journalIntent persists what the running phase is about to do, before
 	// it does it. runPhases sets it; phases call it before any cloud
@@ -825,4 +843,218 @@ func lastAttemptUncertain(st *state.State, intent string) bool {
 		}
 	}
 	return uncertain
+}
+
+// --- Cloudflare phases -------------------------------------------------
+//
+// Tunnel and DNS are created before the stack is rendered, because the
+// render writes COMPOSE_PROFILES and the cloudflared connector needs its
+// token at start time. One cloud create per phase, so the intent journal
+// in runPhases is the pre-create record the specification requires.
+
+func (o *Options) cloudflareClient(st *state.State, u *ui.UI) *cloudflare.Client {
+	if o.Cloudflare != nil {
+		return o.Cloudflare
+	}
+	m := o.manager(st, u)
+	return &cloudflare.Client{Token: func(context.Context) (string, error) {
+		for _, s := range o.credSpecs() {
+			if s.Name == "cloudflare-api-token" {
+				return m.Get(s) // in-memory only; never journalled
+			}
+		}
+		return "", errors.New("no cloudflare-api-token credential is configured")
+	}}
+}
+
+func (o *Options) provisioner(st *state.State, u *ui.UI) *cloudflare.Provisioner {
+	return &cloudflare.Provisioner{
+		Client:       o.cloudflareClient(st, u),
+		AccountID:    st.Config["cloudflare-account-id"],
+		ZoneID:       st.Config["cloudflare-zone-id"],
+		Hostname:     st.Config["guac-hostname"],
+		DeploymentID: st.DeploymentID,
+	}
+}
+
+// apexOf returns the registrable domain guess for a hostname. The operator
+// can override it, because no suffix list is shipped.
+func apexOf(hostname string) string {
+	parts := strings.Split(hostname, ".")
+	if len(parts) < 2 {
+		return hostname
+	}
+	return strings.Join(parts[len(parts)-2:], ".")
+}
+
+func (o *Options) cloudflareSelect(ctx context.Context, st *state.State, u *ui.UI) error {
+	cf := o.cloudflareClient(st, u)
+	if err := cf.VerifyToken(ctx); err != nil {
+		return fmt.Errorf("the Cloudflare API token was rejected: %w", err)
+	}
+	apex := o.Zone
+	if apex == "" {
+		apex = apexOf(st.Config["guac-hostname"])
+	}
+	zones, err := cf.ZonesByName(ctx, apex)
+	if err != nil {
+		return err
+	}
+	switch {
+	case len(zones) == 0:
+		return fmt.Errorf("no Cloudflare zone named %q is visible to this token; pass --zone with the exact zone name", apex)
+	case len(zones) > 1:
+		return fmt.Errorf("%w: %d Cloudflare zones are named %q; pass --zone to choose one", ErrApprovalRequired, len(zones), apex)
+	}
+	z := zones[0]
+	if err := cf.Preflight(ctx, z.Account.ID, z.ID); err != nil {
+		return fmt.Errorf("the Cloudflare token lacks the read access this deployment needs: %w", err)
+	}
+	if st.Config == nil {
+		st.Config = map[string]string{}
+	}
+	st.Config["cloudflare-account-id"] = z.Account.ID
+	st.Config["cloudflare-account-name"] = z.Account.Name
+	st.Config["cloudflare-zone-id"] = z.ID
+	st.Config["cloudflare-zone-name"] = z.Name
+	// Rendered into .env so stack-up starts the cloudflared connector.
+	st.Config["compose-profiles"] = "cloudflare"
+	u.Say("Cloudflare account %q, zone %q selected. The zone itself is pre-existing and is never removed by teardown.", z.Account.Name, z.Name)
+	return nil
+}
+
+func (o *Options) cloudflareTunnel(ctx context.Context, st *state.State, u *ui.UI) error {
+	p := o.provisioner(st, u)
+	plan := p.PlanTunnel()
+	if o.journalIntent != nil {
+		if err := o.journalIntent("will create Cloudflare tunnel " + plan.Name); err != nil {
+			return err
+		}
+	}
+	u.Say("Cloudflare tunnel to create: %s (remotely managed).", plan.Name)
+
+	tun, err := p.ApplyTunnel(ctx)
+	if err != nil {
+		return cloudflareErr(err, "tunnel")
+	}
+	if err := p.ConfigureIngress(ctx, tun.ID); err != nil {
+		return cloudflareErr(err, "tunnel ingress")
+	}
+	st.EnsureResource(state.Resource{
+		Provider: "cloudflare", Type: "tunnel", ProviderID: tun.ID, Name: tun.Name,
+		Ownership: "deployment ID embedded in the tunnel name", CreatedAt: time.Now().UTC(),
+	})
+	st.Config["cloudflare-tunnel-id"] = tun.ID
+	u.Say("Tunnel %s configured to https://nginx:443 with origin certificate verification enabled.", tun.Name)
+	u.Say("Until the origin certificate is issued, the public hostname returns a Cloudflare origin-TLS error because nginx still serves the temporary self-signed certificate. Verification is never disabled to hide this.")
+	return nil
+}
+
+func (o *Options) cloudflareDNS(ctx context.Context, st *state.State, u *ui.UI) error {
+	p := o.provisioner(st, u)
+	plan := p.PlanDNS(st.Config["cloudflare-tunnel-id"])
+	if o.journalIntent != nil {
+		if err := o.journalIntent("will create DNS record " + plan.Name + " -> " + plan.Content); err != nil {
+			return err
+		}
+	}
+	u.Say("DNS record to create: %s %s -> %s (proxied).", plan.Type, plan.Name, plan.Content)
+
+	rec, err := p.ApplyDNS(ctx, plan)
+	if err != nil {
+		return cloudflareErr(err, "DNS record")
+	}
+	st.EnsureResource(state.Resource{
+		Provider: "cloudflare", Type: "dns-record", ProviderID: rec.ID, Name: rec.Name,
+		Ownership: "record comment carries this deployment's marker", CreatedAt: time.Now().UTC(),
+	})
+	st.Config["cloudflare-record-id"] = rec.ID
+	u.Say("DNS record %s published. Unrelated records in this zone are untouched and the zone is preserved at teardown.", rec.Name)
+	return nil
+}
+
+func (o *Options) cloudflareAccess(ctx context.Context, st *state.State, u *ui.UI) error {
+	p := o.provisioner(st, u)
+	allow := cloudflare.Allow{
+		Groups: nonEmpty(st.Config["entra-admin-group-id"], st.Config["entra-operator-group-id"]),
+		Emails: splitList(o.AccessEmails),
+	}
+	if tenant := st.Config["entra-tenant-id"]; tenant != "" && len(allow.Groups) > 0 {
+		idps, err := p.Client.IdentityProviders(ctx, p.AccountID)
+		if err != nil {
+			return err
+		}
+		if idp, ok := cloudflare.FindEntraIdP(idps, tenant); ok {
+			allow.IdPID = idp.ID
+		} else {
+			u.Say("No Cloudflare Access identity provider is bound to this Entra tenant; falling back to the email allow-list.")
+			allow.Groups = nil
+		}
+	}
+	plan, err := p.PlanAccess(allow)
+	if err != nil {
+		if errors.Is(err, cloudflare.ErrNoAllowList) {
+			return fmt.Errorf("%w: Cloudflare Access needs an allow-list. Provision Entra sign-in first, or pass --access-emails", ErrApprovalRequired)
+		}
+		return err
+	}
+	if o.journalIntent != nil {
+		if err := o.journalIntent("will create Cloudflare Access application for " + st.Config["guac-hostname"]); err != nil {
+			return err
+		}
+	}
+
+	app, pol, err := p.ApplyAccess(ctx, plan)
+	if err != nil {
+		return cloudflareErr(err, "Access application")
+	}
+	now := time.Now().UTC()
+	st.EnsureResource(state.Resource{
+		Provider: "cloudflare", Type: "access-application", ProviderID: app.ID, Name: app.Name,
+		Ownership: "deployment ID in the application name, verified against the hostname", CreatedAt: now,
+	})
+	st.EnsureResource(state.Resource{
+		Provider: "cloudflare", Type: "access-policy", ProviderID: pol.ID, Name: pol.Name,
+		Ownership: "policy of the owned Access application", CreatedAt: now,
+	})
+	st.Config["cloudflare-access-app-id"] = app.ID
+
+	v, err := p.VerifyAccess(ctx, app.ID)
+	if err != nil {
+		return fmt.Errorf("Cloudflare Access was created but could not be verified: %w", err)
+	}
+	u.Say("Cloudflare Access protects %s (%s). Health checks now run against the local origin, because the public hostname answers with the Access challenge.", st.Config["guac-hostname"], fmt.Sprintf("%d allow rule(s), %s", v.AllowRules, v.Challenge))
+	return nil
+}
+
+// cloudflareErr maps the package's sentinels onto the session's contract.
+func cloudflareErr(err error, what string) error {
+	switch {
+	case errors.Is(err, cloudflare.ErrRequiresReview):
+		return fmt.Errorf("the Cloudflare %s needs review before anything is created: %w", what, err)
+	case errors.Is(err, cloudflare.ErrPreExisting):
+		return fmt.Errorf("%w: a pre-existing Cloudflare %s already occupies this hostname and is never overwritten: %v", ErrApprovalRequired, what, err)
+	}
+	return err
+}
+
+func nonEmpty(vals ...string) []string {
+	var out []string
+	for _, v := range vals {
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func splitList(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return parts
 }

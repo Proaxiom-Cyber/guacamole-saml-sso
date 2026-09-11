@@ -299,3 +299,35 @@ is never adopted.
 Groups that already existed are reused and are never offered for removal
 at teardown. Only the application, service principal and groups this
 deployment created are recorded as its own.
+
+## Cloudflare tunnel, DNS and Access
+
+Setup selects the Cloudflare account and zone from the hostname's apex,
+or from `--zone` when the guess is wrong or several zones share a name.
+It checks the API token's read access before creating anything. The zone
+itself is always pre-existing and is never removed by teardown.
+
+Three resources are created, one per phase, each recorded with ownership
+evidence: a remotely managed tunnel whose name carries the deployment
+identifier, a proxied CNAME whose record comment carries the same marker,
+and a Cloudflare Access application in front of the hostname.
+
+The tunnel reaches nginx with origin certificate verification enabled.
+Until the origin certificate is issued, the public hostname returns a
+Cloudflare origin-TLS error, because nginx still serves the temporary
+self-signed certificate. Verification is never disabled to hide that.
+
+The connector token is fetched when the stack starts and delivered
+through the in-memory Compose override. It is never written to the
+deployment record, `.env`, logs or command arguments, so rotating it in
+Cloudflare needs no local change.
+
+A DNS record that already occupies the hostname without this
+deployment's marker is never overwritten: setup stops and asks.
+Unattended runs exit with code 3.
+
+Access allows the Entra administrator and operator groups when an Access
+identity provider is bound to the same tenant; otherwise it falls back to
+`--access-emails`. It never publishes an application that allows
+everyone. Once Access is on, the public hostname answers with the Access
+challenge, so setup checks health against the local origin instead.

@@ -460,7 +460,9 @@ func TestStackPhasesFullPipelineUnattended(t *testing.T) {
 		ProbeCheck: func(context.Context, stack.Config) error { return nil },
 	}
 	// Sign-in provisioning has its own tests; this one covers the local stack.
-	opts.Phases = withoutPhase(Phases(&opts), "entra-signin")
+	opts.Phases = withoutPhases(Phases(&opts),
+		"cloudflare-select", "cloudflare-tunnel", "cloudflare-dns",
+		"entra-signin", "cloudflare-access")
 	if err := Run(context.Background(), opts); err != nil {
 		t.Fatalf("full pipeline: %v\n%s", err, out.String())
 	}
@@ -642,10 +644,14 @@ func TestSAMLGroupAttributeNeverSilentlyDefaults(t *testing.T) {
 	}
 }
 
-func withoutPhase(all []Phase, name string) []Phase {
+func withoutPhases(all []Phase, names ...string) []Phase {
+	drop := map[string]bool{}
+	for _, n := range names {
+		drop[n] = true
+	}
 	var out []Phase
 	for _, p := range all {
-		if p.Name != name {
+		if !drop[p.Name] {
 			out = append(out, p)
 		}
 	}
@@ -727,5 +733,38 @@ func TestIntentIsJournalledBeforeTheWork(t *testing.T) {
 	}
 	if last.Intent != "risky" || last.Result != state.ResultFailed {
 		t.Fatalf("unexpected journal entry: %+v", last)
+	}
+}
+
+// TestApexDerivation covers the zone guess and its override, because a
+// wrong apex sends the deployment at somebody else's zone.
+func TestApexDerivation(t *testing.T) {
+	for in, want := range map[string]string{
+		"guac.example.com": "example.com",
+		"a.b.c.example.co": "example.co",
+		"example.com":      "example.com",
+		"localhost":        "localhost",
+	} {
+		if got := apexOf(in); got != want {
+			t.Errorf("apexOf(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestAccessAllowListNeverEmpty pins the rule that Access is never opened
+// to everyone: with no Entra groups and no explicit emails the phase must
+// stop and ask rather than publish a permissive application.
+func TestAccessAllowListNeverEmpty(t *testing.T) {
+	if got := nonEmpty("", ""); len(got) != 0 {
+		t.Fatalf("empty group IDs must not become allow-list entries: %v", got)
+	}
+	if got := nonEmpty("gid-admin", ""); len(got) != 1 || got[0] != "gid-admin" {
+		t.Fatalf("nonEmpty dropped a real group: %v", got)
+	}
+	if got := splitList(" a@example.com , b@example.com "); len(got) != 2 || got[0] != "a@example.com" {
+		t.Fatalf("splitList = %v", got)
+	}
+	if got := splitList("   "); got != nil {
+		t.Fatalf("blank list must be nil, got %v", got)
 	}
 }
