@@ -80,7 +80,71 @@ is all: Cloudflare provides the tunnel and the public certificate. Without Cloud
 also a certificate for that name that your clients trust, and a firewall rule for
 `HTTPS_PORT`.
 
+## Install the deployment tool
+
+The V1 `guacdeploy` tool installs from a signed GitHub release. No checkout and no Go
+toolchain are needed on the server. The launcher verifies the SHA-256 checksum and the
+Sigstore signature of the release, and refuses to install anything that fails either
+check:
+
+```sh
+curl -fsSLO https://github.com/Proaxiom-Cyber/guacamole-saml-sso/releases/latest/download/get-guacdeploy.sh && sh get-guacdeploy.sh
+```
+
+Read the script before you run it. [Release and verification](docs/release-and-verification.md)
+describes the signing identity, the trust bootstrap, the network destinations the
+launcher uses, and the approval an administrator must give on hosts with application
+allowlisting.
+
 ## Deploy
+
+Run `guacdeploy` as root on the server. One guided run does the whole deployment:
+
+```sh
+sudo guacdeploy
+```
+
+It checks the host first — Rocky Linux 10 on Intel or AMD 64-bit, root, no existing
+installation, and the outbound access it needs — and refuses with an explanation rather
+than changing anything it should not. It then asks how credentials should be supplied,
+shows what it will install before installing it, and records what it creates.
+
+For an unattended run, give it the same answers as flags:
+
+```sh
+sudo guacdeploy setup --non-interactive --install-dependencies \
+  --credentials file \
+  --hostname guac.example.com \
+  --admin-group "Guacamole Administrators" \
+  --operator-group "Guacamole Operators" \
+  --zone example.com
+```
+
+Unattended runs never wait for input. Where the specification requires a person —
+approving a change to a resource the tool did not create, for instance — the run stops
+with exit code 3 and says what needs approving.
+
+What a full run does, in order: prepares the host, selects the Cloudflare account and
+zone, creates the tunnel, renders the stack configuration and database schema, obtains a
+Let's Encrypt certificate for the origin by DNS-01, starts the containers, installs
+reboot recovery and any schedules you asked for, checks the local origin, provisions
+Entra sign-in, publishes the DNS record, puts Cloudflare Access in front, and only then
+starts the connector. Nothing is reachable from the internet until sign-in exists and
+the Access policy has been verified.
+
+If a run is interrupted, run it again: it shows the work that did not finish and offers
+to resume or clean up. Completed work is never repeated, and a creation whose response
+was lost is reconciled by ownership marker rather than repeated.
+
+`guacdeploy status` shows the deployment record. `docs/operator-guide.md` covers every
+command, the exit codes, backups, recordings, certificates and teardown.
+
+### The original shell scripts
+
+`setup.sh` and the `lib/` and `init/` scripts are the pre-V1 workflow and are kept for
+reference. They need a checkout on the server, which is exactly what `guacdeploy`
+removes. A deployment made by those scripts is **not** adopted by `guacdeploy`: it
+refuses to overwrite an existing installation and explains why.
 
 On later interactive runs, setup offers to keep the saved hostname. Answer `n` to
 choose another domain and hostname. Runs without a terminal keep the saved hostname.
@@ -120,9 +184,6 @@ provider and the saved hostname yourself before running setup.
    certificate your clients trust, then run setup again. Open `HTTPS_PORT` to your clients.
 7. Open the URL from the summary. With Cloudflare, it is
    `https://<GUAC_HOSTNAME>/guacamole/`. Sign-in starts at once.
-
-The `init/` scripts run only when `data/` is empty. Get the group names right before
-the first start, or delete `data/` and start again.
 
 ## Configuration
 

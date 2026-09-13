@@ -1,0 +1,171 @@
+# Apache Guacamole behind nginx. Rendered by guacdeploy; do not edit by
+# hand — the tool overwrites this file. Non-secret settings come from .env.
+#
+# No credential is an environment field anywhere in this file. Docker keeps a
+# container's environment in its own metadata under
+# /var/lib/docker/containers/<id>/config.v2.json, so an environment field is a
+# plaintext copy of the credential on persistent disk, kept even when the
+# deployment's own credential store is sealed to the TPM. Every credential is
+# delivered as a file instead, through a memory-backed directory that
+# guacdeploy fills at start time:
+#
+#   postgres     POSTGRES_PASSWORD_FILE      (official image, file_env)
+#   guacamole    POSTGRESQL_PASSWORD_FILE    (ENABLE_FILE_ENVIRONMENT_PROPERTIES)
+#   cloudflared  TUNNEL_TOKEN_FILE           (--token-file)
+#
+# Only the paths appear here and in Docker's metadata. The files themselves
+# live on tmpfs, are owner-only, and are gone after a cold boot; the
+# guacdeploy-stack.service boot unit writes them again before it starts the
+# stack. The SELinux option is the lowercase, shared "z": guacdeploy writes
+# these files from outside the container after Docker has labelled the
+# directory, and a private "Z" label would put them in a different MCS
+# category. Access control here is the file owner and mode 0600, not the
+# label.
+
+name: guacamole
+
+networks:
+  guacnet:
+    driver: bridge
+
+services:
+
+  guacd:
+    image: guacamole/guacd:${GUAC_VERSION:?}
+    networks: [guacnet]
+    restart: always
+    volumes:
+      # guacd writes session recordings; the web application only reads them
+      # back. A connection's recording-path parameter is resolved here, in
+      # guacd, so it holds this container path and never a host path.
+      #
+      # The SELinux option is lowercase "z" (shared), not "Z" (private): the
+      # same host directory is mounted into two containers, and a private
+      # label relabels it per container, so the second mount would take the
+      # directory away from the first.
+      #
+      # guacdeploy creates ./recordings and gives it to the guacd container
+      # account. Docker would otherwise create it root-owned, guacd could not
+      # write, and sessions would run unrecorded without failing.
+      - ./recordings:/recordings:z
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "4822"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      PGDATA: /var/lib/postgresql/data/guacamole
+      POSTGRES_DB: guacamole_db
+      POSTGRES_USER: guacamole_user
+      # docker-entrypoint.sh reads this file through its file_env helper while
+      # it is still root, before it drops to the postgres account, so the file
+      # can stay root-owned and mode 0600.
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres-password
+      # Read by init/002-groups.sh on first start only.
+      GUAC_ADMIN_GROUP: ${GUAC_ADMIN_GROUP:?}
+      GUAC_OPERATOR_GROUP: ${GUAC_OPERATOR_GROUP:?}
+    networks: [guacnet]
+    restart: always
+    volumes:
+      - ./init:/docker-entrypoint-initdb.d:ro,Z
+      - ./data:/var/lib/postgresql/data:Z
+      - {{ .RuntimeSecretsDir }}/postgres:/run/secrets:ro,z
+    healthcheck:
+      # TCP checks the password. Query the schema too: PostgreSQL can restart
+      # after an init script fails and accept connections with no Guacamole tables.
+      #
+      # The check reads the same file the entrypoint did. It cannot read
+      # $POSTGRES_PASSWORD: the entrypoint exports that inside its own process
+      # tree only, and the container environment no longer carries it.
+      test: ["CMD-SHELL", "PGPASSWORD=\"$$(cat /run/secrets/postgres-password)\" psql --host=127.0.0.1 --username=\"$$POSTGRES_USER\" --dbname=\"$$POSTGRES_DB\" --no-password --set=ON_ERROR_STOP=1 --command='SELECT entity_id FROM guacamole_entity LIMIT 0; SELECT user_group_id FROM guacamole_user_group LIMIT 0;' >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  guacamole:
+    image: guacamole/guacamole:${GUAC_VERSION:?}
+    depends_on:
+      guacd:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      GUACD_HOSTNAME: guacd
+      POSTGRESQL_HOSTNAME: postgres
+      POSTGRESQL_DATABASE: guacamole_db
+      POSTGRESQL_USERNAME: guacamole_user
+      # guacamole/guacamole:1.6.0 already sets this in its own Dockerfile. It
+      # is repeated here because the whole delivery depends on it: with it
+      # false, the web application never looks at POSTGRESQL_PASSWORD_FILE,
+      # the postgresql extension fails to load, and every sign-in is refused
+      # while the container still looks healthy.
+      ENABLE_FILE_ENVIRONMENT_PROPERTIES: "true"
+      POSTGRESQL_PASSWORD_FILE: /run/secrets/postgresql-password
+{{- if .SAMLMetadataURL }}
+      # SAML authenticates. The database only authorises.
+      SAML_IDP_METADATA_URL: ${SAML_IDP_METADATA_URL:?}
+      # Entra ID rejects an entity ID that ends in "/". This must match the
+      # identity provider exactly.
+      SAML_ENTITY_ID: "https://${GUAC_HOSTNAME:?}/guacamole"
+      SAML_CALLBACK_URL: "https://${GUAC_HOSTNAME}/guacamole/"
+      SAML_STRICT: "true"
+      SAML_DEBUG: "false"
+      SAML_COMPRESS_REQUEST: "true"
+      SAML_COMPRESS_RESPONSE: "true"
+      SAML_GROUP_ATTRIBUTE: ${SAML_GROUP_ATTRIBUTE:-groups}
+      EXTENSION_PRIORITY: "saml,postgresql"
+{{- end }}
+      # nginx terminates TLS. Without this, Tomcat sees "http://", and SAML
+      # response validation fails because the callback URL says "https://".
+      REMOTE_IP_VALVE_ENABLED: "true"
+      # Where the web application looks for a finished recording when an
+      # operator plays one back from the session history. It must match
+      # guacd's recording-path, because guacd chose the file name.
+      RECORDING_SEARCH_PATH: /recordings
+    networks: [guacnet]
+    restart: always
+    volumes:
+      # Read-only: guacd owns these files, and the web application must never
+      # be able to alter or delete session evidence.
+      - ./recordings:/recordings:ro,z
+      - {{ .RuntimeSecretsDir }}/guacamole:/run/secrets:ro,z
+
+  # Started only when COMPOSE_PROFILES in .env contains "cloudflare".
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate --metrics 127.0.0.1:2000 run
+    environment:
+      # "cloudflared tunnel run" reads the connector token from this file
+      # (--token-file), trimming surrounding whitespace. The container runs as
+      # uid 65532, so the file is owned by 65532 rather than root.
+      TUNNEL_TOKEN_FILE: /run/secrets/tunnel-token
+    networks: [guacnet]
+    profiles: [cloudflare]
+    restart: always
+    volumes:
+      - {{ .RuntimeSecretsDir }}/cloudflared:/run/secrets:ro,z
+    healthcheck:
+      test: ["CMD", "cloudflared", "tunnel", "--metrics", "127.0.0.1:2000", "ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  nginx:
+    image: nginx:1.30-alpine
+    depends_on: [guacamole]
+    environment:
+      GUAC_HOSTNAME: ${GUAC_HOSTNAME:?}
+    networks: [guacnet]
+    ports:
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:ro,Z
+      - ./nginx/certs:/etc/nginx/certs:ro,Z
+      - ./nginx/log:/var/log/nginx:Z
+    restart: always
