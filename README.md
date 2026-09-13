@@ -82,12 +82,24 @@ also a certificate for that name that your clients trust, and a firewall rule fo
 
 ## Deploy
 
+On later interactive runs, setup offers to keep the saved hostname. Answer `n` to
+choose another domain and hostname. Runs without a terminal keep the saved hostname.
+The chosen domain ID is saved as `CLOUDFLARE_ZONE_ID` in `/opt/guacamole/.env`.
+
+Changing the hostname registers Entra SAML for the new name and replaces a local
+certificate that does not match. Previous Entra registrations, tunnels and DNS
+records remain in place. For a manually configured SAML provider, update that
+provider and the saved hostname yourself before running setup.
+
 1. Keep the database password in your secret store. For an existing database, use its
    current password. For a new database, create a password in the store first.
 2. As root, run `./setup.sh` from the Git checkout. It installs or updates the live deployment
-   in `/opt/guacamole`, then continues from there. On the first run it asks for the
-   public hostname and whether to publish through Cloudflare. It writes non-secret
-   configuration to `/opt/guacamole/.env`.
+   in `/opt/guacamole`, then continues from there. On the first run it asks whether
+   to publish through Cloudflare. With Cloudflare, supply the API token, choose a
+   domain, then enter a hostname such as `guacamole`. Setup lists the domains that
+   the token can access in the selected account. If only one domain is available,
+   setup uses it and asks for the hostname. Without Cloudflare, enter the full
+   public hostname. It writes non-secret configuration to `/opt/guacamole/.env`.
    To change group names or use Okta or Keycloak, copy `.env.example` to `.env` and edit
    it before the first run. Set the identity provider metadata URL for Okta or Keycloak.
 3. Supply the database password at the masked prompt and confirm it. Setup can also
@@ -97,8 +109,8 @@ also a certificate for that name that your clients trust, and a firewall rule fo
    self-signed certificate. If the metadata URL is empty, it also registers the
    application in Entra ID: it shows a device code, you sign in as an administrator,
    and it writes the metadata URL back to `.env`.
-   With `COMPOSE_PROFILES=cloudflare` (the default), it then asks for a Cloudflare API
-   token and publishes the hostname: a tunnel, a proxied DNS record, and Cloudflare
+   With `COMPOSE_PROFILES=cloudflare` (the default), it uses the supplied token to
+   publish the hostname: a tunnel, a proxied DNS record, and Cloudflare
    Access with Entra ID sign-in in front. Setup gets the tunnel token without displaying it.
 5. Setup starts the containers and waits for the guacd, database and tunnel health checks.
    It checks the Guacamole page through local nginx, shows container status, then prints

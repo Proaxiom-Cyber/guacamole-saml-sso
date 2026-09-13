@@ -92,14 +92,20 @@ env_get() { sed -n "s/^$1=//p" .env | tail -n 1; }
 source lib/startup.sh
 # shellcheck source=lib/schema.sh
 source lib/schema.sh
+# shellcheck source=lib/cloudflare-domain.sh
+source lib/cloudflare-domain.sh
 
 # First run: write .env from .env.example. Only two answers have no default.
 if [ ! -f .env ]; then
   step "Configuration"
   [ -f .env.example ] || die ".env.example is missing. Run this from the repository folder."
-  read -rp "  Public hostname of this Guacamole (e.g. guacamole.example.com): " H
-  [ -n "$H" ] || die "A hostname is needed."
   read -rp "  Publish through Cloudflare Tunnel + Access? [Y/n] " CF
+  H=""
+  if [[ "${CF:-y}" = [nN] ]]; then
+    CF=n
+    read -rp "  Public hostname of this Guacamole (e.g. guacamole.example.com): " H
+    [ -n "$H" ] || die "A hostname is needed."
+  fi
   ACCT_IN=""
   [ "${CF:-y}" = n ] || read -rp "  Cloudflare account ID (dashboard > the account > Overview, right-hand column): " ACCT_IN
   sed -e "s/^GUAC_HOSTNAME=.*/GUAC_HOSTNAME=$H/" \
@@ -109,8 +115,7 @@ if [ ! -f .env ]; then
 fi
 GUAC_VERSION="$(env_get GUAC_VERSION)"
 GUAC_HOSTNAME="$(env_get GUAC_HOSTNAME)"
-[ -n "$GUAC_VERSION" ] && [ -n "$GUAC_HOSTNAME" ] || die "Set GUAC_VERSION and GUAC_HOSTNAME in .env first."
-note "Hostname  $B$GUAC_HOSTNAME$X"
+[ -n "$GUAC_VERSION" ] || die "Set GUAC_VERSION in .env first."
 note "Guacamole $B$GUAC_VERSION$X"
 
 # ---- Tools --------------------------------------------------------------------
@@ -172,6 +177,59 @@ docker compose ls >/dev/null \
   || die "Compose cannot reach the container engine. Check the connection error above before running setup again."
 ok "Compose can reach the container engine"
 
+# Choose the public hostname before certificates and SAML registration.
+if [[ "$(env_get COMPOSE_PROFILES)" == *cloudflare* ]]; then
+  step "Cloudflare domain"
+  # Token: the environment, a command that prints it, or a prompt. The prompt
+  # first walks through creating the token on the account's token page.
+  CF_TOKEN="${CLOUDFLARE_API_TOKEN:-$(${CLOUDFLARE_TOKEN_CMD:-true})}"
+  ACCT="$(env_get CLOUDFLARE_ACCOUNT_ID)"
+  if [ -n "$CF_TOKEN" ]; then
+    ok "API token from the environment"
+  else
+    [ -n "$ACCT" ] || { read -rp "  Cloudflare account ID (dashboard > the account > Overview, right-hand column): " ACCT; echo; }
+    cat <<GUIDE
+
+  Create an account API token, once:
+    open   ${B}https://dash.cloudflare.com/${ACCT:-<account-id>}/api-tokens/create${X}
+    name   guacamole-setup
+    ${B}Policy 1${X}, scope: ${B}the account${X}. Search and tick:
+           Cloudflare Tunnel Write
+           Access: Apps and Policies Write
+           Access: Organizations, Identity Providers, and Groups Write
+    ${B}Add policy${X} -> ${B}Policy 2${X}, scope: ${B}Specified Domains${X} -> the domains you want to choose from. Tick:
+           DNS Write
+           Zone Read
+    expiry 7 days, then Review token -> Create token, and copy it.
+
+GUIDE
+    read -rsp "  Paste the token (not echoed): " CF_TOKEN; echo
+  fi
+  [ -n "$CF_TOKEN" ] || die "No token given."
+
+  # cf METHOD PATH [JSON]. Prints .result. Token and body stay off the command line.
+  cf() {
+    local out
+    out="$(printf 'header = "Authorization: Bearer %s"\n' "$CF_TOKEN" | curl -sS -K - \
+      -X "$1" -H 'Content-Type: application/json' ${3:+-d @/dev/fd/3} \
+      "https://api.cloudflare.com/client/v4$2" 3<<<"${3:-}")" \
+      || die "Cloudflare $1 $2: curl failed."
+    jq -e .success <<<"$out" >/dev/null 2>&1 \
+      || die "Cloudflare $1 $2 failed: $(jq -r '.errors[0].message' <<<"$out")"
+    jq -c .result <<<"$out"
+  }
+
+  # Account tokens verify under the account, user tokens under /user.
+  VERIFY="$(cf GET "/accounts/${ACCT:-_}/tokens/verify" 2>/dev/null || cf GET /user/tokens/verify 2>/dev/null || true)"
+  [ "$(jq -r '.status // empty' <<<"$VERIFY")" = active ] \
+    || die "Cloudflare rejected the token. Check it was copied whole and that its policies match the list above."
+  ok "API token accepted"
+
+  choose_cloudflare_hostname
+fi
+[ -n "$GUAC_HOSTNAME" ] || die "Set GUAC_HOSTNAME in .env first."
+note "Hostname  $B$GUAC_HOSTNAME$X"
+
 step "Database password"
 get_database_password
 ok "database password supplied"
@@ -185,7 +243,9 @@ ok "folders"
 # reinitialised or upgraded by generating this file.
 prepare_database_schema
 
-if [ -f nginx/certs/privkey.pem ]; then
+if [ -f nginx/certs/privkey.pem ] && [ -f nginx/certs/fullchain.pem ] &&
+   openssl verify -verify_hostname "$GUAC_HOSTNAME" -CAfile nginx/certs/fullchain.pem \
+     nginx/certs/fullchain.pem >/dev/null 2>&1; then
   ok "certificate (nginx/certs/privkey.pem exists)"
 else
   openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
@@ -399,62 +459,7 @@ PUBLISHED=
 TUNNEL_TOKEN_OUT=
 if [[ "$(env_get COMPOSE_PROFILES)" == *cloudflare* ]]; then
   step "Cloudflare"
-  # Token: the environment, a command that prints it, or a prompt. The prompt
-  # first walks through creating the token on the account's token page.
-  CF_TOKEN="${CLOUDFLARE_API_TOKEN:-$(${CLOUDFLARE_TOKEN_CMD:-true})}"
-  ACCT="$(env_get CLOUDFLARE_ACCOUNT_ID)"
-  if [ -n "$CF_TOKEN" ]; then
-    ok "API token from the environment"
-  else
-    [ -n "$ACCT" ] || { read -rp "  Cloudflare account ID (dashboard > the account > Overview, right-hand column): " ACCT; echo; }
-    cat <<GUIDE
-
-  Create an account API token, once:
-    open   ${B}https://dash.cloudflare.com/${ACCT:-<account-id>}/api-tokens/create${X}
-    name   guacamole-setup
-    ${B}Policy 1${X}, scope: ${B}the account${X}. Search and tick:
-           Cloudflare Tunnel Write
-           Access: Apps and Policies Write
-           Access: Organizations, Identity Providers, and Groups Write
-    ${B}Add policy${X} -> ${B}Policy 2${X}, scope: ${B}Specified Domains${X} -> ${GUAC_HOSTNAME#*.}. Tick:
-           DNS Write
-           Zone Read
-    expiry 7 days, then Review token -> Create token, and copy it.
-
-GUIDE
-    read -rsp "  Paste the token (not echoed): " CF_TOKEN; echo
-  fi
-  [ -n "$CF_TOKEN" ] || die "No token given."
-
-  # cf METHOD PATH [JSON]. Prints .result. Token and body stay off the command line.
-  cf() {
-    local out
-    out="$(printf 'header = "Authorization: Bearer %s"\n' "$CF_TOKEN" | curl -sS -K - \
-      -X "$1" -H 'Content-Type: application/json' ${3:+-d @/dev/fd/3} \
-      "https://api.cloudflare.com/client/v4$2" 3<<<"${3:-}")" \
-      || die "Cloudflare $1 $2: curl failed."
-    jq -e .success <<<"$out" >/dev/null 2>&1 \
-      || die "Cloudflare $1 $2 failed: $(jq -r '.errors[0].message' <<<"$out")"
-    jq -c .result <<<"$out"
-  }
-
-  # Account tokens verify under the account, user tokens under /user.
-  VERIFY="$(cf GET "/accounts/${ACCT:-_}/tokens/verify" 2>/dev/null || cf GET /user/tokens/verify 2>/dev/null || true)"
-  [ "$(jq -r '.status // empty' <<<"$VERIFY")" = active ] \
-    || die "Cloudflare rejected the token. Check it was copied whole and that its policies match the list above."
-  ok "API token accepted"
-
-  # The zone is the longest suffix of GUAC_HOSTNAME that the token can see.
-  NAME="$GUAC_HOSTNAME"; ZONE=""
-  while :; do
-    ZONE="$(cf GET "/zones?name=$NAME" | jq -r '.[0].id // empty')"
-    [ -z "$ZONE" ] && [[ "$NAME" == *.*.* ]] || break
-    NAME="${NAME#*.}"
-  done
-  [ -n "$ZONE" ] || die "No Cloudflare zone for $GUAC_HOSTNAME is visible to this token."
-  ZINFO="$(cf GET "/zones/$ZONE")"
-  ACCT="$(jq -r .account.id <<<"$ZINFO")"   # authoritative, whatever .env says
-  ok "zone $NAME ($(jq -r .status <<<"$ZINFO")) in account $(jq -r .account.name <<<"$ZINFO")"
+  # Authentication and domain selection ran before host and Entra setup.
 
   # Zero Trust team. An account without one needs CLOUDFLARE_TEAM in .env.
   TEAM_DOMAIN="$(cf GET "/accounts/$ACCT/access/organizations" 2>/dev/null | jq -r '.auth_domain // empty' || true)"
