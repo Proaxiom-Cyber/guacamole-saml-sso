@@ -79,6 +79,38 @@ check() { # check <name> <expected: ok|reject> <rc> <install-subdir> [required-m
 # 1. Intact release, verifier accepts -> installed.
 run_launcher bin1; check "intact release installs" ok $? bin1
 
+# A normal login uses sudo only for the final installation. The shim redirects
+# the default destination into the fixture; this test never writes to the host.
+mkdir -p "$tmp/elevate"
+cat > "$tmp/elevate/id" <<'EOF'
+#!/bin/sh
+echo 1000
+EOF
+cat > "$tmp/elevate/install" <<'EOF'
+#!/bin/sh
+for arg do destination=$arg; done
+[ "$destination" != /usr/local/bin/guacdeploy ] || exit 92
+exec /usr/bin/install "$@"
+EOF
+cat > "$tmp/elevate/sudo" <<'EOF'
+#!/bin/sh
+[ "$1" = -- ] || exit 90
+shift
+case "$1" in
+  mkdir) mkdir -p "$SUDO_TEST_DEST" ;;
+  install) install -m 0755 "$4" "$SUDO_TEST_DEST/guacdeploy" ;;
+  restorecon) exit 0 ;;
+  *) exit 91 ;;
+esac
+EOF
+chmod +x "$tmp/elevate/id" "$tmp/elevate/install" "$tmp/elevate/sudo"
+env PATH="$tmp/elevate:$tmp/shim:$PATH" \
+  SUDO_TEST_DEST="$tmp/bin-sudo" \
+  GUACDEPLOY_BASE_URL="file://$tmp/root" \
+  GUACDEPLOY_INSTALL_DIR=/usr/local/bin \
+  sh "$launcher" "$tag" >"$tmp/out" 2>&1
+check "normal login installs through sudo" ok $? bin-sudo
+
 # 2. Altered artifact -> checksum reject, nothing installed.
 printf 'tampered bytes\n' >> "$rel/guacdeploy_linux_amd64"
 run_launcher bin2; check "altered artifact rejected" reject $? bin2 "checksum mismatch"

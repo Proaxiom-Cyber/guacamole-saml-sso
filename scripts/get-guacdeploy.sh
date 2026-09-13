@@ -103,11 +103,24 @@ fi
   "$tmp/SHA256SUMS" >/dev/null ||
   die "Sigstore verification failed: SHA256SUMS is not signed by the approved release workflow of Proaxiom-Cyber/guacamole-saml-sso. Refusing to install."
 
-mkdir -p "$INSTALL_DIR" || die "cannot create $INSTALL_DIR"
-install -m 0755 "$tmp/$ASSET" "$INSTALL_DIR/guacdeploy" ||
+use_sudo=0
+if [ "$INSTALL_DIR" = /usr/local/bin ] && [ "$(id -u)" -ne 0 ]; then
+  command -v sudo >/dev/null 2>&1 ||
+    die "sudo is required to install to $INSTALL_DIR. Run as root, or set GUACDEPLOY_INSTALL_DIR."
+  echo "get-guacdeploy: using sudo to install the verified binary to $INSTALL_DIR"
+  use_sudo=1
+fi
+
+install_command() {
+  if [ "$use_sudo" -eq 1 ]; then sudo -- "$@"
+  else "$@"; fi
+}
+
+install_command mkdir -p "$INSTALL_DIR" || die "cannot create $INSTALL_DIR"
+install_command install -m 0755 "$tmp/$ASSET" "$INSTALL_DIR/guacdeploy" ||
   die "cannot install to $INSTALL_DIR. Run as root, or set GUACDEPLOY_INSTALL_DIR."
 if command -v restorecon >/dev/null 2>&1; then
-  restorecon "$INSTALL_DIR/guacdeploy" || true
+  install_command restorecon "$INSTALL_DIR/guacdeploy" || true
 fi
 
 echo "get-guacdeploy: verified and installed guacdeploy $version to $INSTALL_DIR/guacdeploy"

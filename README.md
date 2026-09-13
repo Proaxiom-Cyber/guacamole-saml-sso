@@ -91,6 +91,8 @@ check:
 curl -fsSLO https://github.com/Proaxiom-Cyber/guacamole-saml-sso/releases/latest/download/get-guacdeploy.sh && sh get-guacdeploy.sh
 ```
 
+For a normal login, the launcher uses `sudo` to install the verified binary.
+
 Read the script before you run it. [Release and verification](docs/release-and-verification.md)
 describes the signing identity, the trust bootstrap, the network destinations the
 launcher uses, and the approval an administrator must give on hosts with application
