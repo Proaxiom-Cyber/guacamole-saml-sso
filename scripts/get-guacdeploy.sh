@@ -7,8 +7,11 @@
 # signed through GitHub Actions OIDC. The script refuses to install anything
 # that fails either check. See docs/release-and-verification.md.
 #
-# Usage: sh get-guacdeploy.sh [version]
+# Usage: sh get-guacdeploy.sh [--install-only] [version]
 #   version   Release tag, for example v1.0.0. Default: the latest release.
+#   --install-only   Install without starting the guided wizard.
+# A terminal run starts the wizard after verification and installation.
+# Without terminal input and output, the launcher only installs the binary.
 #
 # Environment:
 #   GUACDEPLOY_BASE_URL     Download base for a mirror or a test fixture.
@@ -39,6 +42,21 @@ CERT_ISSUER="https://token.actions.githubusercontent.com"
 
 die() { echo "get-guacdeploy: ERROR: $*" >&2; exit 1; }
 
+version=latest
+version_set=0
+install_only=0
+for arg do
+  case "$arg" in
+    --install-only) install_only=1 ;;
+    latest|v[0-9]*)
+      [ "$version_set" -eq 0 ] || die "specify only one release tag"
+      version="$arg"
+      version_set=1
+      ;;
+    *) die "usage: sh get-guacdeploy.sh [--install-only] [version]" ;;
+  esac
+done
+
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"
   else shasum -a 256 "$1"; fi | awk '{print $1}'
@@ -55,7 +73,6 @@ tmp=$(mktemp -d) || die "cannot create a temporary directory"
 trap 'rm -rf "$tmp"' EXIT
 
 # Resolve "latest" to a concrete tag through the release redirect.
-version="${1:-latest}"
 if [ "$version" = "latest" ]; then
   effective=$(curl -fsSLI --retry 2 -o /dev/null -w '%{url_effective}' "$REPO_URL/releases/latest") ||
     die "cannot resolve the latest release from $REPO_URL"
@@ -124,4 +141,18 @@ if command -v restorecon >/dev/null 2>&1; then
 fi
 
 echo "get-guacdeploy: verified and installed guacdeploy $version to $INSTALL_DIR/guacdeploy"
-echo "get-guacdeploy: next step: run '$INSTALL_DIR/guacdeploy' as root"
+if [ "$install_only" -eq 1 ] || [ ! -t 0 ] || [ ! -t 1 ]; then
+  echo "get-guacdeploy: next step: run '$INSTALL_DIR/guacdeploy' as root"
+  exit 0
+fi
+
+echo "get-guacdeploy: starting the setup wizard"
+# exec preserves the terminal and the wizard's exit status. Remove downloads
+# first: replacing this shell does not run its EXIT trap.
+rm -rf "$tmp"
+trap - EXIT
+if [ "$(id -u)" -eq 0 ]; then
+  exec "$INSTALL_DIR/guacdeploy"
+fi
+command -v sudo >/dev/null 2>&1 || die "sudo is required to start the setup wizard"
+exec sudo -- "$INSTALL_DIR/guacdeploy"

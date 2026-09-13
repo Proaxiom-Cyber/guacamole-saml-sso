@@ -24,6 +24,8 @@ jobs:
         run: |
           go vet ./...
           go test ./...
+          PATH=/usr/bin:/bin:/usr/sbin:/sbin bash tests/launcher_test.sh
+          python3 tests/launcher_interactive_test.py
 
       - name: Build guacdeploy for linux/amd64
         env:

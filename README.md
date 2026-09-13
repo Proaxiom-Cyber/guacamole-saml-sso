@@ -91,7 +91,10 @@ check:
 curl -fsSLO https://github.com/Proaxiom-Cyber/guacamole-saml-sso/releases/latest/download/get-guacdeploy.sh && sh get-guacdeploy.sh
 ```
 
-For a normal login, the launcher uses `sudo` to install the verified binary.
+For a normal login, the launcher uses `sudo` to install the verified binary and
+start the setup wizard. A terminal run continues into setup without another command.
+Use `sh get-guacdeploy.sh --install-only` to install without starting setup.
+Without terminal input and output, the launcher only installs the binary.
 
 Read the script before you run it. [Release and verification](docs/release-and-verification.md)
 describes the signing identity, the trust bootstrap, the network destinations the
@@ -100,7 +103,8 @@ allowlisting.
 
 ## Deploy
 
-Run `guacdeploy` as root on the server. One guided run does the whole deployment:
+The launcher starts setup after an interactive installation. To start setup later
+or resume an interrupted deployment, run:
 
 ```sh
 sudo guacdeploy
