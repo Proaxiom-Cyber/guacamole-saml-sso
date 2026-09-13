@@ -97,7 +97,7 @@ func TestUpKeepsPasswordOutOfArgumentsAndStdin(t *testing.T) {
 		gotStdin, gotArgs = stdin, append([]string{name}, args...)
 		return "ok", nil
 	}
-	cfg := Config{InstallDir: t.TempDir(), RuntimeSecretsDir: filepath.Join(t.TempDir(), "run")}
+	cfg := Config{InstallDir: t.TempDir(), RuntimeSecretsDir: filepath.Join(runtimeTestDir(t), "run")}
 	if err := Up(context.Background(), run, cfg, "pa$sword", "tok$en"); err != nil {
 		t.Fatal(err)
 	}

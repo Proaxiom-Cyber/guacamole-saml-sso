@@ -5,9 +5,26 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+func runtimeTestDir(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		return t.TempDir()
+	}
+	dir, err := os.MkdirTemp("/dev/shm", "guacdeploy-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	if err := checkMemoryBacked(dir); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
 
 const (
 	testPassword = "pa$sword-3f9c"
@@ -18,7 +35,7 @@ func testConfig(t *testing.T) Config {
 	t.Helper()
 	return Config{
 		InstallDir:        t.TempDir(),
-		RuntimeSecretsDir: filepath.Join(t.TempDir(), "run", "secrets"),
+		RuntimeSecretsDir: filepath.Join(runtimeTestDir(t), "run", "secrets"),
 		Hostname:          "guac.example.test",
 		AdminGroup:        "GA",
 		OperatorGroup:     "GO",
