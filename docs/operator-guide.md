@@ -55,12 +55,37 @@ TCP 443 to `mirrors.rockylinux.org`, `download.docker.com`, and
 command runs Podman, and hosts with an existing installation are rejected
 with an explanation. Nothing is adopted or overwritten.
 
-If Docker or the Compose plugin is missing, setup shows the installation
-plan (Docker's RHEL repository via dnf, then enable and start the docker
-service) and asks before installing. Unattended runs need
-`--install-dependencies`. Installed packages and the service enablement
-are recorded as changes made by this deployment. Docker that was already
-present is pre-existing and is never offered for removal at teardown.
+If Docker is missing, setup offers to install it from Docker's RHEL repository,
+then enable and start its service. If Docker exists but Compose is unavailable,
+setup offers to install only `docker-compose-plugin`. This leaves the existing
+Docker service settings unchanged. Setup asks before installing. Unattended runs
+need `--install-dependencies`. Setup records the installed packages and any
+service enablement it performs. Pre-existing Docker is never offered for removal
+at teardown.
+
+### Compose command compatibility
+
+This installer uses `docker compose` for setup and teardown. The separate
+`docker-compose` executable does not satisfy that requirement. Docker recommends
+the [Compose plugin](https://docs.docker.com/compose/install/linux/) and retains
+the [standalone installation](https://docs.docker.com/compose/install/standalone/)
+for backward compatibility. The command spelling alone does not identify the
+Compose version.
+
+Setup runs `docker compose version` before installing dependencies and again
+after installation. If the second check fails, setup stops before starting the
+stack. It does not fall back to `docker-compose` or depend on a shell alias.
+
+For diagnosis, run these checks with the same privileges as the installer:
+
+```sh
+sudo docker --version
+sudo docker compose version
+```
+
+A plugin installed only under your user account can be unavailable to `sudo`.
+Docker documents separate user and system installation paths. Use the packaged
+plugin for this deployment, and make sure the existing Docker service is running.
 
 ## The Guacamole stack
 

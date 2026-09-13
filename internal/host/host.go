@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 )
@@ -166,8 +167,13 @@ func orUnknown(s string) string {
 
 // MissingDependencies lists what dependency installation would add.
 func MissingDependencies(f *Facts) []string {
-	if f.DockerPath != "" && f.ComposeOK {
-		return nil
+	if f.DockerPath != "" {
+		if f.ComposeOK {
+			return nil
+		}
+		// The standalone docker-compose command cannot satisfy callers of
+		// docker compose. Add the plugin without reinstalling Docker itself.
+		return []string{"docker-compose-plugin"}
 	}
 	// Docker's RHEL repository set, per the Rocky installation guidance the
 	// shell setup already followed.
@@ -182,7 +188,9 @@ func (p *Probes) InstallDependencies(ctx context.Context, pkgs []string) error {
 		{"dnf", "-y", "install", "dnf-plugins-core"},
 		{"dnf", "config-manager", "--add-repo", "https://download.docker.com/linux/rhel/docker-ce.repo"},
 		append([]string{"dnf", "-y", "install"}, pkgs...),
-		{"systemctl", "enable", "--now", "docker"},
+	}
+	if slices.Contains(pkgs, "docker-ce") {
+		steps = append(steps, []string{"systemctl", "enable", "--now", "docker"})
 	}
 	for _, s := range steps {
 		if out, err := p.Run(ctx, s[0], s[1:]...); err != nil {

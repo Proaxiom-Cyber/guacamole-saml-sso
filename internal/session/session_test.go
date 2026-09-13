@@ -339,6 +339,47 @@ func TestUnattendedMissingDependenciesRequireConsent(t *testing.T) {
 	}
 }
 
+func TestComposeOnlyInstallDoesNotClaimExistingDocker(t *testing.T) {
+	dir := t.TempDir()
+	h := fakeHost(t)
+	var calls []string
+	pluginInstalled := false
+	h.Run = func(_ context.Context, name string, args ...string) (string, error) {
+		call := name + " " + strings.Join(args, " ")
+		calls = append(calls, call)
+		if call == "docker compose version" && !pluginInstalled {
+			return "compose is not a docker command", errors.New("exit 1")
+		}
+		if strings.HasPrefix(call, "dnf -y install ") && strings.Contains(call, "docker-compose-plugin") {
+			pluginInstalled = true
+		}
+		return "ok", nil
+	}
+	u, out := testUI(false, "")
+	err := Run(context.Background(), core(Options{
+		StateDir: dir, UI: u, Host: h, InstallDependencies: true,
+		CredentialMode: creds.ModeEnv, CredSpecs: []creds.Spec{},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := state.Read(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Resources) != 1 || st.Resources[0].Type != "package" || st.Resources[0].Name != "docker-compose-plugin" {
+		t.Fatalf("only the missing plugin should be recorded as installed: %+v", st.Resources)
+	}
+	for _, call := range calls {
+		if strings.HasPrefix(call, "systemctl ") || strings.Contains(call, "install docker-ce") {
+			t.Fatalf("plugin installation changed existing Docker: %s", call)
+		}
+	}
+	if strings.Contains(out.String(), "enable and start") {
+		t.Fatalf("the approval plan still promises to change Docker's service: %s", out)
+	}
+}
+
 func TestGuidedDependencyDeclineStopsSetup(t *testing.T) {
 	dir := t.TempDir()
 	var calls []string

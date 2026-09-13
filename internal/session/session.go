@@ -533,7 +533,12 @@ func (o *Options) hostDependencies(ctx context.Context, st *state.State, u *ui.U
 		return nil
 	}
 	u.Say("Missing dependencies: %s", strings.Join(missing, ", "))
-	u.Say("Plan: add Docker's RHEL repository, install the packages with dnf, then enable and start the docker service.")
+	if f.DockerPath == "" {
+		u.Say("Plan: add Docker's RHEL repository, install the packages with dnf, then enable and start the docker service.")
+	} else {
+		u.Say("The docker compose command is unavailable. A standalone docker-compose command does not supply the plugin this deployment needs.")
+		u.Say("Plan: add Docker's RHEL repository and install the Compose plugin with dnf. Keep the existing Docker service settings.")
+	}
 	if u.Interactive {
 		ok, err := u.Confirm("Install these dependencies now?")
 		if err != nil {
@@ -555,10 +560,12 @@ func (o *Options) hostDependencies(ctx context.Context, st *state.State, u *ui.U
 			Ownership: "installed by this deployment", CreatedAt: now,
 		})
 	}
-	st.Resources = append(st.Resources, state.Resource{
-		ID: state.NewID(), Provider: "host", Type: "service-enablement", Name: "docker",
-		Ownership: "enabled by this deployment", CreatedAt: now,
-	})
+	if f.DockerPath == "" {
+		st.Resources = append(st.Resources, state.Resource{
+			ID: state.NewID(), Provider: "host", Type: "service-enablement", Name: "docker",
+			Ownership: "enabled by this deployment", CreatedAt: now,
+		})
+	}
 	u.Say("Dependencies installed and recorded as host changes made by this deployment.")
 	return nil
 }

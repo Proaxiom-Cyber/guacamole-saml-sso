@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -135,5 +136,82 @@ func TestInstallDependenciesSurfacesFailure(t *testing.T) {
 	err := p.InstallDependencies(context.Background(), []string{"docker-ce"})
 	if err == nil || !strings.Contains(err.Error(), "systemctl") {
 		t.Fatalf("want systemctl failure surfaced, got %v", err)
+	}
+}
+
+func TestComposeCommandAvailability(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		docker     bool
+		plugin     bool
+		standalone bool
+		want       []string
+	}{
+		{"plugin", true, true, false, nil},
+		{"both commands", true, true, true, nil},
+		{"standalone only", true, false, true, []string{"docker-compose-plugin"}},
+		{"docker without compose", true, false, false, []string{"docker-compose-plugin"}},
+		{"no docker", false, false, false, []string{"docker-ce", "docker-ce-cli", "containerd.io", "docker-buildx-plugin", "docker-compose-plugin"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := goodProbes(t)
+			p.LookPath = func(name string) (string, error) {
+				if name == "docker" && tc.docker || name == "docker-compose" && tc.standalone {
+					return "/usr/bin/" + name, nil
+				}
+				return "", errors.New("not found")
+			}
+			p.Run = func(_ context.Context, name string, args ...string) (string, error) {
+				if name == "docker-compose" {
+					t.Fatal("standalone Compose must not be used as a plugin fallback")
+				}
+				if name == "docker" && strings.Join(args, " ") == "compose version" && !tc.plugin {
+					return "docker: 'compose' is not a docker command", errors.New("exit 1")
+				}
+				return "ok", nil
+			}
+			f, err := p.Gather(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if f.ComposeOK != tc.plugin {
+				t.Fatalf("ComposeOK = %v, want %v", f.ComposeOK, tc.plugin)
+			}
+			if got := MissingDependencies(f); !slices.Equal(got, tc.want) {
+				t.Fatalf("dependencies = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestInstallComposePluginLeavesDockerServiceUnchanged(t *testing.T) {
+	p := goodProbes(t)
+	var calls []string
+	p.Run = func(_ context.Context, name string, args ...string) (string, error) {
+		calls = append(calls, name+" "+strings.Join(args, " "))
+		if name == "systemctl" {
+			t.Fatal("installing only Compose must not enable or start the pre-existing Docker service")
+		}
+		return "ok", nil
+	}
+	if err := p.InstallDependencies(context.Background(), []string{"docker-compose-plugin"}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(calls, "dnf -y install docker-compose-plugin") || calls[len(calls)-1] != "docker compose version" {
+		t.Fatalf("plugin installation was not verified: %v", calls)
+	}
+}
+
+func TestInstallDependenciesRejectsUnavailableComposePlugin(t *testing.T) {
+	p := goodProbes(t)
+	p.Run = func(_ context.Context, name string, args ...string) (string, error) {
+		if name == "docker" && strings.Join(args, " ") == "compose version" {
+			return "plugin unavailable", errors.New("exit 1")
+		}
+		return "ok", nil
+	}
+	err := p.InstallDependencies(context.Background(), []string{"docker-compose-plugin"})
+	if err == nil || !strings.Contains(err.Error(), "docker compose is still unavailable") {
+		t.Fatalf("a successful package install must not hide a broken plugin: %v", err)
 	}
 }
