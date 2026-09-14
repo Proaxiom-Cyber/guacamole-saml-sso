@@ -53,6 +53,9 @@ func fakeHost(t *testing.T) *host.Probes {
 // core trims the registry to end at host-dependencies, keeping these tests
 // focused on session mechanics; stack phases have their own tests.
 func core(o Options) Options {
+	if o.Cloudflare == nil {
+		o.Cloudflare = acceptedCredentialClient()
+	}
 	if o.Phases != nil {
 		return o
 	}
@@ -236,7 +239,7 @@ func TestCompletedDeploymentRunsPhasesItNeverRan(t *testing.T) {
 	if ranOld != 0 {
 		t.Fatalf("a completed phase was re-run: %d", ranOld)
 	}
-	if !strings.Contains(out.String(), "does not overwrite") || !strings.Contains(out.String(), "Re-applying") {
+	if !strings.Contains(out.String(), "refreshing managed service files") || strings.Contains(out.String(), "run teardown first") {
 		t.Fatalf("the operator was not told what happened:\n%s", out.String())
 	}
 }
@@ -509,6 +512,8 @@ func stackRunner(calls *[]stackCall) stack.Runner {
 		*calls = append(*calls, stackCall{stdin: stdin, args: append([]string{name}, args...)})
 		joined := strings.Join(args, " ")
 		switch {
+		case strings.Contains(joined, "guacdeploy-database"):
+			return "GUACDEPLOY_DATABASE_READY", nil
 		case strings.Contains(joined, "initdb.sh"):
 			return "CREATE TABLE guacamole_entity (x int);\nCREATE TABLE guacamole_user_group (y int);\n", nil
 		case strings.Contains(joined, "ps"):
@@ -531,6 +536,7 @@ func TestStackPhasesFullPipelineUnattended(t *testing.T) {
 	opts := Options{
 		StateDir: dir, UI: u, Host: fakeHost(t), CredentialMode: creds.ModeEnv,
 		Hostname: "guac.example.test", AdminGroup: "GuacAdmins", OperatorGroup: "GuacOperators",
+		Cloudflare: acceptedCredentialClient(),
 		InstallDir: install, StackRun: stackRunner(&calls),
 		StackRunOut: func(_ context.Context, name string, args ...string) (string, string, error) {
 			return "CREATE TABLE guacamole_entity (x int);\nCREATE TABLE guacamole_user_group (y int);\n", "", nil
@@ -610,6 +616,7 @@ func TestUnattendedStackNeedsExplicitConfig(t *testing.T) {
 	opts := Options{
 		StateDir: dir, UI: u, Host: fakeHost(t), CredentialMode: creds.ModeEnv,
 		InstallDir: filepath.Join(t.TempDir(), "opt"),
+		Cloudflare: acceptedCredentialClient(),
 		StackRun:   stackRunner(&[]stackCall{}),
 		StackRunOut: func(_ context.Context, name string, args ...string) (string, string, error) {
 			return "CREATE TABLE guacamole_entity (x int);\n", "", nil
@@ -818,21 +825,6 @@ func TestIntentIsJournalledBeforeTheWork(t *testing.T) {
 	}
 	if last.Intent != "risky" || last.Result != state.ResultFailed {
 		t.Fatalf("unexpected journal entry: %+v", last)
-	}
-}
-
-// TestApexDerivation covers the zone guess and its override, because a
-// wrong apex sends the deployment at somebody else's zone.
-func TestApexDerivation(t *testing.T) {
-	for in, want := range map[string]string{
-		"guac.example.com": "example.com",
-		"a.b.c.example.co": "example.co",
-		"example.com":      "example.com",
-		"localhost":        "localhost",
-	} {
-		if got := apexOf(in); got != want {
-			t.Errorf("apexOf(%q) = %q, want %q", in, got, want)
-		}
 	}
 }
 

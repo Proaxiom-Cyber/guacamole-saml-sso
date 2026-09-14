@@ -8,6 +8,7 @@ import (
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/cloudflare"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/creds"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/entra"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/session"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/settings"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/teardown"
@@ -39,13 +40,13 @@ func teardownCmd(ctx context.Context, stateDir string, consent, deleteData bool,
 		return nil
 	}
 
-	reg := settingsRegistry()
 	ops := teardown.DefaultOps(teardown.HostOptions{
 		DeploymentID: st.DeploymentID,
 		StateDir:     stateDir,
 		InstallDir:   installDirOf(st),
 	})
 	cf, ec := teardownProviders(&ops, st, stateDir, u)
+	reg := settingsRegistry(ec)
 
 	// Reconcile before planning. A phase that created resources and then
 	// failed before recording them leaves nothing in the deployment record,
@@ -102,7 +103,7 @@ func teardownProviders(ops *teardown.Ops, st *state.State, stateDir string, u *u
 	m := &creds.Manager{
 		Mode:       st.Config["credential-mode"],
 		Dir:        filepath.Join(stateDir, "credentials"),
-		ReadSecret: u.SecretReader(),
+		ReadSecret: u.SecretReader(), Protect: u.Protect,
 	}
 	cf := &cloudflare.Provisioner{
 		Client: &cloudflare.Client{Token: func(context.Context) (string, error) {
@@ -124,8 +125,9 @@ func teardownProviders(ops *teardown.Ops, st *state.State, stateDir string, u *u
 
 	// Removing the application removes its service principal and role
 	// assignments with it, so neither is ever deleted separately.
-	ec := &entra.Client{Token: entra.StaticTokenFromEnv(entra.DefaultTokenEnv)}
+	ec := session.EntraClientForOperation(st, stateDir, u)
 	ecfg := entra.Config{DeploymentID: st.DeploymentID, Hostname: st.Config["guac-hostname"]}
+	ops.DeleteInstallerIdentity = func(ctx context.Context, id string) error { return ec.CleanupInstaller(ctx, st.DeploymentID, id) }
 	ops.DeleteEntraApp = func(ctx context.Context, id string) error {
 		return ec.CleanupApp(ctx, ecfg, id)
 	}
@@ -151,6 +153,19 @@ func findEntra(ec *entra.Client, st *state.State) teardown.Finder {
 			return teardown.Found{}, err // including ErrRequiresReview: a person decides
 		}
 		var f teardown.Found
+		if st.Config["entra-installer-pending"] != "" || st.Config["entra-installer-client-id"] != "" {
+			app, err := ec.FindInstaller(ctx, st.DeploymentID)
+			if err != nil {
+				return f, err
+			}
+			if app != nil {
+				for _, r := range []struct{ kind, id string }{{"installer-application", app.ID}, {"installer-service-principal", app.SPID}} {
+					if r.id != "" {
+						f.Owned = append(f.Owned, state.Resource{Provider: "entra", Type: r.kind, ProviderID: r.id, Name: app.DisplayName, Ownership: "marker " + entra.InstallerMarker(st.DeploymentID) + " on the installer application"})
+					}
+				}
+			}
+		}
 		if p.App != nil {
 			r := state.Resource{Provider: "entra", Type: "application",
 				ProviderID: p.App.ObjectID, Name: p.App.DisplayName}

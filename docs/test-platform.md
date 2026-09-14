@@ -131,9 +131,11 @@ Cloudflare. Track and remove those resources separately.
 
 ## Platform findings from live runs
 
-- The GenericCloud image ships `kernel-modules-core` only. The first
-  `dnf update` installs a newer kernel with the full `kernel-modules`
-  package. Until the VM reboots into that kernel, Docker cannot load
-  `xt_addrtype` and fails to start. guacdeploy preflight now detects this
-  and asks for a reboot-and-resume. After a rollback to `clean-baseline`,
-  expect one update-and-reboot before deploying.
+- The GenericCloud image ships `kernel-modules-core` only. Setup offers to install
+  `kernel`, `kernel-modules`, and `kernel-modules-extra` when Docker's required
+  `xt_addrtype` module is absent. It checks the running kernel and the next boot
+  kernel after installation. If only the next boot kernel has the module, setup
+  saves progress and gives reboot and resume instructions. A retry before reboot
+  does not reinstall the packages. These operating-system packages remain with the
+  host during teardown. After a rollback to `clean-baseline`, expect one package
+  installation and reboot before deployment.

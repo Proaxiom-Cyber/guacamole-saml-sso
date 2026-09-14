@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/term"
 )
@@ -225,52 +226,31 @@ var twentyPhases = []string{
 func TestPhaseStatusTransitions(t *testing.T) {
 	u, _, _ := newTestUI("")
 	u.PhaseList(twentyPhases)
-	w := u.wiz
-
-	lines := w.snapshot()
-	if !hasLineWith(lines, "Phases (20):", "0 done", "20 to do") {
-		t.Errorf("initial progress line wrong:\n%s", strings.Join(lines, "\n"))
-	}
-	if !hasLineWith(lines, phaseWaiting, "initialise-deployment") {
-		t.Error("a phase still to come is not shown as such")
-	}
-
 	u.PhaseStart("initialise-deployment")
-	lines = w.snapshot()
-	if !hasLineWith(lines, phaseRunning, "initialise-deployment") {
-		t.Error("the running phase is not shown as running")
+	if !hasLineWith(u.wiz.snapshot(), "Create deployment record") {
+		t.Fatal("current task is not visible")
 	}
-	if !hasLineWith(lines, "1 running", "19 to do") {
-		t.Error("progress does not count the running phase")
-	}
-
 	u.PhaseDone("initialise-deployment")
 	u.PhaseSkipped("host-preflight")
-	u.PhaseStart("credential-mode")
 	u.PhaseFailed("credential-mode", errors.New("no credential mode selected"))
-
-	lines = w.snapshot()
-	for _, want := range [][]string{
-		{phaseDone, "initialise-deployment"},
-		{phaseSkipped, "host-preflight", "(already complete)"},
-		{phaseFailed, "credential-mode"},
-		{phaseWaiting, "credential-check"},
-	} {
-		if !hasLineWith(lines, want...) {
-			t.Errorf("missing %v from:\n%s", want, strings.Join(lines, "\n"))
-		}
+	if !hasLineWith(u.wiz.snapshot(), "2 / 20 steps complete") {
+		t.Fatal("completion counts do not include retained work")
 	}
-	if !hasLineWith(lines, "1 done", "1 failed", "1 already complete", "17 to do") {
-		t.Errorf("progress line does not summarise every state:\n%s", strings.Join(lines, "\n"))
+	u.wiz.details = true
+	u.wiz.rows = 80
+	lines := u.wiz.snapshot()
+	for _, want := range [][]string{{phaseDone, "initialise-deployment"}, {phaseSkipped, "host-preflight"}, {phaseFailed, "credential-mode"}, {phaseWaiting, "credential-check"}} {
+		if !hasLineWith(lines, want...) {
+			t.Fatalf("details lost phase state %v", want)
+		}
 	}
 }
 
 func TestPhaseStatusShowsUndeclaredPhases(t *testing.T) {
-	// Wiring that never declares the list still shows real progress.
 	u, _, _ := newTestUI("")
 	u.PhaseStart("stack-up")
-	if !hasLineWith(u.wiz.snapshot(), phaseRunning, "stack-up") {
-		t.Fatal("an undeclared phase did not appear in the status list")
+	if !hasLineWith(u.wiz.snapshot(), "Start the services") || !hasLineWith(u.wiz.snapshot(), "WORKING") {
+		t.Fatal("undeclared current task is not visible")
 	}
 }
 
@@ -310,6 +290,8 @@ func TestFrameIsPlainTextAndDistinguishesEveryState(t *testing.T) {
 	u.Say("Deployment 01 initialised on rocky10.")
 	u.PhaseFailed("credential-mode", errors.New("no credential mode selected"))
 
+	u.wiz.details = true
+	u.wiz.rows = 80
 	lines := u.wiz.snapshot()
 	for _, l := range lines {
 		if strings.ContainsRune(l, 0x1b) {
@@ -364,25 +346,19 @@ func TestColourIsSupplementary(t *testing.T) {
 }
 
 func TestPhaseListWindowsToTheScreen(t *testing.T) {
-	out := &bytes.Buffer{}
-	in := bufio.NewReader(strings.NewReader(""))
-	u := &UI{In: in, Out: out, Interactive: true}
-	u.wiz = newWizard(in, out, 24, 80, false) // a default-sized terminal
+	u, _, _ := newTestUI("")
+	u.wiz.rows = 24
 	u.PhaseList(twentyPhases)
-	u.PhaseStart("stack-up") // twelfth phase
-
+	u.PhaseStart("stack-up")
 	lines := u.wiz.snapshot()
-	if len(lines) > 24 {
-		t.Fatalf("frame is %d lines on a 24-row terminal", len(lines))
+	if len(lines) > 24 || !hasLineWith(lines, "Start the services") {
+		t.Fatal("current task does not fit")
 	}
-	if !hasLineWith(lines, phaseRunning, "stack-up") {
-		t.Error("the running phase scrolled out of the window")
-	}
-	if !hasLineWith(lines, "earlier phase(s) not shown") {
-		t.Error("elided phases are not counted")
-	}
-	if !hasLineWith(lines, "later phase(s) not shown") {
-		t.Error("elided later phases are not counted")
+	u.wiz.details = true
+	u.wiz.scroll = 15
+	lines = u.wiz.snapshot()
+	if len(lines) > 24 || !hasLineWith(lines, "PgUp/PgDn") {
+		t.Fatal("history is not bounded and scrollable")
 	}
 }
 
@@ -455,7 +431,7 @@ func TestWrapLine(t *testing.T) {
 		// early, because each of those letters is two bytes.
 		{"keeps multi-byte runes whole", "ä ö ü ñ é è", 8, []string{"ä ö ü ñ", "é è"}},
 		// Absurd widths are clamped rather than looping one rune at a time.
-		{"a tiny width is clamped", "alpha beta gamma", 2, []string{"alpha", "beta", "gamma"}},
+		{"a tiny width is respected", "alpha beta gamma", 2, []string{"al", "ph", "a", "be", "ta", "ga", "mm", "a"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := wrapLine(tc.in, tc.width)
@@ -530,7 +506,74 @@ func TestHiddenLineIsNeverEchoed(t *testing.T) {
 	}
 }
 
-func TestRestoreTerminalRunsOnceAndReplaysTheSession(t *testing.T) {
+func TestLongAccessTokenStaysHiddenAndDoesNotExpandThePrompt(t *testing.T) {
+	token := strings.Repeat("fixture-token-", 500)
+	u, out, _ := newTestUI(token + "\r")
+	got, err := u.HiddenLine("Graph access token")
+	if err != nil || got != token {
+		t.Fatal("long token was not read intact")
+	}
+	u.RestoreTerminal()
+	if strings.Contains(out.String(), "fixture-token-") {
+		t.Fatal("token reached the screen or transcript")
+	}
+	if strings.Contains(out.String(), strings.Repeat("*", 33)) {
+		t.Fatal("masked token expanded beyond one line")
+	}
+}
+
+func TestMultilineConsentInstructionsRenderAsSeparateTerminalRows(t *testing.T) {
+	u, out, _ := newTestUI("c")
+	prompt := "Open your profile menu.\nGrant these permissions:\nApplication.ReadWrite.All\nGroup.ReadWrite.All\nAppRoleAssignment.ReadWrite.All\nOrganization.Read.All"
+	_, err := u.Choose(prompt, []Choice{{Key: 'c', Label: "Continue"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// In raw terminal mode LF moves down without returning to column one.
+	// Every output newline must therefore include CR, including prompt text.
+	if strings.Contains(strings.ReplaceAll(out.String(), "\r\n", ""), "\n") {
+		t.Fatal("multiline prompt emitted a bare LF, causing staircase indentation in a raw terminal")
+	}
+	w := newWizard(bufio.NewReader(strings.NewReader("")), io.Discard, 40, 80, false)
+	for _, row := range w.frame([]string{prompt}) {
+		if strings.ContainsAny(row, "\r\n") {
+			t.Fatal("frame row contains an uncounted line break")
+		}
+	}
+}
+
+func TestLongConsentPromptKeepsInstructionsAndActionsOnSmallScreen(t *testing.T) {
+	u, _, _ := newTestUI("")
+	u.wiz.rows = 24
+	u.PhaseList(twentyPhases)
+	u.PhaseStart("stack-up")
+	u.Say("The Microsoft tenant is selected.\nSign-in is required.\nCompleted work is retained.")
+	lines := u.wiz.frame([]string{
+		"Scroll to the top of Graph Explorer.\nOpen your profile avatar at the top right.\nChoose Consent to permissions.\nFind each permission and choose Consent:\nApplication.ReadWrite.All\nGroup.ReadWrite.All\nAppRoleAssignment.ReadWrite.All\nOrganization.Read.All",
+		"", "> [c] Continue", "  [q] Quit and keep deployment progress", "",
+		"Up/Down or j/k to move, Enter to choose, or press the letter in brackets.",
+	})
+	if len(lines) > 24 {
+		t.Fatalf("consent instructions overflow the terminal: %d rows", len(lines))
+	}
+	// Instructions may span pages; action keys remain on every page.
+	collected := strings.Join(lines, " ")
+	for _, scroll := range []int{5, 10, 20} {
+		u.wiz.scroll = scroll
+		next := u.wiz.frame([]string{"Scroll to the top of Graph Explorer.\nOpen your profile avatar at the top right.\nChoose Consent to permissions.\nFind each permission and choose Consent:\nApplication.ReadWrite.All\nGroup.ReadWrite.All\nAppRoleAssignment.ReadWrite.All\nOrganization.Read.All", "", "> [c] Continue", "  [q] Quit and keep deployment progress"})
+		if !hasLineWith(next, "[c] Continue") || !hasLineWith(next, "[q] Quit") || len(next) > 24 {
+			t.Fatal("paging hid an action or overflowed")
+		}
+		collected += strings.Join(next, " ")
+	}
+	for _, want := range []string{"Application.ReadWrite.All", "Group.ReadWrite.All", "AppRoleAssignment.ReadWrite.All", "Organization.Read.All"} {
+		if !strings.Contains(collected, want) {
+			t.Fatalf("instruction is inaccessible: %s", want)
+		}
+	}
+}
+
+func TestRestoreTerminalRunsOnceWithoutReplayingTheSession(t *testing.T) {
 	u, out, restores := newTestUI("")
 	u.Say("Deployment 01 initialised on rocky10.")
 	u.Say("Phase stack-up: complete.")
@@ -546,8 +589,8 @@ func TestRestoreTerminalRunsOnceAndReplaysTheSession(t *testing.T) {
 	if n := strings.Count(out.String(), leaveAltScreen); n != 1 {
 		t.Fatalf("left the full-screen view %d times, want 1", n)
 	}
-	if !strings.Contains(out.String(), "Deployment 01 initialised on rocky10.") {
-		t.Error("the session output was lost when the full-screen view closed")
+	if strings.Contains(out.String(), "Deployment 01 initialised on rocky10.") {
+		t.Error("closing the wizard replayed the verbose transcript")
 	}
 	// Output after restoration is line-oriented again.
 	out.Reset()
@@ -803,5 +846,90 @@ func TestPromptsReportAClosedInput(t *testing.T) {
 	u2, _, _ := newTestUI("")
 	if _, err := u2.Line("Public hostname", ""); !errors.Is(err, io.EOF) {
 		t.Errorf("Line on closed input returned %v", err)
+	}
+}
+
+func TestBracketedPasteCannotSubmitAChoiceOrLeakHiddenInput(t *testing.T) {
+	u, _, _ := newTestUI("\x1b[200~q\n\x1b[201~r")
+	choice, err := u.Choose("Choose", resumeChoices)
+	if err != nil || choice != 'r' {
+		t.Fatalf("pasted text submitted a choice: %c %v", choice, err)
+	}
+	u, out, _ := newTestUI("\x1b[200~fixture\nsecret\x1b[201~\r")
+	got, err := u.HiddenLine("Secret")
+	if err != nil || got != "fixturesecret" {
+		t.Fatalf("paste was not read as one value: %v", err)
+	}
+	if strings.Contains(out.String(), "fixture") {
+		t.Fatal("pasted secret was drawn")
+	}
+}
+func TestDetailsDoesNotSubmitOrLoseAField(t *testing.T) {
+	u, _, _ := newTestUI("value\t\r\t\r")
+	got, err := u.Line("Hostname", "")
+	if err != nil || got != "value" {
+		t.Fatalf("details lost the input: %s %v", got, err)
+	}
+}
+func TestSmallTerminalCannotAcceptBlindConfirmation(t *testing.T) {
+	u, _, _ := newTestUI("y\x03")
+	u.wiz.rows = 10
+	u.wiz.cols = 40
+	_, err := u.Confirm("Delete data?")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("accepted an invisible confirmation: %v", err)
+	}
+}
+
+func TestMinimumScreenKeepsFieldAndValidationVisible(t *testing.T) {
+	u, out, _ := newTestUI("\rnew-value\r")
+	u.wiz.rows = 16
+	u.wiz.cols = 48
+	value, err := u.Line("Identity-provider group for administrators", "")
+	if err != nil || value != "new-value" {
+		t.Fatal("field could not be completed")
+	}
+	frames := strings.Split(out.String(), homeAndClear)
+	saw := false
+	for _, f := range frames {
+		if strings.Contains(f, "A value is required.") {
+			saw = true
+			if !strings.Contains(f, "> ") {
+				t.Fatal("validation hid the input")
+			}
+			if !strings.Contains(f, "Identity-provider group for administrators") {
+				t.Fatal("validation hid the question")
+			}
+		}
+	}
+	if !saw {
+		t.Fatal("validation message was hidden")
+	}
+	u, out, _ = newTestUI("\r")
+	u.wiz.rows = 16
+	u.wiz.cols = 48
+	u.Line("Identity-provider group for administrators", "Guacamole Administrators")
+	if !strings.Contains(out.String(), "> _") {
+		t.Fatal("default value pushed input off screen")
+	}
+	if !strings.Contains(out.String(), "Default: Guacamole Administrators") {
+		t.Fatal("default value was hidden")
+	}
+}
+func TestEscapeTimesOutButFragmentedArrowSurvives(t *testing.T) {
+	w := newWizard(bufio.NewReader(strings.NewReader("")), io.Discard, 24, 80, false)
+	w.runes = make(chan runeEvent, 3)
+	w.inputDone = make(chan struct{})
+	w.runes <- runeEvent{r: 27}
+	start := time.Now()
+	key, err := w.readRawKey()
+	if err != nil || key != keyCancel || time.Since(start) > time.Second {
+		t.Fatal("Escape blocked")
+	}
+	w.runes <- runeEvent{r: 27}
+	go func() { time.Sleep(20 * time.Millisecond); w.runes <- runeEvent{r: '['}; w.runes <- runeEvent{r: 'A'} }()
+	key, err = w.readRawKey()
+	if err != nil || key != keyUp {
+		t.Fatalf("fragmented arrow was treated as Escape: %d %v", key, err)
 	}
 }

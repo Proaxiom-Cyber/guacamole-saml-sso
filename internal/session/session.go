@@ -21,6 +21,7 @@ import (
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/cloudflare"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/creds"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/entra"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/entracert"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/host"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recording"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recoverykey"
@@ -54,14 +55,14 @@ type Phase struct {
 }
 
 // Phases builds the ordered registry for one session. Later tickets append
-// their phases (stack, integrations) here. Credential-storage choices come
-// before host mutations, matching the installation flow.
+// their phases (stack, integrations) here. Host checks can offer kernel repair
+// before credentials are requested. Other dependencies follow credential choices.
 func Phases(opts *Options) []Phase {
 	return []Phase{
 		{Name: "initialise-deployment", Run: initialiseDeployment},
 		{Name: "host-preflight", Run: opts.hostPreflight},
 		{Name: "credential-mode", Run: opts.credentialMode},
-		{Name: "credential-check", Run: opts.credentialCheck},
+		{Name: "credential-check", Run: opts.credentialCheck, Always: true},
 		{Name: "host-dependencies", Run: opts.hostDependencies},
 		{Name: "stack-configure", Run: opts.stackConfigure},
 		{Name: "cloudflare-select", Run: opts.cloudflareSelect},
@@ -252,7 +253,7 @@ func (o *Options) stackRender(ctx context.Context, st *state.State, u *ui.UI) er
 		Provider: "host", Type: "data-directory", Name: filepath.Join(cfg.InstallDir, "data"),
 		Ownership: "created by this deployment; preserved by default at teardown", CreatedAt: now,
 	})
-	u.Say("Stack configuration rendered under %s (a temporary self-signed certificate serves until the origin certificate is issued).", cfg.InstallDir)
+	u.Say("Service configuration ready in %s. Certificate validity is checked in the origin-certificate step.", cfg.InstallDir)
 	return nil
 }
 
@@ -293,7 +294,8 @@ func (o *Options) stackUp(ctx context.Context, st *state.State, u *ui.UI) error 
 		return err
 	}
 	cfg := o.stackConfig(st)
-	u.Say("Starting the Guacamole stack (guacd, PostgreSQL, Guacamole, nginx) and waiting for container health.")
+	cfg.InitializeDatabase = true
+	u.Say("Checking the database schema before starting the Guacamole stack (guacd, PostgreSQL, Guacamole, nginx) and waiting for container health.")
 	if err := stack.Up(ctx, o.stackRun(), cfg, password, token); err != nil {
 		return err
 	}
@@ -345,10 +347,10 @@ func (o *Options) credentialMode(ctx context.Context, st *state.State, u *ui.UI)
 				u.Say("  %s — not available on this host: %s", s.Mode, s.Reason)
 				continue
 			}
-			u.Say("  %s — %s", s.Mode, creds.Explain(s.Mode))
+			u.Explain("Available: "+modeLabels[s.Mode], creds.Explain(s.Mode))
 			choices = append(choices, ui.Choice{Key: modeKeys[s.Mode], Label: modeLabels[s.Mode]})
 		}
-		k, err := u.Choose("Credential mode?", choices)
+		k, err := u.Choose("Protect service credentials\n\nThese credentials keep Guacamole and its services running after a reboot.\nTPM protection is preferred when this host supports it.\nOpen Details for the available storage methods and recovery implications.", choices)
 		if err != nil {
 			return err
 		}
@@ -387,7 +389,7 @@ func (o *Options) credentialMode(ctx context.Context, st *state.State, u *ui.UI)
 	}
 	st.Config["credential-mode"] = mode
 	u.Say("Credential storage method: %s.", mode)
-	u.Say("%s", creds.Detail(mode))
+	u.Explain("Credential protection selected. Open Details for reboot and recovery implications.", creds.Detail(mode))
 	return nil
 }
 
@@ -407,12 +409,16 @@ var modeLabels = map[string]string{
 }
 
 func (o *Options) manager(st *state.State, u *ui.UI) *creds.Manager {
-	return &creds.Manager{
+	if o.credentialManager != nil {
+		return o.credentialManager
+	}
+	o.credentialManager = &creds.Manager{
 		Mode:       st.Config["credential-mode"],
 		Dir:        filepath.Join(o.StateDir, "credentials"),
-		ReadSecret: u.SecretReader(),
-		Run:        o.credsRun(),
+		ReadSecret: u.SecretReader(), Protect: u.Protect,
+		Run: o.credsRun(),
 	}
+	return o.credentialManager
 }
 
 func (o *Options) credsRun() creds.Runner {
@@ -431,6 +437,16 @@ func (o *Options) credSpecs() []creds.Spec {
 
 func (o *Options) credentialCheck(ctx context.Context, st *state.State, u *ui.UI) error {
 	m := o.manager(st, u)
+	// Validate Cloudflare before storing a new value, generating the database
+	// password, or installing Docker. Recheck on resume, including sessions
+	// from older versions that already marked credential-check complete.
+	for _, s := range o.credSpecs() {
+		if s.Name == "cloudflare-api-token" {
+			if err := o.checkCloudflareCredential(ctx, st, u, m, s); err != nil {
+				return err
+			}
+		}
+	}
 	if creds.Persistent(m.Mode) {
 		for _, s := range o.credSpecs() {
 			// The stored filename differs by mode: plaintext modes store the
@@ -507,15 +523,48 @@ func (o *Options) probes() *host.Probes {
 }
 
 func (o *Options) hostPreflight(ctx context.Context, st *state.State, u *ui.UI) error {
-	f, err := o.probes().Gather(ctx)
+	probes := *o.probes()
+	probes.Progress = u.TaskProgress
+	f, err := probes.Gather(ctx)
 	if err != nil {
-		return err
-	}
-	if err := host.Preflight(f); err != nil {
 		return err
 	}
 	if st.Config == nil {
 		st.Config = map[string]string{}
+	}
+	check := host.Preflight(f)
+	if errors.Is(check, host.ErrKernelModulesMissing) {
+		u.Say("Docker needs kernel modules missing from this cloud image.")
+		u.Say("Plan: install kernel, kernel-modules and kernel-modules-extra. Setup will stop if a reboot is required.")
+		u.Say("Kernel packages belong to the host and remain installed during teardown.")
+		if u.Interactive {
+			ok, err := u.Confirm("Install the required kernel packages now?")
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return errors.New("kernel package installation declined; setup cannot continue without the required modules")
+			}
+		} else if !o.InstallDependencies {
+			return fmt.Errorf("%w: missing kernel packages need approval; pass --install-dependencies to consent", ErrApprovalRequired)
+		}
+		if err := o.probes().InstallKernelSupport(ctx); err != nil {
+			return err
+		}
+		// Record host maintenance without claiming ownership of the kernel.
+		// Removing a running or shared kernel is not deployment teardown.
+		st.Config["host-kernel-packages"] = "kernel kernel-modules kernel-modules-extra"
+		f, err = probes.Gather(ctx)
+		if err != nil {
+			return err
+		}
+		check = host.Preflight(f)
+		if errors.Is(check, host.ErrKernelModulesMissing) {
+			return errors.New("kernel packages installed, but xt_addrtype is unavailable for both the running kernel and the next boot kernel; check the package and boot configuration before resuming")
+		}
+	}
+	if check != nil {
+		return check
 	}
 	st.Config["os"] = f.OSID + " " + f.VersionID
 	u.Say("Host checks passed: %s, root privileges, no existing installation, required endpoints reachable.", st.Config["os"])
@@ -604,33 +653,40 @@ type Options struct {
 	// Azure asks for an Azure Blob destination during a guided run. The
 	// remaining fields answer the questions ahead of time; any one of them
 	// also turns the phase on.
-	Azure              bool
-	AzureSubscription  string
-	AzureAccount       string
-	AzureContainer     string
-	AzureCreate        bool
-	AzureLocation      string
-	AzureResourceGroup string
-	Hostname           string // explicit configuration; guided asks when empty
-	AdminGroup         string
-	OperatorGroup      string
-	InstallDir         string // default /opt/guacamole
-	CredSpecs          []creds.Spec
-	Host               *host.Probes
-	StackRun           stack.Runner    // injectable for tests
-	StackRunOut        stack.OutRunner // injectable for tests
-	Entra              *entra.Client   // injectable for tests; nil builds one from the environment token
-	Cloudflare         *cloudflare.Client
-	Zone               string // explicit Cloudflare zone name
-	ACMEContact        string // optional operator address for the ACME account
-	BackupDest         string // scheduled backup destination; default <state-dir>/backups
-	BackupSchedule     string // systemd OnCalendar expression; "" means daily
-	BackupKeep         int    // successful backups to retain; 0 means 7
-	BackupPlaintext    bool   // explicit choice; encryption is the default
-	BackupRequireMount bool   // destination must sit on an approved mounted share
-	NoBackupSchedule   bool   // do not install the timer
-	RecordingBudget    string // local recording storage budget, e.g. "20GiB"; "" declines cleanup
-	AccessEmails       string // comma-separated Access allow-list fallback
+	Azure                 bool
+	AzureSubscription     string
+	AzureAccount          string
+	AzureContainer        string
+	AzureCreate           bool
+	AzureLocation         string
+	AzureResourceGroup    string
+	Hostname              string // explicit configuration; guided asks when empty
+	AdminGroup            string
+	OperatorGroup         string
+	InstallDir            string // default /opt/guacamole
+	CredSpecs             []creds.Spec
+	Host                  *host.Probes
+	StackRun              stack.Runner    // injectable for tests
+	StackRunOut           stack.OutRunner // injectable for tests
+	Entra                 *entra.Client   // injectable; nil selects environment input or guided device-code sign-in
+	EntraTenant           string
+	EntraClientID         string
+	reuseEntraIdentity    bool
+	EntraDeviceToken      func(entra.DeviceCodeOptions) (entra.TokenSource, error)                          // test seam
+	EntraApplicationToken func(entra.ApplicationOptions) (entra.TokenSource, error)                         // test seam
+	EntraCertificate      func(context.Context, string, string, entracert.Open) (entracert.Material, error) // test seam
+	entraState            *state.State
+	Cloudflare            *cloudflare.Client
+	Zone                  string // explicit Cloudflare zone name
+	ACMEContact           string // optional operator address for the ACME account
+	BackupDest            string // scheduled backup destination; default <state-dir>/backups
+	BackupSchedule        string // systemd OnCalendar expression; "" means daily
+	BackupKeep            int    // successful backups to retain; 0 means 7
+	BackupPlaintext       bool   // explicit choice; encryption is the default
+	BackupRequireMount    bool   // destination must sit on an approved mounted share
+	NoBackupSchedule      bool   // do not install the timer
+	RecordingBudget       string // local recording storage budget, e.g. "20GiB"; "" declines cleanup
+	AccessEmails          string // comma-separated Access allow-list fallback
 
 	// journalIntent persists what the running phase is about to do, before
 	// it does it. runPhases sets it; phases call it before any cloud
@@ -642,8 +698,9 @@ type Options struct {
 	EnsureRecordingDirs func(installDir string) error
 	// AccessVerify is injectable for tests: the real one re-reads the
 	// Access application, its policy and its identity provider.
-	AccessVerify func(ctx context.Context, st *state.State) error
-	Phases       []Phase
+	AccessVerify      func(ctx context.Context, st *state.State) error
+	Phases            []Phase
+	credentialManager *creds.Manager // process-local cache; never part of state
 }
 
 func (o *Options) phases() []Phase {
@@ -721,17 +778,17 @@ func Run(ctx context.Context, opts Options) error {
 		// forbids, because every completed phase is left alone.
 		u.Say("A completed deployment already exists on this host (deployment %s, created %s).",
 			st.DeploymentID, st.CreatedAt.Format(time.RFC3339))
-		u.Say("This tool manages one deployment per host and does not overwrite it.")
-		u.Say("Run teardown first to start over. Existing installations from the old scripts are not adopted.")
 		// Not overwriting is not the same as doing nothing. A newer version
 		// can carry work this deployment never ran, and the phases that
 		// write desired state -- units, timers, rendered configuration --
 		// must be able to repair a host that is already set up. Completed
 		// one-shot phases are still left exactly as they are.
 		if len(convergeable(st, opts.phases())) > 0 {
-			u.Say("Re-applying the configuration this tool maintains. Completed work is left as it is.")
+			u.Say("Checking credentials and refreshing managed service files. Completed resource-creation steps are skipped.")
 			return runPhases(ctx, store, st, u, &opts, opts.phases())
 		}
+		u.Say("No setup work remains. This tool manages one deployment per host and does not overwrite it.")
+		u.Say("To start a new deployment, run teardown first.")
 		if !u.Interactive {
 			return errors.New("existing deployment present; teardown is required before a new setup")
 		}
@@ -833,7 +890,7 @@ func runPhases(ctx context.Context, store *state.Store, st *state.State, u *ui.U
 		last.FinishedAt = &now
 		if err != nil {
 			last.Result = state.ResultFailed
-			if errors.Is(err, ErrUncertain) {
+			if errors.Is(err, ErrUncertain) || errors.Is(err, entra.ErrUncertain) {
 				// The request was sent and the answer lost: the resource
 				// may exist. Record that so the next run queries by
 				// ownership marker before retrying any creation.
@@ -853,6 +910,11 @@ func runPhases(ctx context.Context, store *state.Store, st *state.State, u *ui.U
 		u.PhaseDone(p.Name)
 	}
 	u.Say("Session complete. Deployment %s.", st.DeploymentID)
+	summary := []string{"Setup complete.", "Deployment: " + st.DeploymentID}
+	if host := st.Config["guac-hostname"]; host != "" {
+		summary = append(summary, "Open https://"+host+"/")
+	}
+	u.Summary(summary...)
 	return nil
 }
 
@@ -895,8 +957,18 @@ func Status(dir string, u *ui.UI) error {
 // duplicate. A pre-existing application is never changed without
 // interactive approval.
 func (o *Options) entraSignin(ctx context.Context, st *state.State, u *ui.UI) error {
+	o.UI = u
+	o.entraState = st
+	if (o.Entra == nil || o.Entra.Token == nil) && os.Getenv(entra.DefaultTokenEnv) == "" && u.Interactive {
+		if err := o.selectEntraTenant(st, u); err != nil {
+			return err
+		}
+	}
 	c, err := o.entraClient()
 	if err != nil {
+		return err
+	}
+	if _, err := c.Token(ctx); err != nil {
 		return err
 	}
 
@@ -924,6 +996,15 @@ func (o *Options) entraSignin(ctx context.Context, st *state.State, u *ui.UI) er
 	if !pf.ClaimsChecked {
 		u.Say("Entra token permissions could not be checked in advance (opaque token); the first change is the proof.")
 	}
+	tenant, err := c.Tenant(ctx)
+	if err != nil {
+		return fmt.Errorf("checking the Microsoft tenant failed: %w", err)
+	}
+	if prior := st.Config["entra-tenant-id"]; prior != "" && !strings.EqualFold(prior, tenant) {
+		return errors.New("the Microsoft sign-in belongs to a different tenant than this deployment; sign in to the original tenant and resume")
+	}
+	st.Config["entra-tenant-id"] = tenant
+	u.Say("Microsoft Graph access checked for tenant %s.", tenant)
 
 	plan, err := c.Plan(ctx, cfg)
 	if err != nil {
@@ -1066,14 +1147,32 @@ func (o *Options) entraSignin(ctx context.Context, st *state.State, u *ui.UI) er
 
 // entraClient builds the Graph client, or explains what is missing.
 func (o *Options) entraClient() (*entra.Client, error) {
-	if o.Entra != nil {
+	if o.Entra != nil && o.Entra.Token != nil {
 		return o.Entra, nil
 	}
 	if os.Getenv(entra.DefaultTokenEnv) == "" {
+		if o.entraState != nil && (o.UI == nil || !o.UI.Interactive) {
+			method := o.entraState.Config["entra-auth-method"]
+			if method == "certificate" || method == "secret" {
+				c := &entra.Client{Token: o.manualEntraToken(method)}
+				if o.Entra != nil {
+					c.Do = o.Entra.Do
+				}
+				o.Entra = c
+				return c, nil
+			}
+		}
+		if o.UI != nil && o.UI.Interactive {
+			return o.guidedEntraClient()
+		}
 		return nil, fmt.Errorf("Entra sign-in needs a Microsoft Graph token: set %s and resume. Required permissions: %s",
 			entra.DefaultTokenEnv, strings.Join(entra.RequiredPermissions, ", "))
 	}
-	return &entra.Client{Token: entra.StaticTokenFromEnv(entra.DefaultTokenEnv)}, nil
+	c := &entra.Client{Token: entra.StaticTokenFromEnv(entra.DefaultTokenEnv)}
+	if o.Entra != nil {
+		c.Do = o.Entra.Do
+	}
+	return c, nil
 }
 
 // lastAttemptUncertain reports whether the most recent attempt at an intent
@@ -1096,11 +1195,8 @@ func lastAttemptUncertain(st *state.State, intent string) bool {
 // in runPhases is the pre-create record the specification requires.
 
 func (o *Options) cloudflareClient(st *state.State, u *ui.UI) *cloudflare.Client {
-	if o.Cloudflare != nil {
-		return o.Cloudflare
-	}
 	m := o.manager(st, u)
-	return &cloudflare.Client{
+	client := &cloudflare.Client{
 		AuthorityNameServers: splitList(st.Config["cloudflare-zone-nameservers"]),
 		Token: func(context.Context) (string, error) {
 			for _, s := range o.credSpecs() {
@@ -1111,6 +1207,11 @@ func (o *Options) cloudflareClient(st *state.State, u *ui.UI) *cloudflare.Client
 			return "", errors.New("no cloudflare-api-token credential is configured")
 		},
 	}
+	if o.Cloudflare != nil {
+		client.Base = o.Cloudflare.Base
+		client.HTTP = o.Cloudflare.HTTP
+	}
+	return client
 }
 
 func (o *Options) provisioner(st *state.State, u *ui.UI) *cloudflare.Provisioner {
@@ -1123,32 +1224,31 @@ func (o *Options) provisioner(st *state.State, u *ui.UI) *cloudflare.Provisioner
 	}
 }
 
-// apexOf returns the registrable domain guess for a hostname. The operator
-// can override it, because no suffix list is shipped.
-func apexOf(hostname string) string {
-	parts := strings.Split(hostname, ".")
-	if len(parts) < 2 {
-		return hostname
-	}
-	return strings.Join(parts[len(parts)-2:], ".")
-}
-
 func (o *Options) cloudflareSelect(ctx context.Context, st *state.State, u *ui.UI) error {
 	cf := o.cloudflareClient(st, u)
-	if err := cf.VerifyToken(ctx); err != nil {
-		return fmt.Errorf("the Cloudflare API token was rejected: %w", err)
-	}
 	apex := o.Zone
+	var zones []cloudflare.Zone
+	var err error
 	if apex == "" {
-		apex = apexOf(st.Config["guac-hostname"])
+		// Query exact parent names, most specific first. Counting two labels
+		// mistakes com.au for a customer's zone and misses delegated zones.
+		apex = strings.TrimSuffix(strings.ToLower(st.Config["guac-hostname"]), ".")
+		for strings.Contains(apex, ".") {
+			zones, err = cf.ZonesByName(ctx, apex)
+			if err != nil || len(zones) > 0 {
+				break
+			}
+			apex = strings.SplitN(apex, ".", 2)[1]
+		}
+	} else {
+		zones, err = cf.ZonesByName(ctx, apex)
 	}
-	zones, err := cf.ZonesByName(ctx, apex)
 	if err != nil {
 		return err
 	}
 	switch {
 	case len(zones) == 0:
-		return fmt.Errorf("no Cloudflare zone named %q is visible to this token; pass --zone with the exact zone name", apex)
+		return fmt.Errorf("no Cloudflare zone for hostname %q is visible to this token; check Zone Read access or pass --zone with the exact zone name", st.Config["guac-hostname"])
 	case len(zones) > 1:
 		return fmt.Errorf("%w: %d Cloudflare zones are named %q; pass --zone to choose one", ErrApprovalRequired, len(zones), apex)
 	}
@@ -1321,6 +1421,7 @@ func (o *Options) cloudflareAccess(ctx context.Context, st *state.State, u *ui.U
 	// Verification compares the policy actually stored at Cloudflare with
 	// the allow-list that was applied, so a policy that drifted or admits
 	// everyone is caught rather than assumed correct.
+	u.Say("Checking Cloudflare Access. Edge propagation can take up to two minutes; the connector stays stopped until protection is verified.")
 	v, err := p.VerifyAccess(ctx, app.ID, cloudflare.AccessExpectation{
 		Allow:         allow,
 		EntraTenantID: st.Config["entra-tenant-id"],
@@ -1699,7 +1800,7 @@ func (o *Options) azureDestination(ctx context.Context, st *state.State, u *ui.U
 		// exists once the identity phase has run. Without it the package says
 		// plainly that scheduled uploads will fail until a role is granted.
 		UploaderObjectID: st.Config["entra-sp-object-id"],
-		Say:              u.Say,
+		Say:              u.Transient,
 		Ask:              u.Line,
 		Confirm:          u.Confirm,
 		Choose:           chooseFromList(u),

@@ -80,6 +80,14 @@ Flags for setup:
   --azure-resource-group N Resource group to create storage in
   --state-dir DIR          Override the state directory (default ` + "/var/lib/guacdeploy" + `)
 
+Preview (no deployment changes):
+  guacdeploy preview
+
+Terminal options (environment):
+  NO_COLOR=1                    Disable colour
+  GUACDEPLOY_REDUCED_MOTION=1    Disable activity animation
+  GUACDEPLOY_ASCII=1             Use ASCII progress and status markers
+
 Flags for backup:
   --dest DIR               Destination directory (default <state-dir>/backups)
   --plaintext              Explicitly write an unencrypted backup
@@ -175,6 +183,23 @@ func run(args []string) int {
 
 	u := ui.New(!*nonInteractive)
 	defer u.RestoreTerminal()
+	if cmd == "setup" {
+		// Validate on every invocation, before creating the log or running
+		// phases that may already be complete in a resumed deployment.
+		normalised, err := certs.NormaliseContact(*acmeContact)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "guacdeploy: %s\n", u.ErrorText(err))
+			return 2
+		}
+		*acmeContact = normalised
+	}
+	if cmd == "setup" || cmd == "teardown" || cmd == "recover" {
+		if err := u.StartLog(*stateDir, cmd); err != nil {
+			fmt.Fprintf(os.Stderr, "guacdeploy: %s\n", u.ErrorText(err))
+			return 1
+		}
+		defer func() { u.RestoreTerminal(); u.FinishLog(nil) }()
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -184,25 +209,19 @@ func run(args []string) int {
 		<-sig // fires only on a real signal; leaks harmlessly on normal exit
 		cancel()
 		u.RestoreTerminal()
+		u.FinishLog(context.Canceled)
 		fmt.Fprintln(os.Stderr, "\nCancelled. Completed work is saved; run guacdeploy again to resume or clean up.")
 		os.Exit(130)
 	}()
 
 	var err error
 	switch cmd {
+	case "preview":
+		u.StartWizard()
+		err = u.Preview(ctx)
 	case "setup":
-		// Checked here rather than in a phase, because a phase that already
-		// succeeded is skipped on resume and would never re-check it. A
-		// malformed address is a usage error and costs nothing to catch.
-		normalised, cerr := certs.NormaliseContact(*acmeContact)
-		if cerr != nil {
-			fmt.Fprintf(os.Stderr, "guacdeploy: %v\n", cerr)
-			return 2
-		}
-		*acmeContact = normalised
 		// Full screen where the terminal supports it, plain lines otherwise.
-		// Only setup: every other command prints a report and exits, so a
-		// full screen that closed immediately would help nobody.
+		// Reports remain on the ordinary screen after they finish.
 		u.StartWizard()
 		opts := session.Options{
 			StateDir: *stateDir, UI: u, Resume: *resume,
@@ -297,6 +316,7 @@ func run(args []string) int {
 	// the first phase gave the operator exit 1 and a blank terminal.
 	// RestoreTerminal is idempotent.
 	u.RestoreTerminal()
+	u.FinishLog(err)
 
 	switch {
 	case err == nil:
@@ -304,12 +324,12 @@ func run(args []string) int {
 	case errors.Is(err, session.ErrApprovalRequired), errors.Is(err, ui.ErrInputRequired),
 		errors.Is(err, settings.ErrApprovalRequired),
 		errors.Is(err, teardown.ErrApprovalRequired), errors.Is(err, teardown.ErrReviewRequired):
-		fmt.Fprintf(os.Stderr, "guacdeploy: %v\n", err)
+		fmt.Fprintf(os.Stderr, "guacdeploy: %s\n", u.ErrorText(err))
 		return 3
 	case errors.Is(err, context.Canceled):
 		return 130
 	default:
-		fmt.Fprintf(os.Stderr, "guacdeploy: %v\n", err)
+		fmt.Fprintf(os.Stderr, "guacdeploy: %s\n", u.ErrorText(err))
 		return 1
 	}
 }

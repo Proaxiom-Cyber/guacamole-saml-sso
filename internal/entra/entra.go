@@ -285,6 +285,31 @@ func tokenTenantID(tok string) (string, bool) {
 	return claims.TID, true
 }
 
+// Tenant returns the directory ID before provisioning. The caller first
+// checks live Graph access, then uses this ID to bind resume to the same tenant.
+func (c *Client) Tenant(ctx context.Context) (string, error) {
+	token, err := c.Token(ctx)
+	if err != nil {
+		return "", err
+	}
+	if tid, ok := tokenTenantID(token); ok {
+		return tid, nil
+	}
+	out, err := c.call(ctx, http.MethodGet, "/organization?%24select=id", nil)
+	if err != nil {
+		return "", fmt.Errorf("the token has no readable tenant ID; /organization requires Organization.Read.All: %w", err)
+	}
+	var org struct {
+		Value []struct {
+			ID string `json:"id"`
+		} `json:"value"`
+	}
+	if json.Unmarshal(out, &org) != nil || len(org.Value) != 1 || org.Value[0].ID == "" {
+		return "", errors.New("could not read a unique tenant ID from /organization")
+	}
+	return org.Value[0].ID, nil
+}
+
 // tokenPermissions decodes the JWT payload and returns the union of `scp`
 // scopes and `roles`. Only permission names leave this function; the token
 // itself never enters any returned value.

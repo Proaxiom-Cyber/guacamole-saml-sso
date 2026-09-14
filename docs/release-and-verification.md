@@ -4,7 +4,16 @@ This document describes how guacdeploy releases are built, signed, and verified.
 The rule is simple: the launcher refuses to install any binary that fails checksum
 or signature verification.
 
+With terminal input and output, the launcher starts the setup wizard after installation.
+It uses `sudo` for a normal login. Use `--install-only` to return to the shell instead.
+Without a terminal, the launcher installs the binary and prints the next command.
+
 ## How a release is cut
+
+Tags with a prerelease suffix, such as `v1.0.0-rc.1`, publish a GitHub prerelease.
+They do not replace the latest stable release. To test one, download its launcher
+from `/releases/download/<tag>/get-guacdeploy.sh` and pass the same tag to the script.
+The verification checks are the same for stable releases and prereleases.
 
 Push a version tag, for example `v1.0.0`, to `Proaxiom-Cyber/guacamole-saml-sso`.
 The `release` workflow (`.github/workflows/release.yml`) then:

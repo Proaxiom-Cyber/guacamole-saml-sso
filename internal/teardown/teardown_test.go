@@ -739,3 +739,41 @@ func TestEveryRecordedResourceTypeHasARule(t *testing.T) {
 		}
 	}
 }
+
+func TestInstallerIdentityIsLastAndRetainedWhenEntraCleanupFails(t *testing.T) {
+	for _, fail := range []bool{true, false} {
+		t.Run(fmt.Sprint(fail), func(t *testing.T) {
+			st := &state.State{DeploymentID: "dep", Config: map[string]string{}, Resources: []state.Resource{
+				{ID: "app", Provider: "entra", Type: "application", ProviderID: "app", Ownership: "created"},
+				{ID: "group", Provider: "entra", Type: "group", ProviderID: "group", Ownership: "created"},
+				{ID: "installer", Provider: "entra", Type: "installer-application", ProviderID: "installer", Ownership: "created"},
+				{ID: "cred", Provider: "host", Type: "credential-dir", Name: t.TempDir(), Ownership: "created"},
+			}}
+			var calls []string
+			ops := Ops{DeleteEntraApp: func(context.Context, string) error { calls = append(calls, "app"); return nil },
+				DeleteEntraGroup: func(context.Context, string) error {
+					calls = append(calls, "group")
+					if fail {
+						return errors.New("offline")
+					}
+					return nil
+				},
+				DeleteInstallerIdentity: func(context.Context, string) error { calls = append(calls, "installer"); return nil },
+				RemoveCredentials: func(context.Context, string, []string) ([]string, error) {
+					calls = append(calls, "credentials")
+					return nil, nil
+				},
+			}
+			u, _ := testUI("")
+			_, err := Run(context.Background(), st, BuildPlan(st, nil, false), ops, u, Options{Consent: true})
+			got := strings.Join(calls, ",")
+			if fail {
+				if got != "app,group" || err == nil {
+					t.Fatalf("removed recovery credentials after a failure: %s %v", got, err)
+				}
+			} else if got != "app,group,installer,credentials" {
+				t.Fatalf("wrong cleanup order: %s", got)
+			}
+		})
+	}
+}

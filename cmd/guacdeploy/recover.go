@@ -14,6 +14,7 @@ import (
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/creds"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/entra"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recover"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/session"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/stack"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/teardown"
@@ -70,7 +71,7 @@ func recoverCmd(ctx context.Context, stateDir, file, keyExport string, yes bool,
 	}
 
 	st := l.Snapshot.State
-	cf, ec, err := recoverProviders(st, u)
+	cf, ec, err := recoverProviders(st, stateDir, u)
 	if err != nil {
 		return err
 	}
@@ -111,7 +112,7 @@ func recoverCmd(ctx context.Context, stateDir, file, keyExport string, yes bool,
 // again for this run only: from the environment for an unattended run, and
 // otherwise at a hidden prompt. Nothing is stored here — setup stores it, the
 // way the operator chooses.
-func recoverProviders(st *state.State, u *ui.UI) (*cloudflare.Provisioner, *entra.Client, error) {
+func recoverProviders(st *state.State, stateDir string, u *ui.UI) (*cloudflare.Provisioner, *entra.Client, error) {
 	spec := creds.Spec{Name: "cloudflare-api-token", Purpose: "asking Cloudflare what of this deployment is still there"}
 	token := os.Getenv(spec.EnvVar())
 	if token == "" {
@@ -123,7 +124,7 @@ func recoverProviders(st *state.State, u *ui.UI) (*cloudflare.Provisioner, *entr
 			return nil, nil, err
 		}
 	}
-	if os.Getenv(entra.DefaultTokenEnv) == "" {
+	if os.Getenv(entra.DefaultTokenEnv) == "" && !u.Interactive && st.Config["entra-auth-method"] == "" {
 		return nil, nil, fmt.Errorf("recovery needs a Microsoft Graph token to ask what still exists in the tenant: set %s and run again. Required permissions: %s",
 			entra.DefaultTokenEnv, strings.Join(entra.RequiredPermissions, ", "))
 	}
@@ -134,5 +135,5 @@ func recoverProviders(st *state.State, u *ui.UI) (*cloudflare.Provisioner, *entr
 		Hostname:     st.Config["guac-hostname"],
 		DeploymentID: st.DeploymentID,
 	}
-	return cf, &entra.Client{Token: entra.StaticTokenFromEnv(entra.DefaultTokenEnv)}, nil
+	return cf, session.EntraClientForOperation(st, stateDir, u), nil
 }

@@ -5,9 +5,26 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+func runtimeTestDir(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		return t.TempDir()
+	}
+	dir, err := os.MkdirTemp("/dev/shm", "guacdeploy-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	if err := checkMemoryBacked(dir); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
 
 const (
 	testPassword = "pa$sword-3f9c"
@@ -16,14 +33,16 @@ const (
 
 func testConfig(t *testing.T) Config {
 	t.Helper()
-	return Config{
+	cfg := Config{
 		InstallDir:        t.TempDir(),
-		RuntimeSecretsDir: filepath.Join(t.TempDir(), "run", "secrets"),
+		RuntimeSecretsDir: filepath.Join(runtimeTestDir(t), "run", "secrets"),
 		Hostname:          "guac.example.test",
 		AdminGroup:        "GA",
 		OperatorGroup:     "GO",
 		ComposeProfiles:   "cloudflare",
 	}
+	writeTestSchema(t, cfg)
+	return cfg
 }
 
 // TestComposeDeliversCredentialsAsFilesOnly is the regression guard the
@@ -78,7 +97,7 @@ func TestUpWritesOwnerOnlyRuntimeFilesAndRecreatesOnColdBoot(t *testing.T) {
 	var calls [][]string
 	run := func(_ context.Context, _ string, name string, args ...string) (string, error) {
 		calls = append(calls, append([]string{name}, args...))
-		return "ok", nil
+		return databaseReady, nil
 	}
 	if err := Up(context.Background(), run, cfg, testPassword, testToken); err != nil {
 		t.Fatal(err)
@@ -124,8 +143,8 @@ func TestUpWritesOwnerOnlyRuntimeFilesAndRecreatesOnColdBoot(t *testing.T) {
 	if err := Up(context.Background(), run, cfg, testPassword, testToken); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(strings.Join(calls[1], " "), "--force-recreate") {
-		t.Fatalf("a warm start recreated the containers: %v", calls[1])
+	if strings.Contains(strings.Join(calls[len(calls)-1], " "), "--force-recreate") {
+		t.Fatalf("a warm start recreated the containers: %v", calls[len(calls)-1])
 	}
 }
 
@@ -145,7 +164,7 @@ func TestUpRepairsDirectoriesDockerCreated(t *testing.T) {
 	if err := os.Chmod(cfg.RuntimeSecretsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	run := func(context.Context, string, string, ...string) (string, error) { return "ok", nil }
+	run := func(context.Context, string, string, ...string) (string, error) { return databaseReady, nil }
 	if err := Up(context.Background(), run, cfg, testPassword, testToken); err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +180,7 @@ func TestUpRepairsDirectoriesDockerCreated(t *testing.T) {
 
 func TestUpWritesNoTunnelTokenWithoutATunnel(t *testing.T) {
 	cfg := testConfig(t)
-	run := func(context.Context, string, string, ...string) (string, error) { return "ok", nil }
+	run := func(context.Context, string, string, ...string) (string, error) { return databaseReady, nil }
 	if err := Up(context.Background(), run, cfg, testPassword, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +192,7 @@ func TestUpWritesNoTunnelTokenWithoutATunnel(t *testing.T) {
 
 func TestRemoveRuntimeSecrets(t *testing.T) {
 	cfg := testConfig(t)
-	run := func(context.Context, string, string, ...string) (string, error) { return "ok", nil }
+	run := func(context.Context, string, string, ...string) (string, error) { return databaseReady, nil }
 	if err := Up(context.Background(), run, cfg, testPassword, testToken); err != nil {
 		t.Fatal(err)
 	}
@@ -190,6 +209,9 @@ func TestRemoveRuntimeSecrets(t *testing.T) {
 func dockerFake(inspect string) Runner {
 	return func(_ context.Context, _ string, _ string, args ...string) (string, error) {
 		joined := strings.Join(args, " ")
+		if strings.Contains(joined, "guacdeploy-database") {
+			return databaseReady, nil
+		}
 		switch {
 		case strings.Contains(joined, "ps --quiet"):
 			return "a1b2c3d4e5f6\nf6e5d4c3b2a1\n", nil

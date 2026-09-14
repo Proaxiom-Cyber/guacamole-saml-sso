@@ -11,6 +11,54 @@ install section of the README for the command, and
 [release-and-verification.md](release-and-verification.md) for what the
 launcher verifies and which network destinations it uses.
 
+## Guided terminal interface
+
+The full-screen wizard shows the current task, saved progress, and elapsed time.
+The progress bar counts completed steps. It does not estimate the time remaining.
+During work, large terminals animate the Proaxiom mark. It stops when setup asks a
+question. Network checks also show a task bar with the number of completed checks.
+The final check result reports failures separately.
+Wide terminals also show the surrounding deployment stages.
+
+- Use the arrow keys to move between actions. Press Enter to select an action.
+- Press the letter in brackets to select an action directly.
+- Press Tab to switch between the current task and session details.
+- Use Page Up and Page Down to read longer instructions or history.
+- Press Ctrl-C to cancel. Completed work remains available for resume.
+
+The terminal must have at least 48 columns and 16 rows. Below that size, resize it
+before answering. The installer ignores action keys until the interface is visible.
+A terminal without screen controls uses the plain prompt interface.
+
+Use `guacdeploy preview` to try the real interface with example data. This command
+creates no deployment resources and needs no customer credentials.
+
+Set `NO_COLOR=1` to disable colour. Set `GUACDEPLOY_REDUCED_MOTION=1` to disable the
+activity animation. Set `GUACDEPLOY_ASCII=1` for ASCII progress and status markers.
+The interface uses the terminal's foreground and background colours.
+
+### Session logs
+
+Setup, teardown, and recovery write a separate timestamped log for each invocation:
+
+```text
+/var/lib/guacdeploy/logs/<UTC timestamp>.log
+```
+
+An alternate `--state-dir` also changes the log directory. The directory uses mode
+0700; each log uses mode 0600. The terminal prints the path when the command ends.
+To follow a running session, use `sudo tail -f` with its log path.
+
+Logs contain application events and phase results. They do not record terminal
+input, device sign-in codes, private keys, or a raw subprocess transcript. The
+in-memory redactor removes known credentials and common token formats. Logs can
+contain hostnames, resource IDs, and tenant names; review them before sharing.
+
+Each log has a 16 MiB limit. If writing fails or reaches the limit, the exit report
+states that the log is incomplete. This does not discard saved deployment progress.
+Logs remain after teardown for diagnosis. Delete old logs when you no longer need
+them; this version does not delete logs automatically.
+
 ## Commands
 
 | Command | Purpose |
@@ -55,6 +103,14 @@ TCP 443 to `mirrors.rockylinux.org`, `download.docker.com`, and
 command runs Podman, and hosts with an existing installation are rejected
 with an explanation. Nothing is adopted or overwritten.
 
+Some Rocky cloud images lack the kernel modules Docker needs. Setup offers to
+install `kernel`, `kernel-modules`, and `kernel-modules-extra` before it requests
+credentials. It asks for approval, or requires `--install-dependencies` in an
+unattended run. If the next boot kernel has the modules but the running kernel
+does not, setup stops and saves progress. Run `sudo reboot`, reconnect, then run
+`sudo guacdeploy` and choose Resume. Setup checks again before it continues.
+Kernel packages remain with the host during teardown.
+
 If Docker is missing, setup offers to install it from Docker's RHEL repository,
 then enable and start its service. If Docker exists but Compose is unavailable,
 setup offers to install only `docker-compose-plugin`. This leaves the existing
@@ -95,6 +151,23 @@ nginx. The database schema is generated from the pinned Guacamole image and
 validated before use. nginx serves HTTPS with a temporary self-signed
 certificate until the origin certificate is issued. Setup checks container
 health and then checks that Guacamole answers through nginx.
+
+Setup starts PostgreSQL first and waits for an authenticated TCP connection.
+It then checks the database against the generated schema. During unfinished
+setup, an empty database receives the schema and authorization groups in one
+transaction. An interrupted or failed import rolls back. Resume can retry it.
+Guacamole starts only after the database check succeeds.
+
+A complete database keeps its data and groups. A partial schema stops setup
+for review. Setup does not delete the database directory or overwrite a partial
+import. After setup completes, the boot command checks the schema but cannot
+initialize a replacement database if application data is missing.
+
+This recovery also covers earlier installer versions that created the PostgreSQL
+data directory without importing the Guacamole tables. Install the current release
+and choose **Resume**. No manual SQL import is needed when the database is empty.
+The first-start scripts no longer control initialization. Public schema files are
+mounted at `/opt/guacdeploy-init` inside the PostgreSQL container.
 
 Unattended runs supply `--hostname`, `--admin-group`, and
 `--operator-group`. No credential is given to a container as an environment
@@ -137,8 +210,19 @@ A mode this host cannot do is refused with the reason — no TPM device, systemd
 older than 250, or a TPM the firmware or driver cannot use — and setup stops
 there. It never answers an unavailable encrypted mode by writing the value in
 plaintext instead. Choose another mode yourself.
-Setup checks that required credentials are available and names exactly
-what to supply when one is missing. Credential values never appear in
+Setup checks the Cloudflare API token as soon as you supply it, before saving it
+or installing Docker. The check uses a read-only zone request and accepts user
+and account API tokens. A rejected token opens a hidden replacement prompt.
+A connection error offers a retry with the same token. Quit retains your progress.
+
+Resume repeats the credential check, including sessions from older releases.
+If a saved token fails, choose replacement to validate and save a new token with
+the same storage method. The database password and completed setup work remain.
+Unattended runs stop with instructions to supply the token again. Environment mode
+uses `GUACDEPLOY_CRED_CLOUDFLARE_API_TOKEN` and does not save a replacement.
+
+Setup names what to supply when a required credential is missing.
+Credential values never appear in
 deployment state, logs, or command arguments. Files written by the tool
 are recorded as material owned by this deployment, so teardown can offer
 their removal; files you placed yourself are pre-existing and stay.
@@ -159,7 +243,9 @@ unanswered question is how a duplicate tunnel gets made.
 
 The credentials died with the host, so recovery asks for the Cloudflare API
 token again, at a hidden prompt or from `GUACDEPLOY_CRED_CLOUDFLARE_API_TOKEN`,
-and needs a Microsoft Graph token in `GUACDEPLOY_GRAPH_TOKEN`. A credential
+and offers the Microsoft authentication choices described below. On a replacement
+VM, use the installer app's client secret, device sign-in, or a supplied Graph
+token for recovery. The old TPM signing key cannot work on the new VM. A credential
 sealed to the old host's TPM cannot be decrypted on a replacement at all;
 that is the point of the mode, and it is why the guide says to keep an
 independent record of anything you cannot recreate.
@@ -296,10 +382,204 @@ credential values. Do not edit it by hand.
 Setup provisions the Entra application, service principal and the two
 groups that carry sign-in, then restarts Guacamole with SAML enabled.
 
-Supply a Microsoft Graph token in `GUACDEPLOY_GRAPH_TOKEN` before this
-phase runs. The token needs Application.ReadWrite.All,
-Group.ReadWrite.All, AppRoleAssignment.ReadWrite.All and
-Organization.Read.All. The token is never written to state or logs.
+Guided setup asks for the Microsoft tenant ID or a verified domain. Choose
+**Connect with Microsoft** for the recommended flow. Device-code sign-in authorizes
+setup. The certificate authenticates this host on later runs. These are two parts
+of the same flow.
+
+### Automatic installer identity
+
+1. Review the proposed application permissions in the terminal.
+2. Choose **Authorize setup and register the certificate**.
+3. Open the Microsoft sign-in address on your workstation. Enter the displayed code.
+4. Sign in as a Privileged Role Administrator or Global Administrator of the selected tenant.
+5. Review Microsoft's consent prompt. Setup continues after authorization.
+
+The host generates its private key inside the TPM. Setup registers the public
+certificate, creates an installer application, and grants its four listed Microsoft
+Graph application permissions. It then checks access through that installer identity.
+The task bar counts completed steps. It does not estimate time remaining.
+No certificate transfer or token copy is needed. Tenant sign-in and consent policies
+still apply.
+
+The installer application is separate from the Guacamole SAML application. Its name
+includes the deployment ID. Setup records its ownership before each creation request.
+On interruption, setup queries Entra before retrying. An unconfirmed creation with no
+visible result requires review; the installer does not create a duplicate.
+
+Entra can take time to make new objects and permission grants readable. Setup waits
+for explicit replication refusals. On resume, it checks recorded object IDs directly
+instead of assuming that a missing search result means the object does not exist.
+If Entra reports an existing permission grant, setup reads back that exact grant
+before it continues. Permission denials still stop the operation.
+
+On later runs, choose **Use the installer identity already registered for this host**.
+Teardown removes that identity after the other Entra resources. If Entra cleanup fails,
+it preserves the identity and local credentials so a later run can finish.
+
+If the host cannot use its TPM, choose **Other authentication options**. You can
+explicitly select a client secret or device-code authorization for this run only.
+If tenant policy blocks device codes, choose **Device code blocked: register the
+installer app yourself**. This uses the manual procedure below.
+
+Microsoft documents [application creation](https://learn.microsoft.com/en-us/graph/api/application-post-applications?view=graph-rest-1.0)
+and [application permission grants](https://learn.microsoft.com/en-us/graph/api/serviceprincipal-post-approleassignedto?view=graph-rest-1.0).
+
+### Manually registered installer app
+
+Use a dedicated app for provisioning. This is separate from the Guacamole SAML
+app that setup creates. The installer does not claim ownership of your manually
+registered app and does not delete it during teardown.
+
+1. Open [Microsoft Entra admin center](https://entra.microsoft.com).
+2. Select **App registrations > New registration**. Name it **Guacamole Installer**.
+3. Select **Accounts in this organizational directory only**. Leave **Redirect URI**
+   empty, then select **Register**.
+4. Select **API permissions > Add a permission > Microsoft Graph > Application
+   permissions**. Add `Application.ReadWrite.All`, `Group.ReadWrite.All`,
+   `AppRoleAssignment.ReadWrite.All`, and `Organization.Read.All`.
+5. Select **Grant admin consent** for your tenant. Use a Privileged Role Administrator
+   or Global Administrator account. These permissions permit tenant-wide application,
+   group, and app-role management; they are not limited to this deployment.
+6. Complete one credential option below.
+7. From **Overview**, enter **Directory (tenant) ID** and **Application (client) ID**
+   into the installer. Do not use the app's Object ID.
+
+An existing installer app can use the same procedure from step 4. The wizard keeps
+each instruction on screen until you choose Continue. Microsoft documents the
+[admin consent requirements](https://learn.microsoft.com/en-us/entra/identity/enterprise-apps/grant-admin-consent).
+
+**Certificate option.** Choose **Device code blocked: register the installer app yourself**.
+The host needs an accessible TPM 2.0 resource-manager device, `/dev/tpmrm0`, with
+empty owner authorization. The installer creates a non-exportable RSA signing key
+inside that TPM. It does not install a TPM utility or export a plaintext private key.
+It writes the public certificate to:
+
+```text
+/var/lib/guacdeploy/credentials/entra-installer.cer
+```
+
+Copy this public file to your workstation. For example, use your normal SSH login
+and run this command on the workstation:
+
+```sh
+ssh rocky@YOUR-SERVER 'sudo cat /var/lib/guacdeploy/credentials/entra-installer.cer' > guacdeploy-installer.cer
+```
+
+This command needs passwordless sudo for the file read. If your host requires a
+sudo password, use an administrator shell to copy the public certificate into
+your user's home directory with read permissions, then retrieve it with your SSH
+file-transfer client. Transfer only the `.cer` file. In the app registration, select **Certificates
+& secrets > Certificates > Upload certificate**. Upload `guacdeploy-installer.cer`
+and select **Add**. Check its thumbprint against the wizard.
+
+The public certificate is valid for one year. Resume reuses it. The TPM-wrapped
+key blob is `entra-installer.tpm`, under the same owner-only directory. A copied
+disk cannot use the key on another TPM. Root on the running host can use it to sign;
+a virtual TPM also trusts the hypervisor and its VM backups. This differs from the
+general `tpm` credential mode, which decrypts software secrets into memory.
+
+On a replacement VM, generate a new certificate during setup and upload it to the
+same installer app. The previous key cannot migrate. Automatic certificate rotation
+is not included. Use the client-secret option if the certificate expires or the TPM
+is unavailable, then arrange certificate replacement. Ordinary teardown removes
+the local certificate and wrapped key after Entra cleanup. Remove the unused
+certificate registration from the installer app yourself.
+
+Microsoft documents [certificate upload and authentication](https://learn.microsoft.com/en-us/entra/identity-platform/certificate-credentials).
+
+**Client-secret option.** Choose **Installer app: enter a client secret**. In Entra,
+select **Certificates & secrets > Client secrets > New client secret**. Paste the
+secret's **Value**, not its Secret ID, at the hidden prompt. The installer keeps
+this value in memory for the current run. Store your own copy in your vault.
+Subsequent setup, recovery, or teardown runs ask for it again.
+
+Both options check authentication, available application-permission claims, and
+the live tenant before any Entra change. Rejected credentials return to a retry
+choice. Correct the app settings or IDs, then retry. Workload identity policies
+still apply. This path changes the authentication method; it does not disable
+customer policy. Opaque tokens do not expose permission claims, so a later
+operation can still report a missing permission.
+
+### Device-code sign-in
+
+For device-code sign-in, setup shows a Microsoft sign-in URL and a short code.
+Open the URL on your computer or phone,
+enter the code, and sign in with an administrator account for that tenant.
+Review and approve the requested permissions in Microsoft's browser flow.
+Setup continues after sign-in. It does not require Azure CLI or PowerShell.
+
+The default device-code application is Microsoft Graph Command Line Tools
+(`14d82eec-204b-4c2f-b7e8-296a70dab67e`). Set the non-secret
+`GUACDEPLOY_ENTRA_CLIENT_ID` to use your own public client with device-code
+authentication enabled. `GUACDEPLOY_ENTRA_TENANT_ID` supplies a tenant without
+the initial prompt. A verified deployment tenant takes precedence on resume.
+An unverified saved choice appears in the prompt and can be corrected. The Microsoft
+tenant can differ from the Cloudflare DNS domain. For example, a Cloudflare zone of
+`slqaccess.qld.gov.au` can serve a deployment in the Microsoft tenant `slq.qld.gov.au`.
+Setup never uses the Cloudflare zone as the default Microsoft tenant.
+
+Sign-in requests Application.ReadWrite.All, Group.ReadWrite.All,
+AppRoleAssignment.ReadWrite.All and Organization.Read.All. Access and refresh
+tokens stay in process memory. The recommended flow then registers the host certificate.
+The optional **Device-code sign-in for this run only** path does not register an identity.
+If device-code sign-in fails, retry, select an installer app, use Graph Explorer,
+or quit and retain progress.
+A registered host identity can authenticate on resume. Without one, sign in again.
+Setup refuses a different tenant before it makes Entra changes. Tenant consent and sign-in policies still apply.
+
+### Browser fallback when device codes are blocked
+
+Choose **Other authentication options > Paste an access token from Graph Explorer**. The wizard keeps
+each instruction on screen until you choose Continue.
+
+Graph Explorer provides the sign-in token. The installer makes the API calls.
+You do not need to enter a query or select **Run query** in Graph Explorer.
+
+1. Open [Microsoft Graph Explorer](https://developer.microsoft.com/graph/graph-explorer)
+   on your computer. Sign in as an administrator and select the deployment's tenant.
+2. Scroll to the top of Graph Explorer. Open your profile avatar at the top right.
+   Choose **Consent to permissions**. Find each permission and choose **Consent**.
+   Grant these delegated permissions: `Application.ReadWrite.All`, `Group.ReadWrite.All`,
+   `AppRoleAssignment.ReadWrite.All`, and `Organization.Read.All`.
+3. Open the **Access token** tab beside **Modify Permissions** and copy the token.
+4. In the installer, choose Continue and paste the token at the hidden prompt.
+
+This fallback requires one manual paste. It does not require an SSH tunnel,
+local callback, Azure CLI, or an environment variable. The installer holds the token
+in memory. It does not save the token in files, deployment state, or logs.
+
+Before continuing, the installer checks application reads, available permission
+claims, and the tenant's ID or verified domain through Microsoft Graph. A rejected
+token returns to the hidden prompt. A token that will expire shortly requires a
+fresh copy. Leave the prompt empty to stop and keep deployment progress.
+
+Graph Explorer sign-in and consent must be allowed by the customer's policies.
+Policies can also restrict use of its token from the server. This fallback does not
+disable those policies. For opaque tokens, Graph does not expose permission claims
+or expiry to the installer. A later rejection can require a fresh token on resume;
+the installer does not replay a failed creation request automatically.
+
+Microsoft documents [Graph Explorer consent and the Access token tab](https://learn.microsoft.com/en-us/graph/graph-explorer/graph-explorer-features).
+
+If the permissions panel shows **Retry again** with no results, its permission
+catalogue may be unavailable. Use the manually registered installer app path.
+
+### Unattended sign-in
+
+Unattended setup continues to accept a Microsoft Graph token through
+`GUACDEPLOY_GRAPH_TOKEN`. An explicitly supplied token takes precedence over
+the guided sign-in flow. Setup never writes the token to state or logs.
+
+After a successful guided installer-app sign-in, state retains the authentication
+method, tenant ID, and client ID. An unattended resume or teardown can reuse the
+local TPM certificate. For the client-secret method, inject
+`GUACDEPLOY_ENTRA_CLIENT_SECRET` into that process from your credential manager.
+The installer does not save it. Do not put its value in a command line or env file.
+Initial certificate generation and manual app preparation use the guided flow.
+
+The flow uses Microsoft's [Azure Identity SDK](https://pkg.go.dev/github.com/Azure/azure-sdk-for-go/sdk/azidentity#DeviceCodeCredential)
+and [device authorization protocol](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-device-code).
 
 Setup checks what the token can actually do before it creates anything.
 It records what it intends to create before creating it. If a creation
@@ -319,10 +599,17 @@ deployment created are recorded as its own.
 
 ## Cloudflare tunnel, DNS and Access
 
-Setup selects the Cloudflare account and zone from the hostname's apex,
-or from `--zone` when the guess is wrong or several zones share a name.
+Setup finds the most specific visible Cloudflare zone for the hostname by querying
+its parent names. This includes domains such as `demo-customer.com.au` and
+delegated subdomains. Use `--zone` to select an exact zone name.
 It checks the API token's read access before creating anything. The zone
 itself is always pre-existing and is never removed by teardown.
+
+The initial token check proves authentication and Zone Read access. The selected
+zone checks cover DNS and Tunnel read access. Write permissions still need the
+documented DNS, Tunnel and Access scopes; a read check cannot prove write access.
+Cloudflare documents [account API tokens](https://developers.cloudflare.com/fundamentals/api/get-started/account-owned-tokens/)
+and the [zone list API](https://developers.cloudflare.com/api/resources/zones/methods/list/).
 
 Three resources are created, one per phase, each recorded with ownership
 evidence: a remotely managed tunnel whose name carries the deployment

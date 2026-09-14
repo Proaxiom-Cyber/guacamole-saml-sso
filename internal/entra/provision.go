@@ -424,29 +424,10 @@ func (c *Client) Apply(ctx context.Context, plan *Plan) (*Result, error) {
 	marker := Marker(cfg.DeploymentID)
 	res := &Result{}
 
-	// The tenant ID is in the token's own `tid` claim, so the ordinary
-	// path needs no directory read at all. /organization is the fallback
-	// for a token this tool cannot inspect, and it is the only reason
-	// Organization.Read.All would ever be required.
-	if tok, err := c.Token(ctx); err == nil {
-		if tid, ok := tokenTenantID(tok); ok {
-			res.TenantID = tid
-		}
-	}
-	if res.TenantID == "" {
-		out, err := c.call(ctx, http.MethodGet, "/organization?%24select=id", nil)
-		if err != nil {
-			return nil, fmt.Errorf("could not read the tenant ID: the token carries no tid claim and reading /organization failed (that fallback needs Organization.Read.All): %w", err)
-		}
-		var org struct {
-			Value []struct {
-				ID string `json:"id"`
-			} `json:"value"`
-		}
-		if json.Unmarshal(out, &org) != nil || len(org.Value) == 0 {
-			return nil, fmt.Errorf("could not read the tenant ID from /organization")
-		}
-		res.TenantID = org.Value[0].ID
+	if tenantID, err := c.Tenant(ctx); err != nil {
+		return nil, err
+	} else {
+		res.TenantID = tenantID
 	}
 
 	// Application. The marker travels in the creation body itself, so a
@@ -579,7 +560,7 @@ func (c *Client) Apply(ctx context.Context, plan *Plan) (*Result, error) {
 	}
 
 	// Groups, then their assignment to the application.
-	assigned, err := c.assignedPrincipals(ctx, sp.ObjectID)
+	assigned, err := c.assignedPrincipals(ctx, sp.ObjectID, res.App.CreatedSP)
 	if err != nil {
 		return nil, err
 	}
@@ -658,8 +639,12 @@ func appPatchBody(changes []FieldChange) map[string]any {
 // service principal.
 // ponytail: reads one page (Graph default 100); paginate if a tenant ever
 // assigns more than 100 principals to this application.
-func (c *Client) assignedPrincipals(ctx context.Context, spID string) (map[string]bool, error) {
-	out, err := c.call(ctx, http.MethodGet, "/servicePrincipals/"+spID+"/appRoleAssignedTo", nil)
+func (c *Client) assignedPrincipals(ctx context.Context, spID string, fresh bool) (map[string]bool, error) {
+	request := c.call
+	if fresh {
+		request = c.callFresh
+	}
+	out, err := request(ctx, http.MethodGet, "/servicePrincipals/"+spID+"/appRoleAssignedTo", nil)
 	if err != nil {
 		return nil, err
 	}

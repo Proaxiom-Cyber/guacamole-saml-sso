@@ -71,7 +71,10 @@ services:
     networks: [guacnet]
     restart: always
     volumes:
-      - ./init:/docker-entrypoint-initdb.d:ro,Z
+      # Setup imports the schema explicitly after PostgreSQL accepts TCP connections.
+      # Keeping these files outside the entrypoint directory prevents partial
+      # first-start imports and makes setup/resume use the same transaction.
+      - ./init:/opt/guacdeploy-init:ro,Z
       - ./data:/var/lib/postgresql/data:Z
       - {{ .RuntimeSecretsDir }}/postgres:/run/secrets:ro,z
     healthcheck:

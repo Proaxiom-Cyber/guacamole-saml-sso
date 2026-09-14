@@ -24,6 +24,7 @@ type Probes struct {
 	LookPath      func(file string) (string, error)
 	Run           func(ctx context.Context, name string, args ...string) (string, error)
 	Dial          func(ctx context.Context, hostport string) error
+	Progress      func(label string, completed, total int)
 }
 
 func (p *Probes) defaults() {
@@ -67,15 +68,16 @@ var setupEndpoints = []string{
 
 // Facts is what one gathering pass observed.
 type Facts struct {
-	OSID              string
-	VersionID         string
-	Root              bool
-	ExistingInstall   string // first marker path found, empty if none
-	DockerPath        string
-	Podman            bool
-	ComposeOK         bool
-	KernelNetfilterOK bool
-	Unreachable       []string
+	OSID                 string
+	VersionID            string
+	Root                 bool
+	ExistingInstall      string // first marker path found, empty if none
+	DockerPath           string
+	Podman               bool
+	ComposeOK            bool
+	KernelNetfilterOK    bool
+	KernelRebootRequired bool
+	Unreachable          []string
 }
 
 // Gather observes the host without changing it.
@@ -114,6 +116,13 @@ func (p *Probes) Gather(ctx context.Context) (*Facts, error) {
 	// to load them. modprobe -n resolves without loading.
 	if _, err := p.Run(ctx, "modprobe", "-qn", "xt_addrtype"); err == nil {
 		f.KernelNetfilterOK = true
+	} else if out, err := p.Run(ctx, "grubby", "--default-kernel"); err == nil {
+		boot := strings.TrimSpace(out)
+		if strings.HasPrefix(boot, "/boot/vmlinuz-") {
+			version := strings.TrimPrefix(boot, "/boot/vmlinuz-")
+			_, err := p.Run(ctx, "modprobe", "-S", version, "-qn", "xt_addrtype")
+			f.KernelRebootRequired = err == nil
+		}
 	}
 
 	if path, err := p.LookPath("docker"); err == nil {
@@ -126,9 +135,15 @@ func (p *Probes) Gather(ctx context.Context) (*Facts, error) {
 		}
 	}
 
-	for _, ep := range setupEndpoints {
+	for i, ep := range setupEndpoints {
+		if p.Progress != nil {
+			p.Progress("Network checks: "+ep, i, len(setupEndpoints))
+		}
 		if err := p.Dial(ctx, ep); err != nil {
 			f.Unreachable = append(f.Unreachable, ep)
+		}
+		if p.Progress != nil {
+			p.Progress("Network checks completed", i+1, len(setupEndpoints))
 		}
 	}
 	return f, nil
@@ -149,11 +164,30 @@ func Preflight(f *Facts) error {
 	if f.Podman {
 		return errors.New("the docker command runs Podman (podman-docker) on this host; this deployment is only verified with Docker. Use a host with Docker or remove podman-docker")
 	}
-	if !f.KernelNetfilterOK {
-		return errors.New("the running kernel cannot load the netfilter modules Docker needs (xt_addrtype). If the kernel was updated (cloud images often update on first boot), reboot into the new kernel and resume; otherwise install the kernel-modules package for the running kernel")
-	}
 	if len(f.Unreachable) > 0 {
 		return fmt.Errorf("required endpoints are unreachable: %s. Fix outbound connectivity (TCP 443) and resume", strings.Join(f.Unreachable, ", "))
+	}
+	if !f.KernelNetfilterOK {
+		if f.KernelRebootRequired {
+			return ErrRebootRequired
+		}
+		return ErrKernelModulesMissing
+	}
+	return nil
+}
+
+var ErrKernelModulesMissing = errors.New("Docker needs netfilter kernel modules (xt_addrtype) that are not installed")
+
+var ErrRebootRequired = errors.New("the next boot kernel has the required modules. Run 'sudo reboot', reconnect, then run 'sudo guacdeploy' and choose Resume")
+
+// InstallKernelSupport adds the host packages after the caller obtains consent.
+// The caller must gather facts again: a successful package transaction does not
+// prove the currently running kernel can use the newly installed modules.
+func (p *Probes) InstallKernelSupport(ctx context.Context) error {
+	p.defaults()
+	args := []string{"-y", "install", "kernel", "kernel-modules", "kernel-modules-extra"}
+	if out, err := p.Run(ctx, "dnf", args...); err != nil {
+		return fmt.Errorf("kernel package installation failed: %v\n%s", err, strings.TrimSpace(out))
 	}
 	return nil
 }

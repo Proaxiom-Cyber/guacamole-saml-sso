@@ -522,3 +522,46 @@ func TestWaitResolvableReportsAHostnameThatNeverAppears(t *testing.T) {
 		}
 	}
 }
+
+func TestAccessWaitsForEdgePropagationWithoutRelaxingTheChallenge(t *testing.T) {
+	old := accessPropagationPoll
+	accessPropagationPoll = time.Millisecond
+	t.Cleanup(func() { accessPropagationPoll = old })
+	f, p := verifyFake(t)
+	calls := 0
+	f.probe(func(*http.Request) *http.Response {
+		calls++
+		if calls < 3 {
+			return probeResponse(530, "")
+		}
+		return probeResponse(302, loginRedirect(t, authDomain, host, appAUD))
+	})
+	v, err := p.VerifyAccess(context.Background(), "app1", expectGroups())
+	if err != nil || !v.ChallengeVerified || calls != 3 {
+		t.Fatalf("edge propagation failed: %v (%d probes)", err, calls)
+	}
+}
+
+func TestAccessPropagationWaitIsBoundedAndCancellable(t *testing.T) {
+	oldWait, oldPoll := accessPropagationWait, accessPropagationPoll
+	accessPropagationWait, accessPropagationPoll = 5*time.Millisecond, time.Millisecond
+	t.Cleanup(func() { accessPropagationWait, accessPropagationPoll = oldWait, oldPoll })
+	for _, cancelled := range []bool{false, true} {
+		f, p := verifyFake(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		f.probe(func(*http.Request) *http.Response {
+			if cancelled {
+				cancel()
+			}
+			return probeResponse(530, "")
+		})
+		v, err := p.VerifyAccess(ctx, "app1", expectGroups())
+		cancel()
+		if err == nil || v.ChallengeVerified {
+			t.Fatal("unavailable edge was accepted")
+		}
+		if cancelled && !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancellation ignored: %v", err)
+		}
+	}
+}

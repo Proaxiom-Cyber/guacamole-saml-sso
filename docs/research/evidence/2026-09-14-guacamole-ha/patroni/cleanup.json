@@ -1,0 +1,25 @@
+{
+  "utc": "2026-09-14T14:23:00.374416+00:00",
+  "containers": {
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  "networks": {
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  "image_tags": {
+    "guac-ha-patroni-research:20260915": {
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "Error response from daemon: No such image: guac-ha-patroni-research:20260915"
+    },
+    "quay.io/coreos/etcd:v3.6.0": {
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "Error response from daemon: No such image: quay.io/coreos/etcd:v3.6.0"
+    }
+  }
+}

@@ -29,9 +29,11 @@ errors.
 - Unattended / lab: `entra.StaticTokenFromEnv(entra.DefaultTokenEnv)` reads
   `GUACDEPLOY_GRAPH_TOKEN` (the `GRAPH_TOKEN_CMD` analogue from the old setup.sh; on
   slq-guac-vm the memory notes describe supplying it).
-- Guided: the parent supplies a device-code TokenSource (client ID
+- Guided: `internal/session/entra_auth.go` supplies `DeviceCodeTokenSource` (client ID
   `14d82eec-204b-4c2f-b7e8-296a70dab67e`, the Microsoft Graph Command Line Tools
-  public client) — not part of this package.
+  public client). `devicecode.go` uses Azure Identity with an in-memory cache.
+  The session selects the tenant, displays the code, and offers retry or quit.
+  It checks the tenant ID before planning changes and retains that ID on resume.
 - Required permissions: `entra.RequiredPermissions` (Application.ReadWrite.All,
   Group.ReadWrite.All, AppRoleAssignment.ReadWrite.All, Organization.Read.All).
 
@@ -122,5 +124,4 @@ two assigned groups can sign in.
   `onpremisessamaccountname`). Without it users sign in with Entra's default
   persistent NameID: sign-in works, usernames are opaque. Adding it needs
   `Policy.ReadWrite.ApplicationConfiguration` and a policy-assignment dance.
-- Device-code sign-in flow (a TokenSource the parent owns).
 - The Cloudflare Access application registration (Cloudflare slice).

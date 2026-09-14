@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"golang.org/x/term"
 )
@@ -38,16 +39,21 @@ type UI struct {
 	// Secret overrides hidden input, for tests.
 	Secret func(prompt string) (string, error)
 
-	fd    int
-	saved *term.State
-	wiz   *Wizard // non-nil once StartWizard succeeds; never cleared
+	fd      int
+	saved   *term.State
+	journal *journal
+	wiz     *Wizard // non-nil once StartWizard succeeds; never cleared
 }
 
 // SecretReader returns the hidden-input function for this UI, or nil when
 // no interactive terminal is available.
 func (u *UI) SecretReader() func(string) (string, error) {
 	if u.Secret != nil {
-		return u.Secret
+		return func(prompt string) (string, error) {
+			value, err := u.Secret(prompt)
+			u.Protect(value)
+			return value, err
+		}
 	}
 	if !u.Interactive {
 		return nil
@@ -70,7 +76,7 @@ func New(allowInteractive bool) *UI {
 }
 
 // RestoreTerminal returns the terminal to its saved settings, leaving the
-// full-screen view first and replaying the session output. Safe to call
+// full-screen view first and printing a short progress summary. Safe to call
 // multiple times, from a signal handler, and while a panic unwinds: the
 // wizard leaves the alternate screen exactly once.
 func (u *UI) RestoreTerminal() {
@@ -84,12 +90,17 @@ func (u *UI) RestoreTerminal() {
 
 // Say writes one line to the user.
 func (u *UI) Say(format string, args ...any) {
-	s := fmt.Sprintf(format, args...)
+	s := u.safe(fmt.Sprintf(format, args...))
+	u.record("INFO", s)
 	if w := u.wizard(); w != nil {
 		w.say(s)
 		return
 	}
-	fmt.Fprintln(u.Out, s)
+	if u.journal != nil {
+		fmt.Fprintf(u.Out, "%s  %s\n", time.Now().Format("15:04:05"), s)
+	} else {
+		fmt.Fprintln(u.Out, s)
+	}
 }
 
 // PhaseList declares the ordered phases of the session, so the full-screen
@@ -104,6 +115,12 @@ func (u *UI) PhaseList(names []string) {
 // PhaseStart marks a phase as running. It writes nothing in line-oriented
 // output, which reports a phase only once it has finished.
 func (u *UI) PhaseStart(name string) {
+	if j := u.journal; j != nil {
+		j.mu.Lock()
+		j.phase = name
+		j.mu.Unlock()
+	}
+	u.record("START", name)
 	if w := u.wizard(); w != nil {
 		w.setPhase(name, phaseRunning)
 	}
@@ -111,6 +128,7 @@ func (u *UI) PhaseStart(name string) {
 
 // PhaseDone marks a phase as complete.
 func (u *UI) PhaseDone(name string) {
+	u.record("DONE", name)
 	if w := u.wizard(); w != nil {
 		w.setPhase(name, phaseDone)
 		return
@@ -120,6 +138,7 @@ func (u *UI) PhaseDone(name string) {
 
 // PhaseSkipped marks a phase that an earlier session already completed.
 func (u *UI) PhaseSkipped(name string) {
+	u.record("SKIP", name+" already complete")
 	if w := u.wizard(); w != nil {
 		w.setPhase(name, phaseSkipped)
 		return
@@ -130,6 +149,8 @@ func (u *UI) PhaseSkipped(name string) {
 // PhaseFailed reports a failed phase. Both outputs name the action that
 // failed, the work that was retained, and the recovery choices.
 func (u *UI) PhaseFailed(name string, err error) {
+	err = errors.New(u.safe(err.Error()))
+	u.record("ERROR", name+": "+err.Error())
 	if w := u.wizard(); w != nil {
 		w.failed(name, err)
 		return
@@ -209,7 +230,9 @@ func (u *UI) HiddenLine(prompt string) (string, error) {
 		return "", fmt.Errorf("%w: %s", ErrInputRequired, prompt)
 	}
 	if w := u.wizard(); w != nil {
-		return w.readLine(prompt, "", true)
+		value, err := w.readLine(prompt, "", true)
+		u.Protect(value)
+		return value, err
 	}
 	fmt.Fprintf(u.Out, "%s: ", prompt)
 	b, err := term.ReadPassword(u.fd)
@@ -217,5 +240,44 @@ func (u *UI) HiddenLine(prompt string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	u.Protect(string(b))
 	return string(b), nil
+}
+
+// Explain keeps an optional explanation in Details and the log, while the
+// current task receives its short summary. Plain terminals print both.
+func (u *UI) Explain(summary, detail string) {
+	if w := u.wizard(); w != nil {
+		text := u.safe(detail)
+		u.record("NOTE", text)
+		w.mu.Lock()
+		w.notes = append(w.notes, summary, text, "")
+		w.mu.Unlock()
+		u.Say("%s", summary)
+		return
+	}
+	u.Say("%s\n%s", summary, detail)
+}
+
+// Summary is retained after the alternate screen closes.
+func (u *UI) Summary(lines ...string) {
+	if w := u.wizard(); w != nil {
+		w.mu.Lock()
+		w.summary = append([]string{}, lines...)
+		w.mu.Unlock()
+		for _, l := range lines {
+			u.record("INFO", l)
+		}
+		return
+	}
+	for _, l := range lines {
+		u.Say("%s", l)
+	}
+}
+
+func (u *UI) ErrorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return u.safe(err.Error())
 }

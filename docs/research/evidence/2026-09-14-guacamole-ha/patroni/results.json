@@ -1,0 +1,1255 @@
+[
+  {
+    "test": "environment",
+    "utc": "2026-09-14T14:20:20.254705+00:00",
+    "docker": "29.1.3 aarch64",
+    "images": {
+      "guac-ha-patroni-research:20260915": "sha256:f33ba65315173a50f328b86f5e47ef07fa39506643a639e12cc6f184231d57ff",
+      "quay.io/coreos/etcd:v3.6.0": "sha256:f31f12f49ecd6fd585301d8d29b7e57c6d57f1f94447f6d411d86dab3a1e9073"
+    },
+    "policy": {
+      "synchronous_mode": false,
+      "synchronous_commit": "on",
+      "ttl": 20,
+      "loop_wait": 2,
+      "retry_timeout": 3,
+      "failsafe_mode": false,
+      "watchdog": "off"
+    }
+  },
+  {
+    "test": "etcd_healthy",
+    "utc": "2026-09-14T14:20:20.855732+00:00",
+    "health": "http://guac-ha-patroni-20260915-e3:2379 is healthy: successfully committed proposal: took = 106.472541ms\nhttp://guac-ha-patroni-20260915-e1:2379 is healthy: successfully committed proposal: took = 106.392125ms\nhttp://guac-ha-patroni-20260915-e2:2379 is healthy: successfully committed proposal: took = 107.348042ms\n"
+  },
+  {
+    "test": "initial_cluster",
+    "utc": "2026-09-14T14:20:23.826661+00:00",
+    "states": {
+      "guac-ha-patroni-20260915-p1": {
+        "state": "running",
+        "role": "primary",
+        "timeline": 1,
+        "xlog": {
+          "location": 50331648
+        },
+        "dcs_last_seen": 1789395622,
+        "patroni": {
+          "version": "4.1.0",
+          "scope": "guac-ha-patroni-20260915",
+          "name": "guac-ha-patroni-20260915-p1"
+        }
+      },
+      "guac-ha-patroni-20260915-p2": {
+        "state": "running",
+        "role": "replica",
+        "timeline": 1,
+        "xlog": {
+          "received_location": 50331648,
+          "replayed_location": 50331648,
+          "replayed_timestamp": null,
+          "paused": false
+        },
+        "dcs_last_seen": 1789395623,
+        "patroni": {
+          "version": "4.1.0",
+          "scope": "guac-ha-patroni-20260915",
+          "name": "guac-ha-patroni-20260915-p2"
+        }
+      }
+    },
+    "postgres_version": "18.6",
+    "replica_row_count": 1
+  },
+  {
+    "test": "automatic_promotion",
+    "utc": "2026-09-14T14:20:49.095552+00:00",
+    "killed": "guac-ha-patroni-20260915-p1",
+    "promoted": "guac-ha-patroni-20260915-p2",
+    "seconds_until_observed": 25.19,
+    "state": {
+      "state": "running",
+      "role": "primary",
+      "timeline": 2,
+      "xlog": {
+        "location": 50519472
+      },
+      "dcs_last_seen": 1789395648,
+      "patroni": {
+        "version": "4.1.0",
+        "scope": "guac-ha-patroni-20260915",
+        "name": "guac-ha-patroni-20260915-p2"
+      }
+    },
+    "write_exit": 0,
+    "write_result": "INSERT 0 1\n2",
+    "manual_promotion_used": false
+  },
+  {
+    "test": "replica_rebuilt_after_restart",
+    "utc": "2026-09-14T14:20:51.665624+00:00",
+    "states": {
+      "guac-ha-patroni-20260915-p1": {
+        "state": "running",
+        "role": "replica",
+        "timeline": 2,
+        "xlog": {
+          "received_location": 83886080,
+          "replayed_location": 83886080,
+          "replayed_timestamp": null,
+          "paused": false
+        },
+        "dcs_last_seen": 1789395651,
+        "patroni": {
+          "version": "4.1.0",
+          "scope": "guac-ha-patroni-20260915",
+          "name": "guac-ha-patroni-20260915-p1"
+        }
+      },
+      "guac-ha-patroni-20260915-p2": {
+        "state": "running",
+        "role": "primary",
+        "timeline": 2,
+        "xlog": {
+          "location": 83886080
+        },
+        "dcs_last_seen": 1789395651,
+        "patroni": {
+          "version": "4.1.0",
+          "scope": "guac-ha-patroni-20260915",
+          "name": "guac-ha-patroni-20260915-p2"
+        }
+      }
+    }
+  },
+  {
+    "test": "quorum_loss",
+    "utc": "2026-09-14T14:21:42.252189+00:00",
+    "stopped_etcd": [
+      "guac-ha-patroni-20260915-e2",
+      "guac-ha-patroni-20260915-e3"
+    ],
+    "observation_seconds": 48.3,
+    "remaining_etcd_health_exit": 1,
+    "final_states": {
+      "guac-ha-patroni-20260915-p1": {
+        "state": "running",
+        "role": "replica",
+        "timeline": 2,
+        "xlog": {
+          "received_location": 83886296,
+          "replayed_location": 83886296,
+          "replayed_timestamp": null,
+          "paused": false
+        },
+        "dcs_last_seen": 1789395692,
+        "patroni": {
+          "version": "4.1.0",
+          "scope": "guac-ha-patroni-20260915",
+          "name": "guac-ha-patroni-20260915-p1"
+        }
+      },
+      "guac-ha-patroni-20260915-p2": {
+        "state": "running",
+        "role": "replica",
+        "timeline": 2,
+        "xlog": {
+          "received_location": 83886296,
+          "replayed_location": 83886296,
+          "replayed_timestamp": null,
+          "paused": false
+        },
+        "dcs_last_seen": 1789395680,
+        "patroni": {
+          "version": "4.1.0",
+          "scope": "guac-ha-patroni-20260915",
+          "name": "guac-ha-patroni-20260915-p2"
+        }
+      }
+    },
+    "write_attempts": {
+      "guac-ha-patroni-20260915-p1": {
+        "exit_code": 1,
+        "output": "",
+        "error": "ERROR:  cannot execute INSERT in a read-only transaction"
+      },
+      "guac-ha-patroni-20260915-p2": {
+        "exit_code": 1,
+        "output": "",
+        "error": "ERROR:  cannot execute INSERT in a read-only transaction"
+      }
+    },
+    "observations": [
+      {
+        "seconds": 0.0,
+        "states": {
+          "guac-ha-patroni-20260915-p1": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886080,
+              "replayed_location": 83886080,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395651,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p1"
+            }
+          },
+          "guac-ha-patroni-20260915-p2": {
+            "state": "running",
+            "role": "primary",
+            "timeline": 2,
+            "xlog": {
+              "location": 83886080
+            },
+            "dcs_last_seen": 1789395653,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p2"
+            }
+          }
+        }
+      },
+      {
+        "seconds": 2.24,
+        "states": {
+          "guac-ha-patroni-20260915-p1": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886080,
+              "replayed_location": 83886080,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395655,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p1"
+            }
+          },
+          "guac-ha-patroni-20260915-p2": {
+            "state": "running",
+            "role": "primary",
+            "timeline": 2,
+            "xlog": {
+              "location": 83886080
+            },
+            "dcs_last_seen": 1789395655,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p2"
+            }
+          }
+        }
+      },
+      {
+        "seconds": 4.5,
+        "states": {
+          "guac-ha-patroni-20260915-p1": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886080,
+              "replayed_location": 83886080,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395655,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p1"
+            }
+          },
+          "guac-ha-patroni-20260915-p2": {
+            "state": "running",
+            "role": "primary",
+            "timeline": 2,
+            "xlog": {
+              "location": 83886080
+            },
+            "dcs_last_seen": 1789395657,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p2"
+            }
+          }
+        }
+      },
+      {
+        "seconds": 6.76,
+        "states": {
+          "guac-ha-patroni-20260915-p1": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886080,
+              "replayed_location": 83886080,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395659,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p1"
+            }
+          },
+          "guac-ha-patroni-20260915-p2": {
+            "state": "running",
+            "role": "primary",
+            "timeline": 2,
+            "xlog": {
+              "location": 83886080
+            },
+            "dcs_last_seen": 1789395657,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p2"
+            }
+          }
+        }
+      },
+      {
+        "seconds": 9.01,
+        "states": {
+          "guac-ha-patroni-20260915-p1": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886080,
+              "replayed_location": 83886080,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395659,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p1"
+            }
+          },
+          "guac-ha-patroni-20260915-p2": {
+            "state": "running",
+            "role": "primary",
+            "timeline": 2,
+            "xlog": {
+              "location": 83886080
+            },
+            "dcs_last_seen": 1789395657,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p2"
+            }
+          }
+        }
+      },
+      {
+        "seconds": 11.27,
+        "states": {
+          "guac-ha-patroni-20260915-p1": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886176,
+              "replayed_location": 83886176,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395659,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p1"
+            }
+          },
+          "guac-ha-patroni-20260915-p2": {
+            "state": "running",
+            "role": "primary",
+            "timeline": 2,
+            "xlog": {
+              "location": 83886176
+            },
+            "dcs_last_seen": 1789395657,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p2"
+            }
+          }
+        }
+      },
+      {
+        "seconds": 13.52,
+        "states": {
+          "guac-ha-patroni-20260915-p1": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886176,
+              "replayed_location": 83886176,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395659,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p1"
+            }
+          },
+          "guac-ha-patroni-20260915-p2": {
+            "state": "running",
+            "role": "primary",
+            "timeline": 2,
+            "xlog": {
+              "location": 83886176
+            },
+            "dcs_last_seen": 1789395657,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p2"
+            }
+          }
+        }
+      },
+      {
+        "seconds": 15.77,
+        "states": {
+          "guac-ha-patroni-20260915-p1": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886176,
+              "replayed_location": 83886176,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395659,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p1"
+            }
+          },
+          "guac-ha-patroni-20260915-p2": {
+            "state": "running",
+            "role": "primary",
+            "timeline": 2,
+            "xlog": {
+              "location": 83886176
+            },
+            "dcs_last_seen": 1789395657,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p2"
+            }
+          }
+        }
+      },
+      {
+        "seconds": 18.01,
+        "states": {
+          "guac-ha-patroni-20260915-p1": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395670,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p1"
+            }
+          },
+          "guac-ha-patroni-20260915-p2": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395657,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p2"
+            }
+          }
+        }
+      },
+      {
+        "seconds": 20.29,
+        "states": {
+          "guac-ha-patroni-20260915-p1": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395670,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p1"
+            }
+          },
+          "guac-ha-patroni-20260915-p2": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395657,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p2"
+            }
+          }
+        }
+      },
+      {
+        "seconds": 22.53,
+        "states": {
+          "guac-ha-patroni-20260915-p1": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395670,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p1"
+            }
+          },
+          "guac-ha-patroni-20260915-p2": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395657,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p2"
+            }
+          }
+        }
+      },
+      {
+        "seconds": 24.78,
+        "states": {
+          "guac-ha-patroni-20260915-p1": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395670,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p1"
+            }
+          },
+          "guac-ha-patroni-20260915-p2": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395657,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p2"
+            }
+          }
+        }
+      },
+      {
+        "seconds": 27.03,
+        "states": {
+          "guac-ha-patroni-20260915-p1": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395670,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p1"
+            }
+          },
+          "guac-ha-patroni-20260915-p2": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395680,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p2"
+            }
+          }
+        }
+      },
+      {
+        "seconds": 29.27,
+        "states": {
+          "guac-ha-patroni-20260915-p1": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395681,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p1"
+            }
+          },
+          "guac-ha-patroni-20260915-p2": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395680,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p2"
+            }
+          }
+        }
+      },
+      {
+        "seconds": 31.58,
+        "states": {
+          "guac-ha-patroni-20260915-p1": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395681,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p1"
+            }
+          },
+          "guac-ha-patroni-20260915-p2": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395680,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p2"
+            }
+          }
+        }
+      },
+      {
+        "seconds": 33.82,
+        "states": {
+          "guac-ha-patroni-20260915-p1": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395681,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p1"
+            }
+          },
+          "guac-ha-patroni-20260915-p2": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395680,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p2"
+            }
+          }
+        }
+      },
+      {
+        "seconds": 36.07,
+        "states": {
+          "guac-ha-patroni-20260915-p1": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395681,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p1"
+            }
+          },
+          "guac-ha-patroni-20260915-p2": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395680,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p2"
+            }
+          }
+        }
+      },
+      {
+        "seconds": 38.33,
+        "states": {
+          "guac-ha-patroni-20260915-p1": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395681,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p1"
+            }
+          },
+          "guac-ha-patroni-20260915-p2": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395680,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p2"
+            }
+          }
+        }
+      },
+      {
+        "seconds": 40.58,
+        "states": {
+          "guac-ha-patroni-20260915-p1": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395692,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p1"
+            }
+          },
+          "guac-ha-patroni-20260915-p2": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395680,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p2"
+            }
+          }
+        }
+      },
+      {
+        "seconds": 42.83,
+        "states": {
+          "guac-ha-patroni-20260915-p1": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395692,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p1"
+            }
+          },
+          "guac-ha-patroni-20260915-p2": {
+            "state": "running",
+            "role": "replica",
+            "timeline": 2,
+            "xlog": {
+              "received_location": 83886296,
+              "replayed_location": 83886296,
+              "replayed_timestamp": null,
+              "paused": false
+            },
+            "dcs_last_seen": 1789395680,
+            "patroni": {
+              "version": "4.1.0",
+              "scope": "guac-ha-patroni-20260915",
+              "name": "guac-ha-patroni-20260915-p2"
+            }
+          }
+        }
+      }
+    ]
+  },
+  {
+    "test": "no_promotion_without_quorum_after_primary_container_killed",
+    "utc": "2026-09-14T14:22:14.418733+00:00",
+    "killed": "guac-ha-patroni-20260915-p2",
+    "remaining": "guac-ha-patroni-20260915-p1",
+    "observations": [
+      {
+        "seconds": 0.0,
+        "state": {
+          "state": "running",
+          "role": "replica",
+          "timeline": 2,
+          "xlog": {
+            "received_location": 83886296,
+            "replayed_location": 83886296,
+            "replayed_timestamp": null,
+            "paused": false
+          },
+          "dcs_last_seen": 1789395692,
+          "patroni": {
+            "version": "4.1.0",
+            "scope": "guac-ha-patroni-20260915",
+            "name": "guac-ha-patroni-20260915-p1"
+          }
+        }
+      },
+      {
+        "seconds": 2.12,
+        "state": {
+          "state": "running",
+          "role": "replica",
+          "timeline": 2,
+          "xlog": {
+            "received_location": 83886296,
+            "replayed_location": 83886296,
+            "replayed_timestamp": null,
+            "paused": false
+          },
+          "dcs_last_seen": 1789395703,
+          "patroni": {
+            "version": "4.1.0",
+            "scope": "guac-ha-patroni-20260915",
+            "name": "guac-ha-patroni-20260915-p1"
+          }
+        }
+      },
+      {
+        "seconds": 4.26,
+        "state": {
+          "state": "running",
+          "role": "replica",
+          "timeline": 2,
+          "xlog": {
+            "received_location": 83886296,
+            "replayed_location": 83886296,
+            "replayed_timestamp": null,
+            "paused": false
+          },
+          "dcs_last_seen": 1789395703,
+          "patroni": {
+            "version": "4.1.0",
+            "scope": "guac-ha-patroni-20260915",
+            "name": "guac-ha-patroni-20260915-p1"
+          }
+        }
+      },
+      {
+        "seconds": 6.41,
+        "state": {
+          "state": "running",
+          "role": "replica",
+          "timeline": 2,
+          "xlog": {
+            "received_location": 83886296,
+            "replayed_location": 83886296,
+            "replayed_timestamp": null,
+            "paused": false
+          },
+          "dcs_last_seen": 1789395703,
+          "patroni": {
+            "version": "4.1.0",
+            "scope": "guac-ha-patroni-20260915",
+            "name": "guac-ha-patroni-20260915-p1"
+          }
+        }
+      },
+      {
+        "seconds": 8.57,
+        "state": {
+          "state": "running",
+          "role": "replica",
+          "timeline": 2,
+          "xlog": {
+            "received_location": 83886296,
+            "replayed_location": 83886296,
+            "replayed_timestamp": null,
+            "paused": false
+          },
+          "dcs_last_seen": 1789395703,
+          "patroni": {
+            "version": "4.1.0",
+            "scope": "guac-ha-patroni-20260915",
+            "name": "guac-ha-patroni-20260915-p1"
+          }
+        }
+      },
+      {
+        "seconds": 10.71,
+        "state": {
+          "state": "running",
+          "role": "replica",
+          "timeline": 2,
+          "xlog": {
+            "received_location": 83886296,
+            "replayed_location": 83886296,
+            "replayed_timestamp": null,
+            "paused": false
+          },
+          "dcs_last_seen": 1789395703,
+          "patroni": {
+            "version": "4.1.0",
+            "scope": "guac-ha-patroni-20260915",
+            "name": "guac-ha-patroni-20260915-p1"
+          }
+        }
+      },
+      {
+        "seconds": 12.84,
+        "state": {
+          "state": "running",
+          "role": "replica",
+          "timeline": 2,
+          "xlog": {
+            "received_location": 83886296,
+            "replayed_location": 83886296,
+            "replayed_timestamp": null,
+            "paused": false
+          },
+          "dcs_last_seen": 1789395714,
+          "patroni": {
+            "version": "4.1.0",
+            "scope": "guac-ha-patroni-20260915",
+            "name": "guac-ha-patroni-20260915-p1"
+          }
+        }
+      },
+      {
+        "seconds": 14.96,
+        "state": {
+          "state": "running",
+          "role": "replica",
+          "timeline": 2,
+          "xlog": {
+            "received_location": 83886296,
+            "replayed_location": 83886296,
+            "replayed_timestamp": null,
+            "paused": false
+          },
+          "dcs_last_seen": 1789395714,
+          "patroni": {
+            "version": "4.1.0",
+            "scope": "guac-ha-patroni-20260915",
+            "name": "guac-ha-patroni-20260915-p1"
+          }
+        }
+      },
+      {
+        "seconds": 17.1,
+        "state": {
+          "state": "running",
+          "role": "replica",
+          "timeline": 2,
+          "xlog": {
+            "received_location": 83886296,
+            "replayed_location": 83886296,
+            "replayed_timestamp": null,
+            "paused": false
+          },
+          "dcs_last_seen": 1789395714,
+          "patroni": {
+            "version": "4.1.0",
+            "scope": "guac-ha-patroni-20260915",
+            "name": "guac-ha-patroni-20260915-p1"
+          }
+        }
+      },
+      {
+        "seconds": 19.24,
+        "state": {
+          "state": "running",
+          "role": "replica",
+          "timeline": 2,
+          "xlog": {
+            "received_location": 83886296,
+            "replayed_location": 83886296,
+            "replayed_timestamp": null,
+            "paused": false
+          },
+          "dcs_last_seen": 1789395714,
+          "patroni": {
+            "version": "4.1.0",
+            "scope": "guac-ha-patroni-20260915",
+            "name": "guac-ha-patroni-20260915-p1"
+          }
+        }
+      },
+      {
+        "seconds": 21.38,
+        "state": {
+          "state": "running",
+          "role": "replica",
+          "timeline": 2,
+          "xlog": {
+            "received_location": 83886296,
+            "replayed_location": 83886296,
+            "replayed_timestamp": null,
+            "paused": false
+          },
+          "dcs_last_seen": 1789395714,
+          "patroni": {
+            "version": "4.1.0",
+            "scope": "guac-ha-patroni-20260915",
+            "name": "guac-ha-patroni-20260915-p1"
+          }
+        }
+      },
+      {
+        "seconds": 23.51,
+        "state": {
+          "state": "running",
+          "role": "replica",
+          "timeline": 2,
+          "xlog": {
+            "received_location": 83886296,
+            "replayed_location": 83886296,
+            "replayed_timestamp": null,
+            "paused": false
+          },
+          "dcs_last_seen": 1789395725,
+          "patroni": {
+            "version": "4.1.0",
+            "scope": "guac-ha-patroni-20260915",
+            "name": "guac-ha-patroni-20260915-p1"
+          }
+        }
+      },
+      {
+        "seconds": 25.65,
+        "state": {
+          "state": "running",
+          "role": "replica",
+          "timeline": 2,
+          "xlog": {
+            "received_location": 83886296,
+            "replayed_location": 83886296,
+            "replayed_timestamp": null,
+            "paused": false
+          },
+          "dcs_last_seen": 1789395725,
+          "patroni": {
+            "version": "4.1.0",
+            "scope": "guac-ha-patroni-20260915",
+            "name": "guac-ha-patroni-20260915-p1"
+          }
+        }
+      },
+      {
+        "seconds": 27.8,
+        "state": {
+          "state": "running",
+          "role": "replica",
+          "timeline": 2,
+          "xlog": {
+            "received_location": 83886296,
+            "replayed_location": 83886296,
+            "replayed_timestamp": null,
+            "paused": false
+          },
+          "dcs_last_seen": 1789395725,
+          "patroni": {
+            "version": "4.1.0",
+            "scope": "guac-ha-patroni-20260915",
+            "name": "guac-ha-patroni-20260915-p1"
+          }
+        }
+      },
+      {
+        "seconds": 29.93,
+        "state": {
+          "state": "running",
+          "role": "replica",
+          "timeline": 2,
+          "xlog": {
+            "received_location": 83886296,
+            "replayed_location": 83886296,
+            "replayed_timestamp": null,
+            "paused": false
+          },
+          "dcs_last_seen": 1789395725,
+          "patroni": {
+            "version": "4.1.0",
+            "scope": "guac-ha-patroni-20260915",
+            "name": "guac-ha-patroni-20260915-p1"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "test": "cleanup",
+    "utc": "2026-09-14T14:22:15.065252+00:00",
+    "containers": "",
+    "networks": ""
+  }
+]

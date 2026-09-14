@@ -49,6 +49,21 @@ func TestGatherParsesOSReleaseAndProbes(t *testing.T) {
 	}
 }
 
+func TestGatherProgressCountsActualChecksIncludingFailures(t *testing.T) {
+	p := goodProbes(t)
+	checks := 0
+	p.Dial = func(context.Context, string) error { checks++; return errors.New("offline fixture") }
+	p.Progress = func(_ string, completed, total int) {
+		if completed != checks || total != len(setupEndpoints) {
+			t.Fatalf("reported %d/%d after %d actual checks", completed, total, checks)
+		}
+	}
+	f, err := p.Gather(context.Background())
+	if err != nil || len(f.Unreachable) != checks || checks != len(setupEndpoints) {
+		t.Fatal("failed checks were hidden")
+	}
+}
+
 func TestPreflightRejections(t *testing.T) {
 	base := func() *Facts {
 		return &Facts{OSID: "rocky", VersionID: "10.0", Root: true, KernelNetfilterOK: true}

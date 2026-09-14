@@ -77,12 +77,25 @@ type Manager struct {
 	// ReadSecret reads one hidden line; injectable for tests. Set by the
 	// UI layer in real runs.
 	ReadSecret func(prompt string) (string, error)
+	Protect    func(string) // register values with the caller's in-memory redactor
 
 	// Run executes systemd-creds for the encrypted modes; injectable for
 	// tests. Defaults to ExecRunner.
 	Run Runner
 
 	values map[string]string // session cache; never serialised
+}
+
+// Remember keeps an accepted value for this process only. It does not write
+// to the environment, the state file, or a credential file.
+func (m *Manager) Remember(s Spec, value string) {
+	if m.values == nil {
+		m.values = map[string]string{}
+	}
+	if m.Protect != nil {
+		m.Protect(value)
+	}
+	m.values[s.Name] = value
 }
 
 // ErrUnattendedPrompt means prompt mode was asked for a value without a
@@ -159,6 +172,9 @@ func (m *Manager) Get(s Spec) (string, error) {
 	}
 	if m.values == nil {
 		m.values = map[string]string{}
+	}
+	if m.Protect != nil {
+		m.Protect(v)
 	}
 	m.values[s.Name] = v
 	return v, nil

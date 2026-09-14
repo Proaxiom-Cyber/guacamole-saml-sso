@@ -864,7 +864,7 @@ func TestWritesToAFreshServicePrincipalWaitOutReplication(t *testing.T) {
 	ReplicationWait, replicationPoll = time.Second, time.Millisecond
 	defer func() { ReplicationWait, replicationPoll = old, oldPoll }()
 
-	notFound, groups := 0, 0
+	notFound, readNotFound, groups := 0, 0, 0
 	f := &fake{t: t, routes: map[string]func(*testing.T, *http.Request) *http.Response{
 		"GET /v1.0/applications": func(t *testing.T, r *http.Request) *http.Response {
 			return jsonResp(200, map[string]any{"value": []any{}})
@@ -902,6 +902,10 @@ func TestWritesToAFreshServicePrincipalWaitOutReplication(t *testing.T) {
 			return jsonResp(201, map[string]any{})
 		},
 		"GET /v1.0/servicePrincipals/sp-1/appRoleAssignedTo": func(t *testing.T, r *http.Request) *http.Response {
+			if readNotFound < 2 {
+				readNotFound++
+				return graphErr(404, "Request_ResourceNotFound", "new service principal not replicated")
+			}
 			return jsonResp(200, map[string]any{"value": []any{}})
 		},
 	}}
@@ -915,7 +919,7 @@ func TestWritesToAFreshServicePrincipalWaitOutReplication(t *testing.T) {
 	if _, err := c.Apply(context.Background(), p); err != nil {
 		t.Fatalf("a replication delay on a write must not fail the deployment: %v", err)
 	}
-	if notFound != 2 {
+	if notFound != 2 || readNotFound != 2 {
 		t.Fatalf("the test did not exercise the delay: %d refusals", notFound)
 	}
 }
@@ -961,5 +965,17 @@ func TestWritesToAnExistingServicePrincipalAreNotRetried(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the call was retried instead of failing at once")
+	}
+}
+
+func TestAssignmentReadDoesNotRetryMissingPreExistingPrincipal(t *testing.T) {
+	calls := 0
+	c := &Client{Token: func(context.Context) (string, error) { return "fixture", nil }, Do: func(*http.Request) (*http.Response, error) {
+		calls++
+		return graphErr(404, "Request_ResourceNotFound", "missing existing principal"), nil
+	}}
+	_, err := c.assignedPrincipals(context.Background(), "existing", false)
+	if err == nil || calls != 1 {
+		t.Fatalf("missing pre-existing principal was retried: %v (%d requests)", err, calls)
 	}
 }
