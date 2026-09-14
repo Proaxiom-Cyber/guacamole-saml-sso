@@ -560,7 +560,7 @@ func (c *Client) Apply(ctx context.Context, plan *Plan) (*Result, error) {
 	}
 
 	// Groups, then their assignment to the application.
-	assigned, err := c.assignedPrincipals(ctx, sp.ObjectID)
+	assigned, err := c.assignedPrincipals(ctx, sp.ObjectID, res.App.CreatedSP)
 	if err != nil {
 		return nil, err
 	}
@@ -639,8 +639,12 @@ func appPatchBody(changes []FieldChange) map[string]any {
 // service principal.
 // ponytail: reads one page (Graph default 100); paginate if a tenant ever
 // assigns more than 100 principals to this application.
-func (c *Client) assignedPrincipals(ctx context.Context, spID string) (map[string]bool, error) {
-	out, err := c.call(ctx, http.MethodGet, "/servicePrincipals/"+spID+"/appRoleAssignedTo", nil)
+func (c *Client) assignedPrincipals(ctx context.Context, spID string, fresh bool) (map[string]bool, error) {
+	request := c.call
+	if fresh {
+		request = c.callFresh
+	}
+	out, err := request(ctx, http.MethodGet, "/servicePrincipals/"+spID+"/appRoleAssignedTo", nil)
 	if err != nil {
 		return nil, err
 	}
