@@ -55,6 +55,14 @@ TCP 443 to `mirrors.rockylinux.org`, `download.docker.com`, and
 command runs Podman, and hosts with an existing installation are rejected
 with an explanation. Nothing is adopted or overwritten.
 
+Some Rocky cloud images lack the kernel modules Docker needs. Setup offers to
+install `kernel`, `kernel-modules`, and `kernel-modules-extra` before it requests
+credentials. It asks for approval, or requires `--install-dependencies` in an
+unattended run. If the next boot kernel has the modules but the running kernel
+does not, setup stops and saves progress. Run `sudo reboot`, reconnect, then run
+`sudo guacdeploy` and choose Resume. Setup checks again before it continues.
+Kernel packages remain with the host during teardown.
+
 If Docker is missing, setup offers to install it from Docker's RHEL repository,
 then enable and start its service. If Docker exists but Compose is unavailable,
 setup offers to install only `docker-compose-plugin`. This leaves the existing

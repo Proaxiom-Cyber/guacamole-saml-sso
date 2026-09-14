@@ -54,8 +54,8 @@ type Phase struct {
 }
 
 // Phases builds the ordered registry for one session. Later tickets append
-// their phases (stack, integrations) here. Credential-storage choices come
-// before host mutations, matching the installation flow.
+// their phases (stack, integrations) here. Host checks can offer kernel repair
+// before credentials are requested. Other dependencies follow credential choices.
 func Phases(opts *Options) []Phase {
 	return []Phase{
 		{Name: "initialise-deployment", Run: initialiseDeployment},
@@ -511,11 +511,42 @@ func (o *Options) hostPreflight(ctx context.Context, st *state.State, u *ui.UI) 
 	if err != nil {
 		return err
 	}
-	if err := host.Preflight(f); err != nil {
-		return err
-	}
 	if st.Config == nil {
 		st.Config = map[string]string{}
+	}
+	check := host.Preflight(f)
+	if errors.Is(check, host.ErrKernelModulesMissing) {
+		u.Say("Docker needs kernel modules missing from this cloud image.")
+		u.Say("Plan: install kernel, kernel-modules and kernel-modules-extra. Setup will stop if a reboot is required.")
+		u.Say("Kernel packages belong to the host and remain installed during teardown.")
+		if u.Interactive {
+			ok, err := u.Confirm("Install the required kernel packages now?")
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return errors.New("kernel package installation declined; setup cannot continue without the required modules")
+			}
+		} else if !o.InstallDependencies {
+			return fmt.Errorf("%w: missing kernel packages need approval; pass --install-dependencies to consent", ErrApprovalRequired)
+		}
+		if err := o.probes().InstallKernelSupport(ctx); err != nil {
+			return err
+		}
+		// Record host maintenance without claiming ownership of the kernel.
+		// Removing a running or shared kernel is not deployment teardown.
+		st.Config["host-kernel-packages"] = "kernel kernel-modules kernel-modules-extra"
+		f, err = o.probes().Gather(ctx)
+		if err != nil {
+			return err
+		}
+		check = host.Preflight(f)
+		if errors.Is(check, host.ErrKernelModulesMissing) {
+			return errors.New("kernel packages installed, but xt_addrtype is unavailable for both the running kernel and the next boot kernel; check the package and boot configuration before resuming")
+		}
+	}
+	if check != nil {
+		return check
 	}
 	st.Config["os"] = f.OSID + " " + f.VersionID
 	u.Say("Host checks passed: %s, root privileges, no existing installation, required endpoints reachable.", st.Config["os"])
