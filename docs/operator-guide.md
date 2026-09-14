@@ -315,10 +315,31 @@ credential values. Do not edit it by hand.
 Setup provisions the Entra application, service principal and the two
 groups that carry sign-in, then restarts Guacamole with SAML enabled.
 
-Supply a Microsoft Graph token in `GUACDEPLOY_GRAPH_TOKEN` before this
-phase runs. The token needs Application.ReadWrite.All,
-Group.ReadWrite.All, AppRoleAssignment.ReadWrite.All and
-Organization.Read.All. The token is never written to state or logs.
+Guided setup asks for the Microsoft tenant ID or a verified domain, then shows
+a Microsoft sign-in URL and a short code. Open the URL on your computer or phone,
+enter the code, and sign in with an administrator account for that tenant.
+Review and approve the requested permissions in Microsoft's browser flow.
+Setup continues after sign-in. It does not require Azure CLI or PowerShell.
+
+The default sign-in application is Microsoft Graph Command Line Tools
+(`14d82eec-204b-4c2f-b7e8-296a70dab67e`). Set the non-secret
+`GUACDEPLOY_ENTRA_CLIENT_ID` to use your own public client with device-code
+authentication enabled. `GUACDEPLOY_ENTRA_TENANT_ID` supplies a tenant without
+the initial prompt. A recorded deployment tenant takes precedence on resume.
+
+Sign-in requests Application.ReadWrite.All, Group.ReadWrite.All,
+AppRoleAssignment.ReadWrite.All and Organization.Read.All. Access and refresh
+tokens stay in process memory. Setup stores only the tenant identifiers.
+If sign-in fails or expires, choose Retry for a new code, or Quit to keep progress.
+Resume asks you to sign in again and refuses a different tenant before it makes
+Entra changes. Tenant consent and sign-in policies still apply.
+
+Unattended setup continues to accept a Microsoft Graph token through
+`GUACDEPLOY_GRAPH_TOKEN`. An explicitly supplied token takes precedence over
+the guided sign-in flow. Setup never writes the token to state or logs.
+
+The flow uses Microsoft's [Azure Identity SDK](https://pkg.go.dev/github.com/Azure/azure-sdk-for-go/sdk/azidentity#DeviceCodeCredential)
+and [device authorization protocol](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-device-code).
 
 Setup checks what the token can actually do before it creates anything.
 It records what it intends to create before creating it. If a creation

@@ -664,7 +664,10 @@ type Options struct {
 	Host               *host.Probes
 	StackRun           stack.Runner    // injectable for tests
 	StackRunOut        stack.OutRunner // injectable for tests
-	Entra              *entra.Client   // injectable for tests; nil builds one from the environment token
+	Entra              *entra.Client   // injectable; nil selects environment input or guided device-code sign-in
+	EntraTenant        string
+	EntraClientID      string
+	EntraDeviceToken   func(entra.DeviceCodeOptions) (entra.TokenSource, error) // test seam
 	Cloudflare         *cloudflare.Client
 	Zone               string // explicit Cloudflare zone name
 	ACMEContact        string // optional operator address for the ACME account
@@ -941,8 +944,17 @@ func Status(dir string, u *ui.UI) error {
 // duplicate. A pre-existing application is never changed without
 // interactive approval.
 func (o *Options) entraSignin(ctx context.Context, st *state.State, u *ui.UI) error {
+	o.UI = u
+	if (o.Entra == nil || o.Entra.Token == nil) && os.Getenv(entra.DefaultTokenEnv) == "" && u.Interactive {
+		if err := o.selectEntraTenant(st, u); err != nil {
+			return err
+		}
+	}
 	c, err := o.entraClient()
 	if err != nil {
+		return err
+	}
+	if _, err := c.Token(ctx); err != nil {
 		return err
 	}
 
@@ -970,6 +982,15 @@ func (o *Options) entraSignin(ctx context.Context, st *state.State, u *ui.UI) er
 	if !pf.ClaimsChecked {
 		u.Say("Entra token permissions could not be checked in advance (opaque token); the first change is the proof.")
 	}
+	tenant, err := c.Tenant(ctx)
+	if err != nil {
+		return fmt.Errorf("checking the Microsoft tenant failed: %w", err)
+	}
+	if prior := st.Config["entra-tenant-id"]; prior != "" && !strings.EqualFold(prior, tenant) {
+		return errors.New("the Microsoft sign-in belongs to a different tenant than this deployment; sign in to the original tenant and resume")
+	}
+	st.Config["entra-tenant-id"] = tenant
+	u.Say("Microsoft Graph access checked for tenant %s.", tenant)
 
 	plan, err := c.Plan(ctx, cfg)
 	if err != nil {
@@ -1112,14 +1133,21 @@ func (o *Options) entraSignin(ctx context.Context, st *state.State, u *ui.UI) er
 
 // entraClient builds the Graph client, or explains what is missing.
 func (o *Options) entraClient() (*entra.Client, error) {
-	if o.Entra != nil {
+	if o.Entra != nil && o.Entra.Token != nil {
 		return o.Entra, nil
 	}
 	if os.Getenv(entra.DefaultTokenEnv) == "" {
+		if o.UI != nil && o.UI.Interactive {
+			return o.guidedEntraClient()
+		}
 		return nil, fmt.Errorf("Entra sign-in needs a Microsoft Graph token: set %s and resume. Required permissions: %s",
 			entra.DefaultTokenEnv, strings.Join(entra.RequiredPermissions, ", "))
 	}
-	return &entra.Client{Token: entra.StaticTokenFromEnv(entra.DefaultTokenEnv)}, nil
+	c := &entra.Client{Token: entra.StaticTokenFromEnv(entra.DefaultTokenEnv)}
+	if o.Entra != nil {
+		c.Do = o.Entra.Do
+	}
+	return c, nil
 }
 
 // lastAttemptUncertain reports whether the most recent attempt at an intent
