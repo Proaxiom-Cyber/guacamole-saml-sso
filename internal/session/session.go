@@ -293,7 +293,8 @@ func (o *Options) stackUp(ctx context.Context, st *state.State, u *ui.UI) error 
 		return err
 	}
 	cfg := o.stackConfig(st)
-	u.Say("Starting the Guacamole stack (guacd, PostgreSQL, Guacamole, nginx) and waiting for container health.")
+	cfg.InitializeDatabase = true
+	u.Say("Checking the database schema before starting the Guacamole stack (guacd, PostgreSQL, Guacamole, nginx) and waiting for container health.")
 	if err := stack.Up(ctx, o.stackRun(), cfg, password, token); err != nil {
 		return err
 	}

@@ -104,6 +104,23 @@ validated before use. nginx serves HTTPS with a temporary self-signed
 certificate until the origin certificate is issued. Setup checks container
 health and then checks that Guacamole answers through nginx.
 
+Setup starts PostgreSQL first and waits for an authenticated TCP connection.
+It then checks the database against the generated schema. During unfinished
+setup, an empty database receives the schema and authorization groups in one
+transaction. An interrupted or failed import rolls back. Resume can retry it.
+Guacamole starts only after the database check succeeds.
+
+A complete database keeps its data and groups. A partial schema stops setup
+for review. Setup does not delete the database directory or overwrite a partial
+import. After setup completes, the boot command checks the schema but cannot
+initialize a replacement database if application data is missing.
+
+This recovery also covers earlier installer versions that created the PostgreSQL
+data directory without importing the Guacamole tables. Install the current release
+and choose **Resume**. No manual SQL import is needed when the database is empty.
+The first-start scripts no longer control initialization. Public schema files are
+mounted at `/opt/guacdeploy-init` inside the PostgreSQL container.
+
 Unattended runs supply `--hostname`, `--admin-group`, and
 `--operator-group`. No credential is given to a container as an environment
 variable. Docker keeps a container's environment in its own metadata on disk

@@ -77,6 +77,9 @@ type Config struct {
 	// Tests point it at a temporary directory; real runs leave it empty and
 	// take DefaultRuntimeSecretsDir.
 	RuntimeSecretsDir string
+	// Only the unfinished setup phase may initialize an empty database.
+	// Reboots and later restarts must never replace missing application data.
+	InitializeDatabase bool
 }
 
 func (c *Config) defaults() {
@@ -166,9 +169,14 @@ func Render(cfg Config) error {
 		".env":         {env, 0o600},
 		"nginx/templates/guacamole.conf.template": {nginxTemplate, 0o644},
 		"init/002-groups.sh":                      {groupsScript, 0o755},
+		"init/002-groups.sql":                     {groupsSQL, 0o644},
 	}
 	for name, f := range files {
-		if err := os.WriteFile(filepath.Join(cfg.InstallDir, name), []byte(f.content), f.mode); err != nil {
+		path := filepath.Join(cfg.InstallDir, name)
+		if err := os.WriteFile(path, []byte(f.content), f.mode); err != nil {
+			return err
+		}
+		if err := os.Chmod(path, f.mode); err != nil {
 			return err
 		}
 	}
@@ -225,8 +233,8 @@ func GenerateSchema(ctx context.Context, run OutRunner, cfg Config) error {
 	// output. Re-check the shape before trusting the cache, otherwise the
 	// corrupt file is never repaired.
 	if b, err := os.ReadFile(schemaPath); err == nil && strings.Contains(string(b), marker) {
-		if looksLikeSQL(string(b)) == nil {
-			return nil
+		if validateSchema(string(b)) == nil {
+			return os.Chmod(schemaPath, 0o644)
 		}
 	}
 	out, errOut, err := run(ctx, "docker", "run", "--rm", "guacamole/guacamole:"+GuacVersion,
@@ -234,16 +242,30 @@ func GenerateSchema(ctx context.Context, run OutRunner, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("database schema generation failed: %v\n%s", err, tail(errOut))
 	}
-	if err := looksLikeSQL(out); err != nil {
+	if err := validateSchema(out); err != nil {
 		return err
 	}
-	for _, want := range []string{"CREATE TABLE guacamole_entity", "CREATE TABLE guacamole_user_group"} {
-		if !strings.Contains(out, want) {
-			return fmt.Errorf("the generated SQL does not contain %q; refusing to publish it", want)
-		}
+	// Publish only complete SQL. A failed write leaves the previous schema intact.
+	file, err := os.CreateTemp(filepath.Dir(schemaPath), ".schema-*")
+	if err != nil {
+		return err
 	}
-	// PostgreSQL's container user reads this public schema.
-	return os.WriteFile(schemaPath, []byte(out+"\n"+marker+"\n"), 0o644)
+	tmp := file.Name()
+	defer os.Remove(tmp)
+	if _, err = file.WriteString(out + "\n" + marker + "\n"); err == nil {
+		err = file.Chmod(0o644)
+	}
+	if err == nil {
+		err = file.Sync()
+	}
+	closeErr := file.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Rename(tmp, schemaPath)
 }
 
 func (c Config) composeArgs(rest ...string) []string {
@@ -261,8 +283,15 @@ func (c Config) composeArgs(rest ...string) []string {
 // secrets.go, and CheckDelivery for the check that proves it.
 func Up(ctx context.Context, run Runner, cfg Config, password, tunnelToken string) error {
 	cfg.defaults()
+	bootstrap, err := databaseBootstrap(cfg)
+	if err != nil {
+		return err
+	}
 	fresh, err := writeRuntimeSecrets(cfg, password, tunnelToken)
 	if err != nil {
+		return err
+	}
+	if err := startDatabase(ctx, run, cfg, fresh, bootstrap); err != nil {
 		return err
 	}
 	args := []string{"up", "--detach", "--wait", "--wait-timeout", "180"}

@@ -512,6 +512,8 @@ func stackRunner(calls *[]stackCall) stack.Runner {
 		*calls = append(*calls, stackCall{stdin: stdin, args: append([]string{name}, args...)})
 		joined := strings.Join(args, " ")
 		switch {
+		case strings.Contains(joined, "guacdeploy-database"):
+			return "GUACDEPLOY_DATABASE_READY", nil
 		case strings.Contains(joined, "initdb.sh"):
 			return "CREATE TABLE guacamole_entity (x int);\nCREATE TABLE guacamole_user_group (y int);\n", nil
 		case strings.Contains(joined, "ps"):

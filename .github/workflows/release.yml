@@ -27,6 +27,12 @@ jobs:
           PATH=/usr/bin:/bin:/usr/sbin:/sbin bash tests/launcher_test.sh
           python3 tests/launcher_interactive_test.py
 
+      - name: Test database recovery and a fresh container stack
+        run: |
+          go test -c -o "$RUNNER_TEMP/stack-integration.test" ./internal/stack
+          sudo env GUACDEPLOY_TEST_DOCKER=1 "$RUNNER_TEMP/stack-integration.test" \
+            -test.run='Test(Database|FullStack)Integration' -test.v -test.timeout=12m
+
       - name: Build guacdeploy for linux/amd64
         env:
           CGO_ENABLED: "0"
