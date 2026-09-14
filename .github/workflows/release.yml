@@ -71,7 +71,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          release_options=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            release_options+=(--prerelease --latest=false)
+          fi
           gh release create "$GITHUB_REF_NAME" dist/* \
+            "${release_options[@]}" \
             --verify-tag \
             --title "guacdeploy $GITHUB_REF_NAME" \
             --notes "Install with the verified launcher: see docs/release-and-verification.md. Verification is mandatory; do not run the binary without it."

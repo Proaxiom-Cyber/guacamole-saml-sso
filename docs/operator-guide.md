@@ -332,13 +332,16 @@ credential values. Do not edit it by hand.
 Setup provisions the Entra application, service principal and the two
 groups that carry sign-in, then restarts Guacamole with SAML enabled.
 
-Guided setup asks for the Microsoft tenant ID or a verified domain, then shows
-a Microsoft sign-in URL and a short code. Open the URL on your computer or phone,
+Guided setup asks for the Microsoft tenant ID or a verified domain, then offers
+device-code sign-in or a browser with a pasted access token.
+
+For device-code sign-in, setup shows a Microsoft sign-in URL and a short code.
+Open the URL on your computer or phone,
 enter the code, and sign in with an administrator account for that tenant.
 Review and approve the requested permissions in Microsoft's browser flow.
 Setup continues after sign-in. It does not require Azure CLI or PowerShell.
 
-The default sign-in application is Microsoft Graph Command Line Tools
+The default device-code application is Microsoft Graph Command Line Tools
 (`14d82eec-204b-4c2f-b7e8-296a70dab67e`). Set the non-secret
 `GUACDEPLOY_ENTRA_CLIENT_ID` to use your own public client with device-code
 authentication enabled. `GUACDEPLOY_ENTRA_TENANT_ID` supplies a tenant without
@@ -347,9 +350,41 @@ the initial prompt. A recorded deployment tenant takes precedence on resume.
 Sign-in requests Application.ReadWrite.All, Group.ReadWrite.All,
 AppRoleAssignment.ReadWrite.All and Organization.Read.All. Access and refresh
 tokens stay in process memory. Setup stores only the tenant identifiers.
-If sign-in fails or expires, choose Retry for a new code, or Quit to keep progress.
+If device-code sign-in fails, choose Retry, switch to the browser option, or Quit.
 Resume asks you to sign in again and refuses a different tenant before it makes
 Entra changes. Tenant consent and sign-in policies still apply.
+
+### Browser fallback when device codes are blocked
+
+Choose **Browser: Graph Explorer, then paste an access token**. The wizard keeps
+each instruction on screen until you choose Continue.
+
+1. Open [Microsoft Graph Explorer](https://developer.microsoft.com/graph/graph-explorer)
+   on your computer. Sign in as an administrator and select the deployment's tenant.
+2. Under your profile, choose **Consent to permissions**. Grant these delegated
+   permissions: `Application.ReadWrite.All`, `Group.ReadWrite.All`,
+   `AppRoleAssignment.ReadWrite.All`, and `Organization.Read.All`.
+3. Open the **Access token** tab and copy the token.
+4. In the installer, choose Continue and paste the token at the hidden prompt.
+
+This fallback requires one manual paste. It does not require an SSH tunnel,
+local callback, Azure CLI, or an environment variable. The installer holds the token
+in memory. It does not save the token in files, deployment state, or logs.
+
+Before continuing, the installer checks application reads, available permission
+claims, and the tenant's ID or verified domain through Microsoft Graph. A rejected
+token returns to the hidden prompt. A token that will expire shortly requires a
+fresh copy. Leave the prompt empty to stop and keep deployment progress.
+
+Graph Explorer sign-in and consent must be allowed by the customer's policies.
+Policies can also restrict use of its token from the server. This fallback does not
+disable those policies. For opaque tokens, Graph does not expose permission claims
+or expiry to the installer. A later rejection can require a fresh token on resume;
+the installer does not replay a failed creation request automatically.
+
+Microsoft documents [Graph Explorer consent and the Access token tab](https://learn.microsoft.com/en-us/graph/graph-explorer/graph-explorer-features).
+
+### Unattended sign-in
 
 Unattended setup continues to accept a Microsoft Graph token through
 `GUACDEPLOY_GRAPH_TOKEN`. An explicitly supplied token takes precedence over

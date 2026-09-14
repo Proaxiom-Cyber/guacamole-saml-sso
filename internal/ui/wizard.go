@@ -600,7 +600,9 @@ func (w *Wizard) readLine(prompt, def string, hidden bool) (string, error) {
 	for {
 		shown := string(buf)
 		if hidden {
-			shown = strings.Repeat("*", len(buf))
+			// Graph access tokens can contain thousands of characters. Keep
+			// masked feedback on one line instead of pushing the prompt away.
+			shown = strings.Repeat("*", min(len(buf), 32))
 		}
 		lines := []string{prompt}
 		if def != "" {

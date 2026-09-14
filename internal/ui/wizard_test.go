@@ -530,6 +530,22 @@ func TestHiddenLineIsNeverEchoed(t *testing.T) {
 	}
 }
 
+func TestLongAccessTokenStaysHiddenAndDoesNotExpandThePrompt(t *testing.T) {
+	token := strings.Repeat("fixture-token-", 500)
+	u, out, _ := newTestUI(token + "\r")
+	got, err := u.HiddenLine("Graph access token")
+	if err != nil || got != token {
+		t.Fatal("long token was not read intact")
+	}
+	u.RestoreTerminal()
+	if strings.Contains(out.String(), "fixture-token-") {
+		t.Fatal("token reached the screen or transcript")
+	}
+	if strings.Contains(out.String(), strings.Repeat("*", 33)) {
+		t.Fatal("masked token expanded beyond one line")
+	}
+}
+
 func TestRestoreTerminalRunsOnceAndReplaysTheSession(t *testing.T) {
 	u, out, restores := newTestUI("")
 	u.Say("Deployment 01 initialised on rocky10.")

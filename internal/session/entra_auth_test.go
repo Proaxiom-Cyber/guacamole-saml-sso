@@ -30,7 +30,7 @@ func TestGuidedEntraClientDoesNotRequireExternalToken(t *testing.T) {
 func TestGuidedEntraResumeAuthenticatesBeforePlanning(t *testing.T) {
 	t.Setenv(entra.DefaultTokenEnv, "")
 	dir := t.TempDir()
-	u, out := testUI(true, "r\n\n")
+	u, out := testUI(true, "r\n\nd\n")
 	now := time.Now().UTC()
 	st := &state.State{DeploymentID: "existing-deployment", Config: map[string]string{"guac-hostname": "guac.demo-customer.com.au", "cloudflare-zone-name": "demo-customer.com.au", "admin-group": "Guacamole Administrators", "operator-group": "Guacamole Operators"}, Actions: []state.Action{{ID: state.NewID(), Intent: "stack-up", StartedAt: now, FinishedAt: &now, Result: state.ResultOK}, {ID: state.NewID(), Intent: "entra-signin", StartedAt: now, FinishedAt: &now, Result: state.ResultFailed}}}
 	seed(t, dir, st)
@@ -96,7 +96,7 @@ func TestGuidedEntraRetryAndQuit(t *testing.T) {
 			if retry {
 				input = "r\n"
 			}
-			u, _ := testUI(true, input)
+			u, _ := testUI(true, "d\n"+input)
 			attempts := 0
 			o := Options{UI: u, EntraDeviceToken: func(entra.DeviceCodeOptions) (entra.TokenSource, error) {
 				attempts++
@@ -141,5 +141,102 @@ func TestEntraResumeRefusesDifferentTenantBeforeMutation(t *testing.T) {
 	}
 	if st.Config["entra-tenant-id"] != "original-tenant" {
 		t.Fatal("saved tenant changed")
+	}
+}
+
+func TestBrowserEntraTokenCorrectsInputAndCachesOnlyInMemory(t *testing.T) {
+	for _, method := range []string{"b\n", "d\nb\n"} {
+		t.Run(strings.TrimSpace(method), func(t *testing.T) {
+			t.Setenv(entra.DefaultTokenEnv, "")
+			u, out := testUI(true, method+"c\nc\n")
+			const accepted = "opaque-accepted-fixture"
+			inputs := []string{"rejected-fixture", "wrong-tenant-fixture", "Bearer " + accepted}
+			prompts, deviceCalls, checks := 0, 0, 0
+			u.Secret = func(prompt string) (string, error) {
+				if prompts >= len(inputs) {
+					t.Fatal("cached token prompted again")
+				}
+				v := inputs[prompts]
+				prompts++
+				return v, nil
+			}
+			o := Options{UI: u, EntraTenant: "customer.example", EntraDeviceToken: func(entra.DeviceCodeOptions) (entra.TokenSource, error) {
+				deviceCalls++
+				return func(context.Context) (string, error) {
+					return "", errors.New("Microsoft sign-in blocked by tenant policy")
+				}, nil
+			}, Entra: &entra.Client{Do: func(r *http.Request) (*http.Response, error) {
+				if r.Method != "GET" {
+					t.Fatal("validation made a mutation")
+				}
+				checks++
+				token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+				status, body := 200, `{"value":[]}`
+				if token == "rejected-fixture" {
+					status, body = 401, `{"error":{"message":"rejected-fixture"}}`
+				} else if r.URL.Path == "/v1.0/organization" {
+					domain := "customer.example"
+					if token == "wrong-tenant-fixture" {
+						domain = "other.example"
+					}
+					body = `{"value":[{"id":"tenant-fixture","verifiedDomains":[{"name":"` + domain + `"}]}]}`
+				}
+				return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+			}}}
+			client, err := o.entraClient()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < 3; i++ {
+				token, err := client.Token(context.Background())
+				if err != nil || token != accepted {
+					t.Fatalf("browser sign-in failed: %v", err)
+				}
+			}
+			if prompts != 3 || checks != 5 {
+				t.Fatalf("unexpected prompts or Graph checks: %d, %d", prompts, checks)
+			}
+			if (method == "b\n" && deviceCalls != 0) || (method != "b\n" && deviceCalls != 1) {
+				t.Fatal("wrong device-code behavior")
+			}
+			for _, token := range inputs {
+				if strings.Contains(out.String(), token) {
+					t.Fatal("token leaked to output")
+				}
+			}
+			if strings.Contains(out.String(), accepted) || os.Getenv(entra.DefaultTokenEnv) != "" {
+				t.Fatal("token leaked to output or environment")
+			}
+			if !strings.Contains(out.String(), "different tenant") || !strings.Contains(out.String(), "graph/graph-explorer") {
+				t.Fatal("missing correction or browser instructions")
+			}
+		})
+	}
+}
+
+func TestBrowserEntraBlankOrCancelledInputStops(t *testing.T) {
+	for _, cancel := range []bool{false, true} {
+		u, _ := testUI(true, "b\nc\nc\n")
+		u.Secret = func(string) (string, error) {
+			if cancel {
+				return "", context.Canceled
+			}
+			return "", nil
+		}
+		o := Options{UI: u, EntraTenant: "customer.example"}
+		c, err := o.guidedEntraClient()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.Token(context.Background())
+		if err == nil {
+			t.Fatal("empty input accepted")
+		}
+		if cancel && !errors.Is(err, context.Canceled) {
+			t.Fatal("cancel not preserved")
+		}
+		if !cancel && !strings.Contains(err.Error(), "progress is retained") {
+			t.Fatal("blank input did not stop directly")
+		}
 	}
 }
