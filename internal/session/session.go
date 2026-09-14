@@ -523,7 +523,9 @@ func (o *Options) probes() *host.Probes {
 }
 
 func (o *Options) hostPreflight(ctx context.Context, st *state.State, u *ui.UI) error {
-	f, err := o.probes().Gather(ctx)
+	probes := *o.probes()
+	probes.Progress = u.TaskProgress
+	f, err := probes.Gather(ctx)
 	if err != nil {
 		return err
 	}
@@ -552,7 +554,7 @@ func (o *Options) hostPreflight(ctx context.Context, st *state.State, u *ui.UI) 
 		// Record host maintenance without claiming ownership of the kernel.
 		// Removing a running or shared kernel is not deployment teardown.
 		st.Config["host-kernel-packages"] = "kernel kernel-modules kernel-modules-extra"
-		f, err = o.probes().Gather(ctx)
+		f, err = probes.Gather(ctx)
 		if err != nil {
 			return err
 		}

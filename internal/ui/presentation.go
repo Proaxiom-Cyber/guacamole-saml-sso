@@ -111,22 +111,14 @@ func (w *Wizard) frame(prompt []string) []string {
 	}
 	bar := strings.Repeat(solid, fill) + strings.Repeat(empty, barWidth-fill)
 	progress := fmt.Sprintf("%s  %d / %d steps complete", bar, completed, total)
-	header := " GUACAMOLE / DEPLOY"
-	if w.details {
-		header += "   SESSION DETAILS"
-	} else {
-		header += "   GUIDED SETUP"
-	}
-	right := elapsed(w.started) + " elapsed "
-	header = pad(header, width-len(right)) + right
-	out := []string{header, "", fit("  "+progress, width), ""}
+	out := w.brandHeader(width, progress, w.state[active] == phaseRunning && len(prompt) == 0 && !w.details)
 	sidebar := w.cols >= 104 && w.rows >= 26 && !w.details
 	sideWidth := 0
 	if sidebar {
 		sideWidth = 29
 	}
 	contentWidth := width - sideWidth - 4
-	bodyHeight := w.rows - 8
+	bodyHeight := w.rows - len(out) - 4
 	var controls []string
 	if !w.details {
 		for i, l := range prompt {
@@ -183,6 +175,9 @@ func (w *Wizard) frame(prompt []string) []string {
 				spinner = []string{"|", "/", "-", "\\"}[w.tick%4]
 			}
 			activity = "WORKING " + spinner + "  " + elapsed(w.phaseStarted)
+			if w.rows >= 30 && width >= 79 {
+				activity = "WORKING  " + elapsed(w.phaseStarted)
+			}
 		}
 		if len(prompt) > 0 || len(controls) > 0 {
 			activity = "YOUR TURN"
@@ -202,6 +197,9 @@ func (w *Wizard) frame(prompt []string) []string {
 			body = append(body, p.Purpose)
 		}
 		body = append(body, "", activity, "")
+		if w.task.total > 0 && len(prompt) == 0 && len(controls) == 0 {
+			body = append(body, w.task.line(contentWidth), "")
+		}
 		if w.challenge != "" {
 			body = append(body, w.challenge, "")
 		}
@@ -321,20 +319,20 @@ func (w *Wizard) paint(line string) string {
 	if !w.colour {
 		return line
 	}
+	if painted, ok := w.paintBrand(line); ok {
+		return painted
+	}
 	if left, right, ok := strings.Cut(line, "│"); ok {
 		return w.paint(left) + "│" + w.paint(right)
 	}
 	reset := "\x1b[0m"
 	// Default terminal colours keep body text legible on light and dark themes.
-	if strings.HasPrefix(line, " GUACAMOLE") {
-		return "\x1b[1;97;44m" + line + reset
-	}
 	if strings.Contains(line, "NEEDS ATTENTION") || strings.Contains(line, phaseFailed) {
 		return "\x1b[1;31m" + line + reset
 	}
 	if strings.Contains(line, "YOUR TURN") || strings.Contains(line, "WAITING FOR MICROSOFT") {
 		prefix := line[:len(line)-len(strings.TrimLeft(line, " "))]
-		return prefix + "\x1b[1;97;44m" + strings.TrimLeft(line, " ") + reset
+		return prefix + brandInk(0, true) + "\x1b[1;97m" + strings.TrimLeft(line, " ") + reset
 	}
 	if strings.Contains(line, "> [") {
 		prefix := line[:len(line)-len(strings.TrimLeft(line, " "))]

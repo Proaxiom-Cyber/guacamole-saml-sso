@@ -18,12 +18,26 @@ func (u *UI) Preview(ctx context.Context) error {
 	u.PhaseStart("entra-signin")
 	u.Say("PREVIEW ONLY. Example deployment: guac.example.com. No resources will be created.")
 	for {
-		c, err := u.Choose("Connect Microsoft Entra\n\nMicrosoft sign-in authorizes setup. The host certificate authenticates the installer.\nThe recommended path does both, without copying a certificate or a token.", []Choice{{'d', "Connect with Microsoft: device code + host certificate"}, {'a', "Device code blocked: register the installer app yourself"}, {'e', "Preview a recoverable failure"}, {'q', "Close preview"}})
+		c, err := u.Choose("Connect Microsoft Entra\n\nMicrosoft sign-in authorizes setup. The host certificate authenticates the installer.\nThe recommended path does both, without copying a certificate or a token.", []Choice{{'d', "Connect with Microsoft: device code + host certificate"}, {'a', "Device code blocked: register the installer app yourself"}, {'p', "Preview task progress and logo animation"}, {'e', "Preview a recoverable failure"}, {'q', "Close preview"}})
 		if err != nil {
 			return err
 		}
 		if c == 'q' {
 			return nil
+		}
+		if c == 'p' {
+			u.PhaseStart("host-preflight")
+			for i := 0; i <= 3; i++ {
+				u.TaskProgress("PREVIEW: network checks completed", i, 3)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(time.Second):
+				}
+			}
+			u.PhaseDone("host-preflight")
+			u.PhaseStart("entra-signin")
+			continue
 		}
 		if c == 'e' {
 			u.PhaseFailed("entra-signin", fmt.Errorf("Microsoft sign-in was blocked by tenant policy. Use manual app registration to continue"))

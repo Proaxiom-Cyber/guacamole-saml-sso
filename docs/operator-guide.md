@@ -15,6 +15,9 @@ launcher verifies and which network destinations it uses.
 
 The full-screen wizard shows the current task, saved progress, and elapsed time.
 The progress bar counts completed steps. It does not estimate the time remaining.
+During work, large terminals animate the Proaxiom mark. It stops when setup asks a
+question. Network checks also show a task bar with the number of completed checks.
+The final check result reports failures separately.
 Wide terminals also show the surrounding deployment stages.
 
 - Use the arrow keys to move between actions. Press Enter to select an action.
@@ -503,7 +506,11 @@ The default device-code application is Microsoft Graph Command Line Tools
 (`14d82eec-204b-4c2f-b7e8-296a70dab67e`). Set the non-secret
 `GUACDEPLOY_ENTRA_CLIENT_ID` to use your own public client with device-code
 authentication enabled. `GUACDEPLOY_ENTRA_TENANT_ID` supplies a tenant without
-the initial prompt. A recorded deployment tenant takes precedence on resume.
+the initial prompt. A verified deployment tenant takes precedence on resume.
+An unverified saved choice appears in the prompt and can be corrected. The Microsoft
+tenant can differ from the Cloudflare DNS domain. For example, a Cloudflare zone of
+`slqaccess.qld.gov.au` can serve a deployment in the Microsoft tenant `slq.qld.gov.au`.
+Setup never uses the Cloudflare zone as the default Microsoft tenant.
 
 Sign-in requests Application.ReadWrite.All, Group.ReadWrite.All,
 AppRoleAssignment.ReadWrite.All and Organization.Read.All. Access and refresh

@@ -24,6 +24,7 @@ type Probes struct {
 	LookPath      func(file string) (string, error)
 	Run           func(ctx context.Context, name string, args ...string) (string, error)
 	Dial          func(ctx context.Context, hostport string) error
+	Progress      func(label string, completed, total int)
 }
 
 func (p *Probes) defaults() {
@@ -134,9 +135,15 @@ func (p *Probes) Gather(ctx context.Context) (*Facts, error) {
 		}
 	}
 
-	for _, ep := range setupEndpoints {
+	for i, ep := range setupEndpoints {
+		if p.Progress != nil {
+			p.Progress("Network checks: "+ep, i, len(setupEndpoints))
+		}
 		if err := p.Dial(ctx, ep); err != nil {
 			f.Unreachable = append(f.Unreachable, ep)
+		}
+		if p.Progress != nil {
+			p.Progress("Network checks completed", i+1, len(setupEndpoints))
 		}
 	}
 	return f, nil

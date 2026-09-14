@@ -8,6 +8,8 @@ Other commands keep their reports on the ordinary terminal screen.
 - `ui.go` provides prompts, phase events, explanations, and summaries.
 - `wizard.go` handles keyboard input, resizing, animation, and terminal restoration.
 - `presentation.go` lays out the current task, actions, stages, and details view.
+- `brand.go` adapts the Proaxiom submark and palette for terminal cells.
+- `task_progress.go` reports measured task counts without estimating duration.
 - `journal.go` records timestamped events and redacts credentials.
 - `preview.go` exercises the interface with labelled example data and no resources.
 
@@ -15,6 +17,10 @@ Phases use `PhaseList`, `PhaseStart`, `PhaseDone`, `PhaseSkipped`, and `PhaseFai
 Prompts use `Choose`, `Confirm`, `Line`, and `HiddenLine`. Do not write directly to
 stdout while the wizard runs. Each redraw writes one buffered frame under a lock.
 Later frames update changed lines; resizing clears and redraws the entire view.
+
+Use `TaskProgress(label, completed, total)` only when the operation knows the total.
+The label must explain what is counted. Network checks count attempts, not successes.
+The next phase clears the count. Invalid or unknown totals do not draw a bar.
 
 Use `Explain` for a short status with longer guidance in Details. Use `Transient`
 for a device sign-in challenge, then `ClearTransient` when authorization ends.

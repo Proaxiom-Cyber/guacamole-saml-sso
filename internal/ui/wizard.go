@@ -89,6 +89,7 @@ type Wizard struct {
 	scroll       int
 	tick         int
 	logPath      string
+	task         taskProgress
 
 	keys      chan keyEvent
 	waiting   bool
@@ -309,6 +310,7 @@ func (w *Wizard) setPhase(name, state string) {
 	}
 	w.state[name] = state
 	if state == phaseRunning || state == phaseFailed {
+		w.task = taskProgress{}
 		w.active = name
 		w.phaseStarted = time.Now()
 		w.scroll = 0
