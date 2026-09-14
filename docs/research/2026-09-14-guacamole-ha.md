@@ -89,8 +89,8 @@ failure tolerance. An etcd voter is a full consensus member, not a PostgreSQL re
 **Documented:** Patroni normally stops PostgreSQL after loss of its leader lock.
 Process failure or a paused VM can prevent that action. Its watchdog support adds
 host reset protection. Actual watchdog behavior and fencing need tests on the
-chosen platform. This local Docker exercise did not configure a watchdog, reset a
-host, or test Patroni.
+chosen platform. Neither local Docker exercise configured a watchdog or reset a host.
+The additional Patroni experiment appears later in this report.
 [Patroni watchdog](https://patroni.readthedocs.io/en/latest/watchdog.html)
 
 The data-loss policy needs an explicit choice:
@@ -251,7 +251,8 @@ The final run passed and exited with code 0. Its source is
 The token checks used database authentication to isolate token locality. They did
 not exercise SAML, NGINX, Cloudflare, or a remote desktop. The synchronous check
 used explicit cancellation after observing the wait. It did not measure timeout
-handling by a Guacamole client. No experiment ran a complete failover cluster.
+handling by a Guacamole client. These first checks did not run a failover manager.
+The additional experiment below uses Patroni and etcd.
 
 Production acceptance still requires these checks:
 
@@ -267,3 +268,56 @@ Production acceptance still requires these checks:
 
 No production recovery-time target, data-loss limit, or uninterrupted-session claim
 is established by these local checks.
+
+## Additional Patroni experiment: 15 September, Brisbane
+
+**Tested locally:** A second fixture used two PostgreSQL 18.6 nodes under Patroni
+4.1.0 and three etcd 3.6.0 members. All five containers used one internal Docker
+network. No ports were published. Trust authentication applied only to the fixture.
+No passwords, private keys, customer data, or cloud resources were needed.
+
+The fixture selected asynchronous replication: `synchronous_mode=false` and
+`synchronous_commit=on`, with no required synchronous standby. The latter setting
+alone does not require a remote copy. Patroni used `ttl=20`, `loop_wait=2`, and
+`retry_timeout=3`. DCS failsafe mode and watchdog support were off.
+The configuration uses Patroni's documented `bootstrap.dcs` and `etcd3` settings.
+[Patroni configuration](https://patroni.readthedocs.io/en/latest/yaml_configuration.html)
+
+| Check | Verified observation |
+| --- | --- |
+| Initial cluster | All three etcd endpoints passed their health check. One database was primary and one was a replica. |
+| Replication | The replica received the first committed row. |
+| Abrupt primary-container stop | `docker kill --signal KILL` stopped the primary container. Patroni promoted the other node without a manual promotion command. |
+| Promotion timing | The harness observed the new primary after 25.19 seconds. Its timeline changed from 1 to 2. |
+| Writes after promotion | The sole running data node accepted a second row. A query returned two rows. |
+| Restart of the stopped container | Its tmpfs data was empty. Patroni rebuilt it as a replica of the new primary. |
+| Loss of two etcd voters | After a 45-second sampling period, both databases reported replica status. The remaining etcd endpoint failed its health check. |
+| Writes without quorum | Both databases rejected inserts with a read-only transaction error. |
+| Former primary stopped without quorum | The surviving replica did not promote in 15 observations across a further 30 seconds. |
+
+The promotion timing is one observation on Docker Desktop/aarch64. It includes
+local polling and container-command overhead. It is not an application recovery-time
+guarantee. The test waited for the first row to replicate before stopping the
+primary. It does not establish a zero-loss guarantee for asynchronous replication.
+
+The restart test proves reconstruction from the surviving database into empty
+storage. It does not test rewind or reconciliation of a former primary's retained
+data. The fixture also did not exercise Guacamole database routing or connection
+pool recovery.
+
+Stopping a Docker container kills the database and its manager together. This does
+not reproduce a frozen host or a failed Patroni process with PostgreSQL still alive.
+The experiment provides no proof of watchdog fencing, protection from split brain,
+or availability across physical failure domains. It also does not test asymmetric
+network partitions or quorum restoration. These remain deployment acceptance work.
+
+The fixture source, Dockerfile, image identifiers, and structured observations are
+under [`patroni/`](evidence/2026-09-14-guacamole-ha/patroni/). The source generates
+the non-secret configuration. Local scratch files retain the container logs.
+
+The harness completed with exit code 0 at 00:22 Brisbane. Cleanup removed all five
+containers, their anonymous volumes, the fixture network, and both added image tags.
+The final container and network queries returned empty output. Both image inspections
+returned “No such image”. The exact commands and results appear in
+[`cleanup.json`](evidence/2026-09-14-guacamole-ha/patroni/cleanup.json).
+No shared Docker cache or pre-existing image was removed.
