@@ -381,8 +381,10 @@ and run this command on the workstation:
 ssh rocky@YOUR-SERVER 'sudo cat /var/lib/guacdeploy/credentials/entra-installer.cer' > guacdeploy-installer.cer
 ```
 
-If sudo requires a terminal for its password prompt, use `ssh -t` instead. This
-copies the public certificate only. In the app registration, select **Certificates
+This command needs passwordless sudo for the file read. If your host requires a
+sudo password, use an administrator shell to copy the public certificate into
+your user's home directory with read permissions, then retrieve it with your SSH
+file-transfer client. Transfer only the `.cer` file. In the app registration, select **Certificates
 & secrets > Certificates > Upload certificate**. Upload `guacdeploy-installer.cer`
 and select **Add**. Check its thumbprint against the wizard.
 
