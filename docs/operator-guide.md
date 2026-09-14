@@ -398,6 +398,7 @@ of the same flow.
 The host generates its private key inside the TPM. Setup registers the public
 certificate, creates an installer application, and grants its four listed Microsoft
 Graph application permissions. It then checks access through that installer identity.
+The task bar counts completed steps. It does not estimate time remaining.
 No certificate transfer or token copy is needed. Tenant sign-in and consent policies
 still apply.
 

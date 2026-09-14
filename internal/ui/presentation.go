@@ -336,7 +336,14 @@ func (w *Wizard) paint(line string) string {
 	}
 	if strings.Contains(line, "> [") {
 		prefix := line[:len(line)-len(strings.TrimLeft(line, " "))]
-		return prefix + "\x1b[1;7m" + strings.TrimLeft(line, " ") + reset
+		return prefix + brandInk(0, true) + "\x1b[1;97m" + strings.TrimLeft(line, " ") + reset
+	}
+	if strings.HasPrefix(strings.TrimSpace(line), "WORKING") {
+		prefix := line[:len(line)-len(strings.TrimLeft(line, " "))]
+		return prefix + brandInk(0, true) + "\x1b[1;97m" + strings.TrimLeft(line, " ") + reset
+	}
+	if strings.HasPrefix(strings.TrimSpace(line), "> ") {
+		return "\x1b[1;36m" + line + reset
 	}
 	if strings.Contains(line, "steps complete") {
 		return "\x1b[36m" + line + reset

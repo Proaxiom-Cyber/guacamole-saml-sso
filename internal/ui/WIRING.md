@@ -20,7 +20,9 @@ Later frames update changed lines; resizing clears and redraws the entire view.
 
 Use `TaskProgress(label, completed, total)` only when the operation knows the total.
 The label must explain what is counted. Network checks count attempts, not successes.
-The next phase clears the count. Invalid or unknown totals do not draw a bar.
+The automatic Entra path counts four completed steps: host certificate, administrator
+authorization, registration, and identity verification. The next phase clears the
+count. Invalid or unknown totals do not draw a bar.
 
 Use `Explain` for a short status with longer guidance in Details. Use `Transient`
 for a device sign-in challenge, then `ClearTransient` when authorization ends.

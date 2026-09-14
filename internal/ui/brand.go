@@ -70,7 +70,11 @@ func (w *Wizard) paintBrand(line string) (string, bool) {
 		for _, v := range variants {
 			if strings.HasPrefix(line, v) {
 				// A white card keeps the navy mark visible on both terminal themes.
-				return "\x1b[48;5;255m" + brandInk(i, false) + v[:len(v)-2] + "\x1b[0m  \x1b[1m" + strings.TrimPrefix(line, v) + "\x1b[0m", true
+				textInk := "\x1b[1m"
+				if i == len(brandBars)-1 {
+					textInk = "\x1b[1;36m"
+				}
+				return "\x1b[48;5;255m" + brandInk(i, false) + v[:len(v)-2] + "\x1b[0m  " + textInk + strings.TrimPrefix(line, v) + "\x1b[0m", true
 			}
 		}
 	}

@@ -33,11 +33,13 @@ func (o *Options) automaticInstallerToken(administrator entra.TokenSource) entra
 		if choice == 'q' {
 			return "", entraSignInStopped()
 		}
+		u.TaskProgress("Installer identity steps completed", 0, 4)
 		u.Say("Generating or opening the installer key in this host's TPM...")
 		material, err := o.prepareInstallerCertificate(ctx)
 		if err != nil {
 			return "", err
 		}
+		u.TaskProgress("Installer identity steps completed", 1, 4)
 		u.Say("Host certificate ready. Waiting for administrator authorization.")
 		admin := &entra.Client{Token: func(ctx context.Context) (string, error) {
 			token, err := administrator(ctx)
@@ -86,6 +88,7 @@ func (o *Options) automaticInstallerToken(administrator entra.TokenSource) entra
 			record("installer-service-principal", app.SPID)
 			return o.journalIntent("installer certificate registration: " + pending)
 		}
+		u.TaskProgress("Installer identity steps completed", 2, 4)
 		u.Say("Administrator authorized the selected tenant. Registering the host certificate...")
 		applyCtx, applyCancel := context.WithTimeout(ctx, 2*time.Minute)
 		known := entra.InstallerApplication{AppID: st.Config["entra-installer-client-id"]}
@@ -119,6 +122,7 @@ func (o *Options) automaticInstallerToken(administrator entra.TokenSource) entra
 		if err = checkpoint("", app); err != nil {
 			return "", err
 		}
+		u.TaskProgress("Installer identity steps completed", 3, 4)
 		u.Say("Certificate registered. Checking the installer identity and its permissions...")
 		probe := &entra.Client{Token: candidate, Do: admin.Do}
 		verifyCtx, verifyCancel := context.WithTimeout(ctx, 45*time.Second)
@@ -127,6 +131,7 @@ func (o *Options) automaticInstallerToken(administrator entra.TokenSource) entra
 			return "", err
 		}
 		source = candidate
+		u.TaskProgress("Installer identity steps completed", 4, 4)
 		u.Say("Microsoft Entra connected. This host can authenticate with its TPM certificate on future runs.")
 		return source(ctx)
 	}

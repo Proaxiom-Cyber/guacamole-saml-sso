@@ -126,6 +126,9 @@ func TestRecommendedEntraPathCombinesSignInAndHostCertificate(t *testing.T) {
 	if mutations != 6 || factories != 1 || st.Config["entra-auth-method"] != "certificate" || st.Config["entra-installer-pending"] != "" {
 		t.Fatal("registration repeated or resume state was lost")
 	}
+	if strings.Count(out.String(), "Installer identity steps completed: 4/4") != 1 {
+		t.Fatal("completion progress was absent or repeated for cached authentication")
+	}
 	owned := 0
 	for _, r := range st.Resources {
 		if r.Provider == "entra" && r.Ownership != "" {
@@ -144,12 +147,15 @@ func TestRecommendedEntraPathCombinesSignInAndHostCertificate(t *testing.T) {
 }
 
 func TestAutomaticEntraPreservesDevicePolicyError(t *testing.T) {
-	u, _ := testUI(true, "c\n")
+	u, out := testUI(true, "c\n")
 	want := errors.New("device-code flow is blocked by tenant policy")
 	o := &Options{StateDir: t.TempDir(), UI: u, entraState: &state.State{DeploymentID: "deployment", Config: map[string]string{}}, journalIntent: func(string) error { return nil }, EntraCertificate: func(context.Context, string, string, entracert.Open) (entracert.Material, error) {
 		return entracert.Material{}, nil
 	}}
 	_, err := o.automaticInstallerToken(func(context.Context) (string, error) { return "", want })(context.Background())
+	if strings.Contains(out.String(), "steps completed: 4/4") {
+		t.Fatal("failed authorization reported complete progress")
+	}
 	if !errors.Is(err, want) {
 		t.Fatalf("policy failure was replaced by an unrelated token error: %v", err)
 	}
