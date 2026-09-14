@@ -30,7 +30,7 @@ func TestGuidedEntraClientDoesNotRequireExternalToken(t *testing.T) {
 func TestGuidedEntraResumeAuthenticatesBeforePlanning(t *testing.T) {
 	t.Setenv(entra.DefaultTokenEnv, "")
 	dir := t.TempDir()
-	u, out := testUI(true, "r\n\nd\n")
+	u, out := testUI(true, "r\ndemo-customer.com.au\nd\n")
 	now := time.Now().UTC()
 	st := &state.State{DeploymentID: "existing-deployment", Config: map[string]string{"guac-hostname": "guac.demo-customer.com.au", "cloudflare-zone-name": "demo-customer.com.au", "admin-group": "Guacamole Administrators", "operator-group": "Guacamole Operators"}, Actions: []state.Action{{ID: state.NewID(), Intent: "stack-up", StartedAt: now, FinishedAt: &now, Result: state.ResultOK}, {ID: state.NewID(), Intent: "entra-signin", StartedAt: now, FinishedAt: &now, Result: state.ResultFailed}}}
 	seed(t, dir, st)

@@ -17,21 +17,24 @@ func (o *Options) selectEntraTenant(st *state.State, u *ui.UI) error {
 		o.EntraTenant = st.Config["entra-tenant-id"]
 	}
 	if o.EntraTenant == "" {
-		o.EntraTenant = st.Config["entra-login-tenant"]
-	}
-	if o.EntraTenant == "" {
 		o.EntraTenant = os.Getenv("GUACDEPLOY_ENTRA_TENANT_ID")
 	}
 	if o.EntraTenant == "" {
-		u.Say("Sign in to the Microsoft tenant that will own this deployment's application and groups.")
-		var err error
-		o.EntraTenant, err = u.Line("Microsoft tenant ID or verified domain", st.Config["cloudflare-zone-name"])
-		if err != nil {
-			return err
+		u.Explain("Choose the Microsoft tenant that will own the application and groups.\nThis can differ from the Cloudflare DNS domain.", "Enter the tenant ID or a verified domain from Microsoft Entra. The public Guacamole hostname and Cloudflare zone do not identify your Microsoft tenant. A saved choice below has not yet been verified; you can correct it before signing in.")
+		for {
+			var err error
+			o.EntraTenant, err = u.Line("Microsoft tenant ID or verified domain", st.Config["entra-login-tenant"])
+			if err != nil {
+				return err
+			}
+			if validEntraTenant(o.EntraTenant) {
+				break
+			}
+			u.Say("Enter a tenant ID or verified domain, without a URL or spaces.")
 		}
 	}
 	o.EntraTenant = strings.TrimSpace(o.EntraTenant)
-	if strings.ContainsAny(o.EntraTenant, "/\\?# \t\r\n") || o.EntraTenant == "" {
+	if !validEntraTenant(o.EntraTenant) {
 		return errors.New("enter a Microsoft tenant ID or verified domain, without a URL or spaces")
 	}
 	if st.Config == nil {
@@ -40,6 +43,11 @@ func (o *Options) selectEntraTenant(st *state.State, u *ui.UI) error {
 	st.Config["entra-login-tenant"] = o.EntraTenant
 	u.Say("Microsoft sign-in tenant: %s. This sign-in needs administrator consent for application, group, role assignment and organization permissions.", o.EntraTenant)
 	return nil
+}
+
+func validEntraTenant(value string) bool {
+	value = strings.TrimSpace(value)
+	return value != "" && !strings.ContainsAny(value, "/\\?# \t\r\n")
 }
 
 func (o *Options) guidedEntraClient() (*entra.Client, error) {
