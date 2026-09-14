@@ -10,7 +10,9 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
+	"github.com/mattn/go-runewidth"
 	"golang.org/x/term"
 )
 
@@ -35,8 +37,8 @@ const (
 
 // Control-sequence literals, kept together so the escapes appear once.
 const (
-	enterAltScreen = "\x1b[?1049h\x1b[?25l"
-	leaveAltScreen = "\x1b[?25h\x1b[?1049l"
+	enterAltScreen = "\x1b[?1049h\x1b[?25l\x1b[?2004h"
+	leaveAltScreen = "\x1b[?2004l\x1b[?25h\x1b[?1049l"
 	homeAndClear   = "\x1b[H\x1b[2J"
 )
 
@@ -45,9 +47,7 @@ const (
 // ordinary key instead, and the wizard says the same thing itself.
 const cancelNotice = "Cancelled. Completed work is saved; run guacdeploy again to resume or clean up."
 
-// logCap bounds the retained transcript. It is replayed when the wizard
-// stops, so leaving the full-screen view does not take the session output
-// with it.
+// logCap bounds the retained transcript. Full history is available in the details view and the private log.
 const logCap = 500
 
 // Keys returned by readKey. They are negative so they cannot collide with a
@@ -59,7 +59,12 @@ const (
 	keyBackspace = rune(-4)
 	keyCancel    = rune(-5)
 	keyOther     = rune(-6)
+	keyPageUp    = rune(-7)
+	keyPageDown  = rune(-8)
+	keyDetails   = rune(-9)
 )
+
+const keyPaste = rune(-10)
 
 // Wizard draws the guided interface. Use UI.StartWizard to create one; the
 // UI routes its own prompts and output through it while it is running.
@@ -70,16 +75,38 @@ type Wizard struct {
 	rows, cols int
 	colour     bool
 
-	mu      sync.Mutex
-	names   []string
-	state   map[string]string
-	log     []string
-	prompt  []string // the question on screen now, redrawn with everything else
-	stopped bool
+	mu           sync.Mutex
+	names        []string
+	state        map[string]string
+	log          []string
+	prompt       []string // the question on screen now, redrawn with everything else
+	stopped      bool
+	started      time.Time
+	phaseStarted time.Time
+	active       string
+	challenge    string
+	details      bool
+	scroll       int
+	tick         int
+	logPath      string
 
-	stopOnce   sync.Once
-	restore    func() // undoes raw mode; nil when no real terminal is attached
-	stopResize func() // stops following the window size; nil when not following
+	keys      chan keyEvent
+	waiting   bool
+	lastFrame []string
+
+	notes   []string
+	summary []string
+
+	rawPaste   string
+	inputPaste string
+
+	runes     chan runeEvent
+	inputDone chan struct{}
+
+	stopOnce      sync.Once
+	restore       func() // undoes raw mode; nil when no real terminal is attached
+	stopAnimation func()
+	stopResize    func() // stops following the window size; nil when not following
 }
 
 // clampSize holds the frame to a usable minimum.
@@ -87,19 +114,11 @@ type Wizard struct {
 // ponytail: below about twenty rows the frame is taller than the screen and
 // the top scrolls away. Treat that as the floor rather than build a second
 // compact layout.
-func clampSize(rows, cols int) (int, int) {
-	if rows < 20 {
-		rows = 20
-	}
-	if cols < 40 {
-		cols = 40
-	}
-	return rows, cols
-}
+func clampSize(rows, cols int) (int, int) { return max(1, rows), max(1, cols) }
 
 func newWizard(in *bufio.Reader, out io.Writer, rows, cols int, colour bool) *Wizard {
 	rows, cols = clampSize(rows, cols)
-	return &Wizard{out: out, in: in, rows: rows, cols: cols, colour: colour, state: map[string]string{}}
+	return &Wizard{out: out, in: in, rows: rows, cols: cols, colour: colour, state: map[string]string{}, started: time.Now(), phaseStarted: time.Now()}
 }
 
 // StartWizard switches the guided path to the full-screen interface. It
@@ -130,7 +149,10 @@ func (u *UI) StartWizard() bool {
 	w.restore = func() { term.Restore(u.fd, prev) }
 	io.WriteString(u.Out, enterAltScreen)
 	u.wiz = w
+	w.logPath = u.LogPath()
+	w.startInput()
 	w.followResize(u.fd)
+	w.animate()
 	w.draw(nil)
 	return true
 }
@@ -150,6 +172,7 @@ func (w *Wizard) followResize(fd int) {
 			}
 			w.mu.Lock()
 			w.rows, w.cols = clampSize(r, c)
+			w.lastFrame = nil
 			w.mu.Unlock()
 			w.redraw()
 		}
@@ -191,12 +214,18 @@ func (w *Wizard) done() bool {
 	return w.stopped
 }
 
-// stop leaves the full-screen view, restores the terminal, and replays the
-// session output onto the ordinary screen. It runs at most once, whichever
+// stop leaves the full-screen view, restores the terminal, and prints a concise
+// result on the ordinary screen. It runs at most once, whichever
 // path reaches it: normal exit, cancellation, a signal, or a panic unwinding
 // through a deferred UI.RestoreTerminal.
 func (w *Wizard) stop() {
 	w.stopOnce.Do(func() {
+		if w.inputDone != nil {
+			close(w.inputDone)
+		}
+		if w.stopAnimation != nil {
+			w.stopAnimation()
+		}
 		if w.stopResize != nil {
 			w.stopResize()
 		}
@@ -212,9 +241,22 @@ func (w *Wizard) stop() {
 			w.restore()
 		}
 		io.WriteString(w.out, leaveAltScreen)
-		for _, l := range w.log {
-			io.WriteString(w.out, l+"\n")
+		done := 0
+		for _, status := range w.state {
+			if status == phaseDone || status == phaseSkipped {
+				done++
+			}
 		}
+		for _, line := range w.summary {
+			fmt.Fprintln(w.out, line)
+		}
+		if len(w.names) > 0 && len(w.summary) == 0 {
+			fmt.Fprintf(w.out, "Guacamole setup: %d of %d steps complete.\n", done, len(w.names))
+		}
+		if w.active != "" && w.state[w.active] == phaseFailed {
+			fmt.Fprintf(w.out, "Needs attention: %s. Progress is saved; run guacdeploy setup to resume.\n", phaseInfo(w.active).Title)
+		}
+
 	})
 }
 
@@ -231,7 +273,12 @@ func (w *Wizard) say(s string) {
 	// Stored without indentation: the frame indents when it draws, and the
 	// replayed transcript reads like ordinary output.
 	w.mu.Lock()
-	w.log = append(w.log, strings.Split(s, "\n")...)
+	for _, line := range strings.Split(cleanText(s), "\n") {
+		if len(line) > 8192 {
+			line = line[:8192] + " [display shortened; see session log]"
+		}
+		w.log = append(w.log, time.Now().Format("15:04:05")+"  "+line)
+	}
 	if n := len(w.log) - logCap; n > 0 {
 		w.log = append([]string(nil), w.log[n:]...)
 	}
@@ -261,6 +308,12 @@ func (w *Wizard) setPhase(name, state string) {
 		w.names = append(w.names, name)
 	}
 	w.state[name] = state
+	if state == phaseRunning || state == phaseFailed {
+		w.active = name
+		w.phaseStarted = time.Now()
+		w.scroll = 0
+		w.challenge = ""
+	}
 	w.mu.Unlock()
 	w.redraw()
 }
@@ -286,154 +339,24 @@ func (w *Wizard) failed(name string, err error) {
 	}, "\n"))
 }
 
-func (w *Wizard) width() int {
-	if w.cols > 78 {
-		return 78
-	}
-	return w.cols
-}
-
-// progress summarises the phase list in one line. Every category it names is
-// also visible in the list below it.
-func (w *Wizard) progress() string {
-	count := map[string]int{}
-	for _, n := range w.names {
-		s := w.state[n]
-		if s == "" {
-			s = phaseWaiting
-		}
-		count[s]++
-	}
-	parts := []string{fmt.Sprintf("%d done", count[phaseDone])}
-	if n := count[phaseRunning]; n > 0 {
-		parts = append(parts, fmt.Sprintf("%d running", n))
-	}
-	if n := count[phaseFailed]; n > 0 {
-		parts = append(parts, fmt.Sprintf("%d failed", n))
-	}
-	if n := count[phaseSkipped]; n > 0 {
-		parts = append(parts, fmt.Sprintf("%d already complete", n))
-	}
-	parts = append(parts, fmt.Sprintf("%d to do", count[phaseWaiting]))
-	return fmt.Sprintf("Phases (%d): %s", len(w.names), strings.Join(parts, ", "))
-}
-
-// frame builds the screen as plain text. It contains no escape sequences:
-// everything a reader needs is in the words. The caller holds w.mu.
-func (w *Wizard) frame(prompt []string) []string {
-	rule := strings.Repeat("-", w.width())
-
-	phases := make([]string, 0, len(w.names))
-	active := 0
-	for i, n := range w.names {
-		s := w.state[n]
-		if s == "" {
-			s = phaseWaiting
-		}
-		line := "  " + s + "  " + n
-		if s == phaseSkipped {
-			line += " (already complete)"
-		}
-		if s == phaseRunning || s == phaseFailed {
-			active = i
-		}
-		phases = append(phases, line)
-	}
-
-	// The prompt is wrapped before the budget is worked out, so a long
-	// question cannot push the top of the screen away.
-	var asked []string
-	for _, block := range prompt {
-		// Each frame entry must be one physical row. Embedded LF characters
-		// bypass draw's CRLF handling in raw mode and retain the old column.
-		for _, l := range strings.Split(strings.ReplaceAll(block, "\r\n", "\n"), "\n") {
-			segs := wrapLine(l, w.width()-4)
-			asked = append(asked, segs[0])
-			for _, s := range segs[1:] {
-				asked = append(asked, "    "+s)
-			}
-		}
-	}
-
-	// Furniture: title, progress, three rules, the Output label, the prompt
-	// block and the cancel footer. The count only sizes the budget, so an
-	// approximation is enough.
-	budget := w.rows - (2 + 3 + 1 + len(asked) + 1) - 1
-	if budget < 6 {
-		// Keep a long instruction and its actions visible on small terminals.
-		// Phase history and output remain in the transcript; the active phase
-		// stays above the prompt instead of competing with it for rows.
-		out := []string{"GUACAMOLE DEPLOYMENT (guided setup)"}
-		if len(phases) > 0 {
-			out = append(out, phases[active])
-		}
-		out = append(out, rule)
-		out = append(out, asked...)
-		return append(out, rule, "Ctrl-C  Cancel. Completed work is retained.")
-	}
-	logRoom := budget - len(phases)
-	if logRoom < 3 {
-		logRoom = 3
-		phases = windowLines(phases, active, budget-logRoom)
-	}
-
-	out := []string{"GUACAMOLE DEPLOYMENT (guided setup)"}
-	if len(phases) > 0 {
-		out = append(out, w.progress(), rule)
-		out = append(out, phases...)
-	}
-	out = append(out, rule, "Output")
-	// Wrapped here rather than left to the terminal: a line the terminal
-	// wraps is taller than the frame expects and pushes the top off screen.
-	// The stored log keeps the whole line for the replayed transcript.
-	var shown []string
-	for _, l := range w.log {
-		for _, seg := range wrapLine(l, w.width()-2) {
-			shown = append(shown, "  "+seg)
-		}
-	}
-	if len(shown) > logRoom {
-		shown = shown[len(shown)-logRoom:]
-	}
-	out = append(out, shown...)
-	out = append(out, rule)
-	if len(asked) > 0 {
-		out = append(out, asked...)
-		out = append(out, rule)
-	}
-	return append(out, "Ctrl-C  Cancel. Completed work is retained.")
-}
-
 // wrapLine breaks one line at spaces to fit the width, and breaks mid-word
 // only when a single word is longer than the line. It works in runes, so a
 // name outside ASCII cannot be cut in half.
 func wrapLine(s string, width int) []string {
-	if width < 8 {
-		width = 8
-	}
-	r := []rune(s)
-	if len(r) <= width {
-		return []string{s}
-	}
-	var out []string
-	for len(r) > width {
-		cut := 0
-		for i := width; i > 0; i-- {
-			if r[i] == ' ' {
-				cut = i
-				break
-			}
+	width = max(1, width)
+	var lines []string
+	for runewidth.StringWidth(s) > width {
+		head := runewidth.Truncate(s, width, "")
+		if head == "" {
+			head = string([]rune(s)[0])
 		}
-		if cut == 0 {
-			cut = width
+		if cut := strings.LastIndex(head, " "); cut > 0 {
+			head = head[:cut]
 		}
-		out = append(out, strings.TrimRight(string(r[:cut]), " "))
-		r = []rune(strings.TrimLeft(string(r[cut:]), " "))
+		lines = append(lines, head)
+		s = strings.TrimLeft(s[len(head):], " ")
 	}
-	if len(r) > 0 {
-		out = append(out, string(r))
-	}
-	return out
+	return append(lines, s)
 }
 
 // windowLines keeps at most max lines around the active one. The elided
@@ -464,66 +387,76 @@ func windowLines(lines []string, active, max int) []string {
 	return out
 }
 
-// paint adds colour to one plain frame line and changes nothing else, so
-// removing the colour returns exactly the text frame produced.
-func (w *Wizard) paint(line string) string {
-	if !w.colour {
-		return line
-	}
-	for marker, code := range map[string]string{
-		phaseDone:    "\x1b[32m",
-		phaseRunning: "\x1b[36m",
-		phaseFailed:  "\x1b[31m",
-		phaseSkipped: "\x1b[90m",
-	} {
-		if i := strings.Index(line, marker); i >= 0 {
-			return line[:i] + code + marker + "\x1b[0m" + line[i+len(marker):]
-		}
-	}
-	if strings.HasPrefix(line, "> ") {
-		return "\x1b[1m" + line + "\x1b[0m"
-	}
-	return line
-}
-
-// redraw repaints with whatever question is currently on screen. Output from
-// a phase, a change of phase status and a resize all go through it, so none of
-// them wipes a prompt the operator is part way through answering.
-func (w *Wizard) redraw() {
-	w.mu.Lock()
-	p := w.prompt
-	w.mu.Unlock()
-	w.draw(p)
-}
-
+// Redraws and terminal restoration serialize their writes. A timer cannot
+// overwrite an input prompt or draw after the alternate screen has closed.
+func (w *Wizard) redraw() { w.mu.Lock(); defer w.mu.Unlock(); w.renderLocked() }
 func (w *Wizard) draw(prompt []string) {
 	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.prompt = prompt
+	w.renderLocked()
+}
+func (w *Wizard) renderLocked() {
 	if w.stopped {
-		w.mu.Unlock()
 		return
 	}
-	w.prompt = prompt
-	lines := w.frame(prompt)
-	w.mu.Unlock()
-
 	var b strings.Builder
-	b.WriteString(homeAndClear)
-	for i, l := range lines {
-		if i > 0 {
-			b.WriteString("\r\n")
+	lines := w.frame(w.prompt)
+	if w.keys == nil || len(w.lastFrame) != len(lines) {
+		b.WriteString(homeAndClear)
+		for i, l := range lines {
+			if i > 0 {
+				b.WriteString("\r\n")
+			}
+			b.WriteString(w.paint(l))
 		}
-		b.WriteString(w.paint(l))
+	} else {
+		for i, l := range lines {
+			if l != w.lastFrame[i] {
+				fmt.Fprintf(&b, "\x1b[%d;1H\x1b[2K", i+1)
+				b.WriteString(w.paint(l))
+			}
+		}
 	}
+	w.lastFrame = append(w.lastFrame[:0], lines...)
 	io.WriteString(w.out, b.String())
+}
+func (w *Wizard) animate() {
+	reduced := os.Getenv("GUACDEPLOY_REDUCED_MOTION") != ""
+	done := make(chan struct{})
+	w.stopAnimation = func() { close(done) }
+	go func() {
+		interval := 250 * time.Millisecond
+		if reduced {
+			interval = time.Second
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				w.mu.Lock()
+				if !reduced {
+					w.tick++
+				}
+				w.renderLocked()
+				w.mu.Unlock()
+			}
+		}
+	}()
 }
 
 // readKey reads one keystroke.
-func (w *Wizard) readKey() (rune, error) {
-	r, _, err := w.in.ReadRune()
+func (w *Wizard) readRawKey() (rune, error) {
+	r, err := w.nextRune(0)
 	if err != nil {
 		return 0, err
 	}
 	switch r {
+	case 9:
+		return keyDetails, nil
 	case 3: // Ctrl-C
 		return keyCancel, nil
 	case '\r', '\n':
@@ -531,20 +464,20 @@ func (w *Wizard) readKey() (rune, error) {
 	case 8, 127:
 		return keyBackspace, nil
 	case 27:
-		// ponytail: a lone Escape is told from an arrow key by whether the
-		// rest of the sequence has already arrived. A terminal delivers an
-		// arrow key in one read, so this holds; a hand-typed Escape
-		// immediately followed by "[A" would be read as an arrow key.
-		if w.in.Buffered() == 0 {
-			return keyCancel, nil
-		}
-		if r, _, err = w.in.ReadRune(); err != nil {
+		r, err = w.nextRune(150 * time.Millisecond)
+		if err != nil {
+			if err == io.EOF || err == errEscapeTimeout {
+				return keyCancel, nil
+			}
 			return 0, err
+		}
+		if r == 3 {
+			return keyCancel, nil
 		}
 		if r != '[' && r != 'O' {
 			return keyOther, nil
 		}
-		if r, _, err = w.in.ReadRune(); err != nil {
+		if r, err = w.nextRune(0); err != nil {
 			return 0, err
 		}
 		switch r {
@@ -552,6 +485,58 @@ func (w *Wizard) readKey() (rune, error) {
 			return keyUp, nil
 		case 'B':
 			return keyDown, nil
+		case '2':
+			sequence := "2"
+			for len(sequence) < 16 {
+				next, err := w.nextRune(0)
+				if err != nil {
+					return 0, err
+				}
+				sequence += string(next)
+				if next >= '@' && next <= '~' {
+					break
+				}
+			}
+			if sequence != "200~" {
+				return keyOther, nil
+			}
+
+			var paste strings.Builder
+			var suffix string
+			for {
+				r, err := w.nextRune(0)
+				if err != nil {
+					return 0, err
+				}
+				suffix += string(r)
+				if strings.HasSuffix(suffix, "\x1b[201~") {
+					break
+				}
+				if len(suffix) > 6 {
+					if paste.Len() < 131072 {
+						paste.WriteString(suffix[:len(suffix)-6])
+					}
+					suffix = suffix[len(suffix)-6:]
+				}
+			}
+			if len(suffix) > 6 && paste.Len() < 131072 {
+				paste.WriteString(suffix[:len(suffix)-6])
+			}
+			w.rawPaste = paste.String()
+			return keyPaste, nil
+		case '5', '6':
+			page := r
+			end, err := w.nextRune(0)
+			if err != nil {
+				return 0, err
+			}
+			if end != '~' {
+				return keyOther, nil
+			}
+			if page == '5' {
+				return keyPageUp, nil
+			}
+			return keyPageDown, nil
 		}
 		return keyOther, nil
 	}
@@ -559,7 +544,11 @@ func (w *Wizard) readKey() (rune, error) {
 }
 
 func (w *Wizard) choose(prompt string, choices []Choice) (rune, error) {
-	defer w.draw(nil) // the question is answered; take it off the screen
+	w.beginPrompt()
+	defer w.endPrompt()
+	if len(choices) == 0 {
+		return 0, fmt.Errorf("prompt has no choices")
+	}
 	sel := 0
 	for {
 		lines := []string{prompt, ""}
@@ -570,12 +559,15 @@ func (w *Wizard) choose(prompt string, choices []Choice) (rune, error) {
 			}
 			lines = append(lines, fmt.Sprintf("%s[%c] %s", cursor, c.Key, c.Label))
 		}
-		lines = append(lines, "", "Up/Down or j/k to move, Enter to choose, or press the letter in brackets.")
+		lines = append(lines, "", "Up/Down  Move   Enter  Choose   Letter  Shortcut")
 		w.draw(lines)
 
 		k, err := w.readKey()
 		if err != nil {
 			return 0, err
+		}
+		if w.viewKey(k) {
+			continue
 		}
 		// A choice key wins over the j/k shortcuts, so a prompt that offers
 		// "j" keeps working.
@@ -591,8 +583,10 @@ func (w *Wizard) choose(prompt string, choices []Choice) (rune, error) {
 			return choices[sel].Key, nil
 		case keyUp, 'k':
 			sel = (sel - 1 + len(choices)) % len(choices)
+			w.resetScroll()
 		case keyDown, 'j':
 			sel = (sel + 1) % len(choices)
+			w.resetScroll()
 		}
 	}
 }
@@ -607,7 +601,8 @@ func lowerASCII(r rune) rune {
 // readLine edits one line of input. hidden suppresses the echo for
 // credential prompts: the value is never drawn, logged or retained.
 func (w *Wizard) readLine(prompt, def string, hidden bool) (string, error) {
-	defer w.draw(nil) // the question is answered; take it off the screen
+	w.beginPrompt()
+	defer w.endPrompt()
 	var buf []rune
 	note := ""
 	for {
@@ -624,7 +619,10 @@ func (w *Wizard) readLine(prompt, def string, hidden bool) (string, error) {
 		if hidden {
 			lines = append(lines, "Input is hidden.")
 		}
-		lines = append(lines, "", "  "+shown+"_", "")
+		w.mu.Lock()
+		fieldWidth := w.width() - 8
+		w.mu.Unlock()
+		lines = append(lines, "", "> "+inputTail(shown, fieldWidth)+"_", "")
 		if note != "" {
 			lines = append(lines, note)
 		}
@@ -635,7 +633,20 @@ func (w *Wizard) readLine(prompt, def string, hidden bool) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		if w.viewKey(k) {
+			continue
+		}
 		switch {
+		case k == keyPaste:
+			text := strings.ReplaceAll(cleanText(w.inputPaste), "\n", "")
+			chars := []rune(text)
+			remaining := max(0, 16384-len(buf))
+			if len(chars) > remaining {
+				chars = chars[:remaining]
+				note = "Pasted text reached the 16,384-character limit. Review before Enter."
+			}
+			buf = append(buf, chars...)
+
 		case k == keyCancel:
 			return "", w.cancelled()
 		case k == keyEnter:
@@ -656,7 +667,152 @@ func (w *Wizard) readLine(prompt, def string, hidden bool) (string, error) {
 				buf = buf[:len(buf)-1]
 			}
 		case k >= ' ':
-			buf = append(buf, k)
+			if len(buf) < 16384 {
+				buf = append(buf, k)
+			} else {
+				note = "Input limit reached (16,384 characters)."
+			}
 		}
 	}
+}
+
+func (w *Wizard) endPrompt() {
+	w.mu.Lock()
+	w.waiting = false
+	w.details = false
+	w.scroll = 0
+	w.prompt = nil
+	w.renderLocked()
+	w.mu.Unlock()
+}
+func (w *Wizard) resetScroll() { w.mu.Lock(); w.scroll = 0; w.mu.Unlock() }
+func (w *Wizard) viewKey(k rune) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if (w.cols < 48 || w.rows < 16) && k != keyCancel {
+		return true
+	}
+	switch k {
+
+	case keyDetails:
+		w.details = !w.details
+		w.scroll = 0
+	case keyPageUp:
+		w.scroll = max(0, w.scroll-max(1, w.rows/3))
+	case keyPageDown:
+		w.scroll += max(1, w.rows/3)
+	case keyCancel:
+		return false
+	default:
+		return w.details // do not submit a hidden prompt from history
+	}
+	return true
+}
+
+type keyEvent struct {
+	paste string
+	key   rune
+	err   error
+}
+
+func (w *Wizard) beginPrompt() { w.mu.Lock(); w.waiting = true; w.scroll = 0; w.mu.Unlock() }
+func (w *Wizard) readKey() (rune, error) {
+	if w.keys != nil {
+		e, ok := <-w.keys
+		if !ok {
+			return 0, io.EOF
+		}
+		w.inputPaste = e.paste
+		return e.key, e.err
+	}
+	k, err := w.readRawKey()
+	w.inputPaste = w.rawPaste
+	w.rawPaste = ""
+	return k, err
+}
+func (w *Wizard) startInput() {
+	w.keys = make(chan keyEvent, 256)
+	w.runes = make(chan runeEvent, 256)
+	w.inputDone = make(chan struct{})
+	go func() {
+		defer close(w.runes)
+		for {
+			r, _, err := w.in.ReadRune()
+			select {
+			case <-w.inputDone:
+				return
+			case w.runes <- runeEvent{r, err}:
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		defer close(w.keys)
+		for {
+			k, err := w.readRawKey()
+			w.mu.Lock()
+			stopped, waiting := w.stopped, w.waiting
+			w.mu.Unlock()
+			if stopped {
+				return
+			}
+			if waiting || err != nil {
+				select {
+				case <-w.inputDone:
+					return
+				case w.keys <- keyEvent{key: k, err: err, paste: w.rawPaste}:
+				}
+				w.rawPaste = ""
+			} else if k == keyDetails || k == keyPageUp || k == keyPageDown {
+				w.viewKey(k)
+				w.redraw()
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+}
+
+type runeEvent struct {
+	r   rune
+	err error
+}
+
+var errEscapeTimeout = fmt.Errorf("escape timeout")
+
+func (w *Wizard) nextRune(wait time.Duration) (rune, error) {
+	if w.runes == nil {
+		r, _, err := w.in.ReadRune()
+		return r, err
+	}
+	var timeout <-chan time.Time
+	if wait > 0 {
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		timeout = timer.C
+	}
+	select {
+	case <-w.inputDone:
+		return 0, io.EOF
+	case <-timeout:
+		return 0, errEscapeTimeout
+	case e, ok := <-w.runes:
+		if !ok {
+			return 0, io.EOF
+		}
+		return e.r, e.err
+	}
+}
+func inputTail(s string, width int) string {
+	if runewidth.StringWidth(s) <= width {
+		return s
+	}
+	runes := []rune(s)
+	for len(runes) > 0 && runewidth.StringWidth(string(runes)) > width-1 {
+		runes = runes[1:]
+	}
+	return "…" + string(runes)
 }

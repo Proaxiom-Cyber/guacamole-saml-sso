@@ -103,7 +103,7 @@ func teardownProviders(ops *teardown.Ops, st *state.State, stateDir string, u *u
 	m := &creds.Manager{
 		Mode:       st.Config["credential-mode"],
 		Dir:        filepath.Join(stateDir, "credentials"),
-		ReadSecret: u.SecretReader(),
+		ReadSecret: u.SecretReader(), Protect: u.Protect,
 	}
 	cf := &cloudflare.Provisioner{
 		Client: &cloudflare.Client{Token: func(context.Context) (string, error) {
@@ -127,6 +127,7 @@ func teardownProviders(ops *teardown.Ops, st *state.State, stateDir string, u *u
 	// assignments with it, so neither is ever deleted separately.
 	ec := session.EntraClientForOperation(st, stateDir, u)
 	ecfg := entra.Config{DeploymentID: st.DeploymentID, Hostname: st.Config["guac-hostname"]}
+	ops.DeleteInstallerIdentity = func(ctx context.Context, id string) error { return ec.CleanupInstaller(ctx, st.DeploymentID, id) }
 	ops.DeleteEntraApp = func(ctx context.Context, id string) error {
 		return ec.CleanupApp(ctx, ecfg, id)
 	}
@@ -152,6 +153,19 @@ func findEntra(ec *entra.Client, st *state.State) teardown.Finder {
 			return teardown.Found{}, err // including ErrRequiresReview: a person decides
 		}
 		var f teardown.Found
+		if st.Config["entra-installer-pending"] != "" || st.Config["entra-installer-client-id"] != "" {
+			app, err := ec.FindInstaller(ctx, st.DeploymentID)
+			if err != nil {
+				return f, err
+			}
+			if app != nil {
+				for _, r := range []struct{ kind, id string }{{"installer-application", app.ID}, {"installer-service-principal", app.SPID}} {
+					if r.id != "" {
+						f.Owned = append(f.Owned, state.Resource{Provider: "entra", Type: r.kind, ProviderID: r.id, Name: app.DisplayName, Ownership: "marker " + entra.InstallerMarker(st.DeploymentID) + " on the installer application"})
+					}
+				}
+			}
+		}
 		if p.App != nil {
 			r := state.Resource{Provider: "entra", Type: "application",
 				ProviderID: p.App.ObjectID, Name: p.App.DisplayName}

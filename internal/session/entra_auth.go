@@ -59,35 +59,44 @@ func (o *Options) guidedEntraClient() (*entra.Client, error) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		u.Say("Open %s on your computer or phone.", verificationURL)
-		u.Say("Enter sign-in code: %s", code)
-		u.Say("Sign in as an administrator of the selected tenant and review the permissions. Waiting for Microsoft sign-in; Ctrl+C cancels.")
+		u.Transient("Open this address on your computer or phone:\n%s\n\nEnter this code: %s\n\nSign in to the selected tenant and review the permissions.\nThis screen continues after Microsoft accepts your sign-in.", verificationURL, code)
 		return nil
 	}}
 	// Select on first use, so callers can construct a client without prompting.
 	// A browser token is supplied by Graph Explorer; it needs no callback server.
 	var source entra.TokenSource
 	guided := false
+	automatic := false
 	c := &entra.Client{Token: func(ctx context.Context) (string, error) {
 		for {
 			if err := ctx.Err(); err != nil {
 				return "", err
 			}
 			if source == nil {
-				choice, err := u.Choose("Microsoft sign-in method", []ui.Choice{
-					{Key: 'a', Label: "Installer app: generate a TPM certificate (recommended)"},
-					{Key: 's', Label: "Installer app: enter a client secret"},
-					{Key: 'd', Label: "Device code: sign in with a short code"},
-					{Key: 'b', Label: "Browser: Graph Explorer, then paste an access token"},
-					{Key: 'q', Label: "Quit and keep deployment progress"},
-				})
+				label := "Connect with Microsoft (recommended): device code + host certificate"
+				if o.journalIntent == nil {
+					label = "Sign in with Microsoft for this run"
+				}
+				choices := []ui.Choice{{Key: 'd', Label: label}, {Key: 'a', Label: "Device code blocked: register the installer app yourself"}, {Key: 'x', Label: "Other authentication options"}, {Key: 'q', Label: "Quit and keep deployment progress"}}
+				if o.entraState != nil && o.entraState.Config["entra-auth-method"] != "" {
+					choices = append([]ui.Choice{{Key: 'r', Label: "Use the installer identity already registered for this host"}}, choices...)
+				}
+				choice, err := u.Choose("Connect Microsoft Entra\n\nMicrosoft sign-in authorizes setup. The host certificate authenticates the installer.\nThe recommended path does both, without copying a certificate or a token.", choices)
+				if err == nil && choice == 'x' {
+					choice, err = u.Choose("Other authentication options\n\nThese options depend on your tenant policy. Credentials stay in memory for this run.", []ui.Choice{{Key: 's', Label: "Use an installer app with a client secret"}, {Key: 'b', Label: "Paste an access token from Graph Explorer"}, {Key: 'o', Label: "Device-code sign-in for this run only"}, {Key: 'q', Label: "Stop and keep progress"}})
+				}
+
 				if err != nil {
 					return "", err
 				}
 				switch choice {
-				case 'a', 's':
+				case 'r', 'a', 's':
 					guided = true
 					method := "certificate"
+					if choice == 'r' {
+						o.reuseEntraIdentity = true
+						method = o.entraState.Config["entra-auth-method"]
+					}
 					if choice == 's' {
 						method = "secret"
 					}
@@ -103,20 +112,26 @@ func (o *Options) guidedEntraClient() (*entra.Client, error) {
 					if err != nil {
 						return "", err
 					}
+					automatic = choice == 'd' && o.journalIntent != nil
+					if automatic {
+						source = o.automaticInstallerToken(source)
+					}
 				}
 			}
 			token, err := source(ctx)
+			u.ClearTransient()
+			u.Protect(token)
 			if err == nil {
 				return token, nil
 			}
-			if guided {
+			if guided || errors.Is(err, entra.ErrUncertain) || errors.Is(err, entra.ErrRequiresReview) {
 				return "", err // These guided sources handle correction before returning.
 			}
 			if ctx.Err() != nil {
 				return "", ctx.Err()
 			}
 			u.Say("%s", err)
-			choice, chooseErr := u.Choose("Microsoft sign-in", []ui.Choice{{Key: 'r', Label: "Retry Microsoft sign-in"}, {Key: 'a', Label: "Use an installer app with a TPM certificate"}, {Key: 's', Label: "Use an installer app with a client secret"}, {Key: 'b', Label: "Use Graph Explorer in a browser instead"}, {Key: 'q', Label: "Quit and keep deployment progress"}})
+			choice, chooseErr := u.Choose("Microsoft sign-in", []ui.Choice{{Key: 'r', Label: "Retry Microsoft sign-in"}, {Key: 'o', Label: "Device-code sign-in for this run only (no stored installer identity)"}, {Key: 'a', Label: "Use an installer app with a TPM certificate"}, {Key: 's', Label: "Use an installer app with a client secret"}, {Key: 'b', Label: "Use Graph Explorer in a browser instead"}, {Key: 'q', Label: "Quit and keep deployment progress"}})
 			if chooseErr != nil {
 				return "", chooseErr
 			}
@@ -134,10 +149,17 @@ func (o *Options) guidedEntraClient() (*entra.Client, error) {
 				}
 				source = o.manualEntraToken(method)
 			} else {
+				if choice == 'o' {
+					automatic = false
+				}
 				source, err = newSource(options)
 				if err != nil {
 					return "", err
 				}
+				if automatic {
+					source = o.automaticInstallerToken(source)
+				}
+				guided = false
 			}
 		}
 	}}

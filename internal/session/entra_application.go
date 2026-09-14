@@ -48,7 +48,7 @@ func (o *Options) manualEntraToken(method string) entra.TokenSource {
 		}
 		interactive := u != nil && u.Interactive
 		step := func(message string) error {
-			if !interactive {
+			if !interactive || o.reuseEntraIdentity {
 				return nil
 			}
 			choice, err := u.Choose(message, []ui.Choice{{Key: 'c', Label: "Continue"}, {Key: 'q', Label: "Quit and keep deployment progress"}})
@@ -68,32 +68,9 @@ func (o *Options) manualEntraToken(method string) entra.TokenSource {
 		}
 		var material entracert.Material
 		if method == "certificate" {
-			if o.StateDir == "" {
-				return "", errors.New("the installer certificate needs a state directory")
-			}
-			dir := filepath.Join(o.StateDir, "credentials")
-			_, existingErr := os.Lstat(filepath.Join(dir, entracert.BlobName))
-			if errors.Is(existingErr, os.ErrNotExist) {
-				// Setup journals the files before generating the key. Other
-				// operations only reuse it, and cannot mutate state here.
-				if o.journalIntent == nil {
-					return "", errors.New("no installer certificate exists on this host; run setup to generate one, or choose client secret")
-				}
-				if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
-					recordCredentialResource(st, "credential-dir", dir)
-				}
-				recordCredentialResource(st, "credential-file", entracert.BlobName)
-				recordCredentialResource(st, "credential-file", entracert.PublicName)
-				if err := o.journalIntent("generate a TPM installer key and export its public certificate"); err != nil {
-					return "", err
-				}
-			}
-			prepare := o.EntraCertificate
-			if prepare == nil {
-				prepare = entracert.Prepare
-			}
 			var err error
-			material, err = prepare(ctx, dir, st.DeploymentID, nil)
+			material, err = o.prepareInstallerCertificate(ctx)
+
 			if err != nil {
 				if !interactive {
 					return "", err
@@ -142,7 +119,7 @@ func (o *Options) manualEntraToken(method string) entra.TokenSource {
 				return "", err
 			}
 			var err error
-			if interactive {
+			if interactive && !o.reuseEntraIdentity {
 				tenant, err = u.Line("Directory (tenant) ID from the installer app Overview", tenant)
 				if err != nil {
 					return "", err
@@ -222,6 +199,7 @@ func (o *Options) manualEntraToken(method string) entra.TokenSource {
 			if !interactive {
 				return "", err
 			}
+			o.reuseEntraIdentity = false
 			u.Say("%s", err)
 			choice, chooseErr := u.Choose("Correct the installer app settings in Entra, then retry.", []ui.Choice{{Key: 'r', Label: "Retry and check the IDs and credential"}, {Key: 'q', Label: "Quit and keep deployment progress"}})
 			if chooseErr != nil {
@@ -232,4 +210,38 @@ func (o *Options) manualEntraToken(method string) entra.TokenSource {
 			}
 		}
 	}
+}
+
+// prepareInstallerCertificate journals the owned files before key creation.
+func (o *Options) prepareInstallerCertificate(ctx context.Context) (entracert.Material, error) {
+	st := o.entraState
+	if st == nil {
+		return entracert.Material{}, errors.New("installer certificate needs a deployment record")
+	}
+	if o.StateDir == "" {
+		return entracert.Material{}, errors.New("the installer certificate needs a state directory")
+	}
+	dir := filepath.Join(o.StateDir, "credentials")
+	_, existingErr := os.Lstat(filepath.Join(dir, entracert.BlobName))
+	if errors.Is(existingErr, os.ErrNotExist) {
+		// Setup journals the files before generating the key. Other
+		// operations only reuse it, and cannot mutate state here.
+		if o.journalIntent == nil {
+			return entracert.Material{}, errors.New("no installer certificate exists on this host; run setup to generate one, or choose client secret")
+		}
+		if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+			recordCredentialResource(st, "credential-dir", dir)
+		}
+		recordCredentialResource(st, "credential-file", entracert.BlobName)
+		recordCredentialResource(st, "credential-file", entracert.PublicName)
+		if err := o.journalIntent("generate a TPM installer key and export its public certificate"); err != nil {
+			return entracert.Material{}, err
+		}
+	}
+	prepare := o.EntraCertificate
+	if prepare == nil {
+		prepare = entracert.Prepare
+	}
+
+	return prepare(ctx, dir, st.DeploymentID, nil)
 }

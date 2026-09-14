@@ -71,17 +71,18 @@ var ErrIncomplete = errors.New("teardown is incomplete")
 type Kind string
 
 const (
-	KindDNSRecord  Kind = "dns-record"
-	KindAccessApp  Kind = "access-application"
-	KindTunnel     Kind = "tunnel"
-	KindEntraApp   Kind = "entra-application"
-	KindEntraGroup Kind = "entra-group"
-	KindHostUnit   Kind = "host-unit"
-	KindContainer  Kind = "container"
-	KindCredential Kind = "credential"
-	KindConfigDir  Kind = "config-directory"
-	KindData       Kind = "data"
-	KindHostChange Kind = "host-change"
+	KindDNSRecord         Kind = "dns-record"
+	KindAccessApp         Kind = "access-application"
+	KindTunnel            Kind = "tunnel"
+	KindEntraApp          Kind = "entra-application"
+	KindEntraGroup        Kind = "entra-group"
+	KindInstallerIdentity Kind = "installer-identity"
+	KindHostUnit          Kind = "host-unit"
+	KindContainer         Kind = "container"
+	KindCredential        Kind = "credential"
+	KindConfigDir         Kind = "config-directory"
+	KindData              Kind = "data"
+	KindHostChange        Kind = "host-change"
 )
 
 // Order is the removal order.
@@ -96,7 +97,7 @@ const (
 // Data is last, and only ever with explicit intent.
 var Order = []Kind{
 	KindDNSRecord, KindAccessApp, KindTunnel,
-	KindEntraApp, KindEntraGroup,
+	KindEntraApp, KindEntraGroup, KindInstallerIdentity,
 	KindHostUnit, KindContainer, KindCredential, KindConfigDir,
 	KindData, KindHostChange,
 }
@@ -217,6 +218,10 @@ func classify(r state.Resource) (Kind, Action, string) {
 		return KindAccessApp, ActionWithParent, "scoped to the Access application; removed with it, never deleted separately"
 	case "cloudflare/tunnel":
 		return KindTunnel, ActionRemove, "delete the tunnel after its connector has stopped"
+	case "entra/installer-application":
+		return KindInstallerIdentity, ActionRemove, "remove this deployment's installer identity after all other Entra work succeeds"
+	case "entra/installer-service-principal":
+		return KindInstallerIdentity, ActionWithParent, "removed with the installer application"
 	case "entra/application":
 		return KindEntraApp, ActionRemove, "delete the application; Entra's soft delete keeps it recoverable for 30 days"
 	case "entra/service-principal":
@@ -410,12 +415,13 @@ func (p Plan) Report(u *ui.UI) {
 // silent skip: the step is reported as retained, saying no removal is
 // implemented, and the run does not claim to be complete.
 type Ops struct {
-	StopConnector    func(ctx context.Context, container string) error
-	DeleteDNSRecord  func(ctx context.Context, providerID string) error
-	DeleteAccessApp  func(ctx context.Context, providerID string) error
-	DeleteTunnel     func(ctx context.Context, providerID string) error
-	DeleteEntraApp   func(ctx context.Context, providerID string) error
-	DeleteEntraGroup func(ctx context.Context, providerID string) error
+	StopConnector           func(ctx context.Context, container string) error
+	DeleteDNSRecord         func(ctx context.Context, providerID string) error
+	DeleteAccessApp         func(ctx context.Context, providerID string) error
+	DeleteTunnel            func(ctx context.Context, providerID string) error
+	DeleteInstallerIdentity func(ctx context.Context, providerID string) error
+	DeleteEntraApp          func(ctx context.Context, providerID string) error
+	DeleteEntraGroup        func(ctx context.Context, providerID string) error
 	// RemoveHostUnits removes every unit at once and returns the paths it
 	// removed, because the units share one binary copy whose removal must
 	// come after all of them. See HostUnits.
@@ -654,8 +660,39 @@ func Run(ctx context.Context, st *state.State, plan Plan, ops Ops, u *ui.UI, o O
 		}
 	}
 
+	installerRetained := false
 	for _, k := range Order {
-		step := runStep(ctx, k, plan, ops)
+		var step []Outcome
+		hold := false
+		if k == KindInstallerIdentity {
+			hold = len(res.Unrestored) > 0
+			for _, out := range res.Outcomes {
+				if out.Status == StatusUncertain {
+					hold = true
+				}
+			}
+			for _, previous := range res.Outcomes {
+				if (previous.Item.Kind == KindEntraApp || previous.Item.Kind == KindEntraGroup) && (previous.Status == StatusFailed || previous.Status == StatusRetained) {
+					hold = true
+				}
+			}
+		}
+		if hold || (k == KindCredential && installerRetained) {
+			for _, it := range plan.Items {
+				if it.Kind == k && (it.Action == ActionRemove || it.Action == ActionWithParent) {
+					step = append(step, Outcome{Item: it, Status: StatusRetained, Detail: "kept so a later run can finish Entra cleanup"})
+				}
+			}
+		} else {
+			step = runStep(ctx, k, plan, ops)
+		}
+		if k == KindInstallerIdentity {
+			for _, out := range step {
+				if out.Status == StatusFailed || out.Status == StatusRetained {
+					installerRetained = true
+				}
+			}
+		}
 		res.Outcomes = append(res.Outcomes, step...)
 		// Drop what is gone before the next step, and persist it, so an
 		// interruption never leaves a removed resource recorded as present,
@@ -749,6 +786,8 @@ func removeStep(ctx context.Context, k Kind, plan Plan, ops Ops) []Outcome {
 		one = ops.DeleteAccessApp
 	case KindTunnel:
 		one = ops.DeleteTunnel
+	case KindInstallerIdentity:
+		one = ops.DeleteInstallerIdentity
 	case KindEntraApp:
 		one = ops.DeleteEntraApp
 	case KindEntraGroup:

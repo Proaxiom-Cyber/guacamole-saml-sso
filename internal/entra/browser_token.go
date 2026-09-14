@@ -17,14 +17,15 @@ import (
 // verified domains. Neither transport errors nor Graph response bodies reach
 // the prompt: either can contain a malformed credential supplied by the user.
 func (c *Client) CheckBrowserToken(ctx context.Context, expectedTenant string) (tenant string, expires time.Time, err error) {
-	return c.checkTokenAccess(ctx, expectedTenant, true)
+	return c.checkTokenAccess(ctx, expectedTenant, "in Graph Explorer, grant consent and copy a fresh token")
 }
 
-func (c *Client) checkTokenAccess(ctx context.Context, expectedTenant string, browser bool) (tenant string, expires time.Time, err error) {
-	help := "in the installer app's API permissions, grant admin consent, then retry"
-	if browser {
-		help = "in Graph Explorer, grant consent and copy a fresh token"
-	}
+// CheckDeviceCodeToken verifies the administrator's delegated authorization.
+func (c *Client) CheckDeviceCodeToken(ctx context.Context, expectedTenant string) (string, time.Time, error) {
+	return c.checkTokenAccess(ctx, expectedTenant, "grant consent to the requested permissions, then sign in again")
+}
+
+func (c *Client) checkTokenAccess(ctx context.Context, expectedTenant, help string) (tenant string, expires time.Time, err error) {
 	token, err := c.Token(ctx)
 	if err != nil {
 		return "", time.Time{}, errors.New("could not read the Microsoft Graph access token")

@@ -347,10 +347,10 @@ func (o *Options) credentialMode(ctx context.Context, st *state.State, u *ui.UI)
 				u.Say("  %s — not available on this host: %s", s.Mode, s.Reason)
 				continue
 			}
-			u.Say("  %s — %s", s.Mode, creds.Explain(s.Mode))
+			u.Explain("Available: "+modeLabels[s.Mode], creds.Explain(s.Mode))
 			choices = append(choices, ui.Choice{Key: modeKeys[s.Mode], Label: modeLabels[s.Mode]})
 		}
-		k, err := u.Choose("Credential mode?", choices)
+		k, err := u.Choose("Protect service credentials\n\nThese credentials keep Guacamole and its services running after a reboot.\nTPM protection is preferred when this host supports it.\nOpen Details for the available storage methods and recovery implications.", choices)
 		if err != nil {
 			return err
 		}
@@ -389,7 +389,7 @@ func (o *Options) credentialMode(ctx context.Context, st *state.State, u *ui.UI)
 	}
 	st.Config["credential-mode"] = mode
 	u.Say("Credential storage method: %s.", mode)
-	u.Say("%s", creds.Detail(mode))
+	u.Explain("Credential protection selected. Open Details for reboot and recovery implications.", creds.Detail(mode))
 	return nil
 }
 
@@ -415,8 +415,8 @@ func (o *Options) manager(st *state.State, u *ui.UI) *creds.Manager {
 	o.credentialManager = &creds.Manager{
 		Mode:       st.Config["credential-mode"],
 		Dir:        filepath.Join(o.StateDir, "credentials"),
-		ReadSecret: u.SecretReader(),
-		Run:        o.credsRun(),
+		ReadSecret: u.SecretReader(), Protect: u.Protect,
+		Run: o.credsRun(),
 	}
 	return o.credentialManager
 }
@@ -669,6 +669,7 @@ type Options struct {
 	Entra                 *entra.Client   // injectable; nil selects environment input or guided device-code sign-in
 	EntraTenant           string
 	EntraClientID         string
+	reuseEntraIdentity    bool
 	EntraDeviceToken      func(entra.DeviceCodeOptions) (entra.TokenSource, error)                          // test seam
 	EntraApplicationToken func(entra.ApplicationOptions) (entra.TokenSource, error)                         // test seam
 	EntraCertificate      func(context.Context, string, string, entracert.Open) (entracert.Material, error) // test seam
@@ -887,7 +888,7 @@ func runPhases(ctx context.Context, store *state.Store, st *state.State, u *ui.U
 		last.FinishedAt = &now
 		if err != nil {
 			last.Result = state.ResultFailed
-			if errors.Is(err, ErrUncertain) {
+			if errors.Is(err, ErrUncertain) || errors.Is(err, entra.ErrUncertain) {
 				// The request was sent and the answer lost: the resource
 				// may exist. Record that so the next run queries by
 				// ownership marker before retrying any creation.
@@ -907,6 +908,11 @@ func runPhases(ctx context.Context, store *state.Store, st *state.State, u *ui.U
 		u.PhaseDone(p.Name)
 	}
 	u.Say("Session complete. Deployment %s.", st.DeploymentID)
+	summary := []string{"Setup complete.", "Deployment: " + st.DeploymentID}
+	if host := st.Config["guac-hostname"]; host != "" {
+		summary = append(summary, "Open https://"+host+"/")
+	}
+	u.Summary(summary...)
 	return nil
 }
 
@@ -1791,7 +1797,7 @@ func (o *Options) azureDestination(ctx context.Context, st *state.State, u *ui.U
 		// exists once the identity phase has run. Without it the package says
 		// plainly that scheduled uploads will fail until a role is granted.
 		UploaderObjectID: st.Config["entra-sp-object-id"],
-		Say:              u.Say,
+		Say:              u.Transient,
 		Ask:              u.Line,
 		Confirm:          u.Confirm,
 		Choose:           chooseFromList(u),

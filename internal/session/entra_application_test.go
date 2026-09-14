@@ -44,7 +44,7 @@ func TestInstallerAppGuidedChecksRetriesAndPreservesOwnership(t *testing.T) {
 			dir := t.TempDir()
 			steps := "a\nc\nc\nc\nc\n"
 			if method == "secret" {
-				steps = "s\nc\nc\nc\n"
+				steps = "x\ns\nc\nc\nc\n"
 			}
 			u, out := testUI(true, steps+tenant+"\n"+clientID+"\nr\n\n\n")
 			secrets := 0

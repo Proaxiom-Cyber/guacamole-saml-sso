@@ -26,6 +26,8 @@ jobs:
           go test ./...
           PATH=/usr/bin:/bin:/usr/sbin:/sbin bash tests/launcher_test.sh
           python3 tests/launcher_interactive_test.py
+          go build -o "$RUNNER_TEMP/guacdeploy-preview" ./cmd/guacdeploy
+          python3 tests/wizard_interactive_test.py "$RUNNER_TEMP/guacdeploy-preview"
 
       - name: Test database recovery and a fresh container stack
         run: |

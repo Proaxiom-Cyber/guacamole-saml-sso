@@ -284,7 +284,9 @@ var (
 	ansiSeq    = regexp.MustCompile("\x1b\\[[0-9;?]*[a-zA-Z]")
 	colourSeq  = regexp.MustCompile("\x1b\\[[0-9;]*m")
 	idPattern  = regexp.MustCompile(`\b[0-9a-f]{32}\b`)
-	rfc3339Pat = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T[\d:]+Z`)
+	rfc3339Pat = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T[\d:.]+Z`)
+	clockPat   = regexp.MustCompile(`\b\d{2}:\d{2}:\d{2}\b`)
+	logPathPat = regexp.MustCompile(`(?m)^Session log: [^\r\n]+`)
 )
 
 func stripANSI(s string) string { return ansiSeq.ReplaceAllString(s, "") }
@@ -294,6 +296,8 @@ func stripANSI(s string) string { return ansiSeq.ReplaceAllString(s, "") }
 func normalise(s string) string {
 	s = idPattern.ReplaceAllString(s, "<deployment-id>")
 	s = rfc3339Pat.ReplaceAllString(s, "<time>")
+	s = clockPat.ReplaceAllString(s, "<clock>")
+	s = logPathPat.ReplaceAllString(s, "Session log: <path>")
 	return strings.ReplaceAll(s, "\r\n", "\n")
 }
 
@@ -411,8 +415,8 @@ func TestPTYTermiosRestoredExactly(t *testing.T) {
 
 func TestPTYResize(t *testing.T) {
 	p := openPTY(t, 24, 80)
-	// Sizes stay at or above the documented floor of 20 rows and 40 columns.
-	// Below that the frame is taller than the window by design.
+	// Finish below the 48-column minimum. The final frame must become a
+	// resize gate that fits the real window, without stale content.
 	sizes := []struct{ rows, cols uint16 }{{30, 100}, {24, 60}, {20, 46}}
 
 	r := childRunner(t, p, "resize", true, func(t *testing.T, r *runner) {
@@ -429,8 +433,10 @@ func TestPTYResize(t *testing.T) {
 	if len(frames) < 4 {
 		t.Fatalf("only %d frames were drawn", len(frames))
 	}
-	// The final frame can be cut short by the kill, so check the one before.
-	final := stripANSI(frames[len(frames)-2])
+	final := stripANSI(frames[len(frames)-1])
+	if !strings.Contains(final, "Resize to 48 x 16") {
+		t.Fatalf("small terminal did not show the resize gate: %s", final)
+	}
 	lines := strings.Split(strings.TrimSuffix(final, "\r\n"), "\r\n")
 
 	var wide []string
@@ -570,7 +576,8 @@ func TestPTYCancelDuringARunningPhase(t *testing.T) {
 	reachRunningPhase := func(t *testing.T, r *runner) {
 		r.await(t, "Start a fresh setup?", 20*time.Second)
 		r.send("y")
-		r.await(t, "[running]  test-sleep", 20*time.Second)
+		r.await(t, "test sleep", 20*time.Second)
+		r.await(t, "WORKING", 20*time.Second)
 		time.Sleep(300 * time.Millisecond)
 	}
 

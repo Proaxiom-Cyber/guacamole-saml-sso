@@ -145,7 +145,7 @@ func TestEntraResumeRefusesDifferentTenantBeforeMutation(t *testing.T) {
 }
 
 func TestBrowserEntraTokenCorrectsInputAndCachesOnlyInMemory(t *testing.T) {
-	for _, method := range []string{"b\n", "d\nb\n"} {
+	for _, method := range []string{"x\nb\n", "d\nb\n"} {
 		t.Run(strings.TrimSpace(method), func(t *testing.T) {
 			t.Setenv(entra.DefaultTokenEnv, "")
 			u, out := testUI(true, method+"c\nc\nc\n")
@@ -196,7 +196,7 @@ func TestBrowserEntraTokenCorrectsInputAndCachesOnlyInMemory(t *testing.T) {
 			if prompts != 3 || checks != 5 {
 				t.Fatalf("unexpected prompts or Graph checks: %d, %d", prompts, checks)
 			}
-			if (method == "b\n" && deviceCalls != 0) || (method != "b\n" && deviceCalls != 1) {
+			if (method == "x\nb\n" && deviceCalls != 0) || (method != "x\nb\n" && deviceCalls != 1) {
 				t.Fatal("wrong device-code behavior")
 			}
 			for _, token := range inputs {
@@ -216,7 +216,7 @@ func TestBrowserEntraTokenCorrectsInputAndCachesOnlyInMemory(t *testing.T) {
 
 func TestBrowserEntraBlankOrCancelledInputStops(t *testing.T) {
 	for _, cancel := range []bool{false, true} {
-		u, _ := testUI(true, "b\nc\nc\nc\n")
+		u, _ := testUI(true, "x\nb\nc\nc\nc\n")
 		u.Secret = func(string) (string, error) {
 			if cancel {
 				return "", context.Canceled

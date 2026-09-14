@@ -11,6 +11,51 @@ install section of the README for the command, and
 [release-and-verification.md](release-and-verification.md) for what the
 launcher verifies and which network destinations it uses.
 
+## Guided terminal interface
+
+The full-screen wizard shows the current task, saved progress, and elapsed time.
+The progress bar counts completed steps. It does not estimate the time remaining.
+Wide terminals also show the surrounding deployment stages.
+
+- Use the arrow keys to move between actions. Press Enter to select an action.
+- Press the letter in brackets to select an action directly.
+- Press Tab to switch between the current task and session details.
+- Use Page Up and Page Down to read longer instructions or history.
+- Press Ctrl-C to cancel. Completed work remains available for resume.
+
+The terminal must have at least 48 columns and 16 rows. Below that size, resize it
+before answering. The installer ignores action keys until the interface is visible.
+A terminal without screen controls uses the plain prompt interface.
+
+Use `guacdeploy preview` to try the real interface with example data. This command
+creates no deployment resources and needs no customer credentials.
+
+Set `NO_COLOR=1` to disable colour. Set `GUACDEPLOY_REDUCED_MOTION=1` to disable the
+activity animation. Set `GUACDEPLOY_ASCII=1` for ASCII progress and status markers.
+The interface uses the terminal's foreground and background colours.
+
+### Session logs
+
+Setup, teardown, and recovery write a separate timestamped log for each invocation:
+
+```text
+/var/lib/guacdeploy/logs/<UTC timestamp>.log
+```
+
+An alternate `--state-dir` also changes the log directory. The directory uses mode
+0700; each log uses mode 0600. The terminal prints the path when the command ends.
+To follow a running session, use `sudo tail -f` with its log path.
+
+Logs contain application events and phase results. They do not record terminal
+input, device sign-in codes, private keys, or a raw subprocess transcript. The
+in-memory redactor removes known credentials and common token formats. Logs can
+contain hostnames, resource IDs, and tenant names; review them before sharing.
+
+Each log has a 16 MiB limit. If writing fails or reaches the limit, the exit report
+states that the log is incomplete. This does not discard saved deployment progress.
+Logs remain after teardown for diagnosis. Delete old logs when you no longer need
+them; this version does not delete logs automatically.
+
 ## Commands
 
 | Command | Purpose |
@@ -334,11 +379,41 @@ credential values. Do not edit it by hand.
 Setup provisions the Entra application, service principal and the two
 groups that carry sign-in, then restarts Guacamole with SAML enabled.
 
-Guided setup asks for the Microsoft tenant ID or a verified domain. It then offers
-an installer app with a certificate or client secret, device-code sign-in, or
-Graph Explorer. The installer app path does not depend on Graph Explorer or device
-codes. You supply the tenant ID and client ID. The installer obtains and renews
-its own short-lived access tokens internally.
+Guided setup asks for the Microsoft tenant ID or a verified domain. Choose
+**Connect with Microsoft** for the recommended flow. Device-code sign-in authorizes
+setup. The certificate authenticates this host on later runs. These are two parts
+of the same flow.
+
+### Automatic installer identity
+
+1. Review the proposed application permissions in the terminal.
+2. Choose **Authorize setup and register the certificate**.
+3. Open the Microsoft sign-in address on your workstation. Enter the displayed code.
+4. Sign in as a Privileged Role Administrator or Global Administrator of the selected tenant.
+5. Review Microsoft's consent prompt. Setup continues after authorization.
+
+The host generates its private key inside the TPM. Setup registers the public
+certificate, creates an installer application, and grants its four listed Microsoft
+Graph application permissions. It then checks access through that installer identity.
+No certificate transfer or token copy is needed. Tenant sign-in and consent policies
+still apply.
+
+The installer application is separate from the Guacamole SAML application. Its name
+includes the deployment ID. Setup records its ownership before each creation request.
+On interruption, setup queries Entra before retrying. An unconfirmed creation with no
+visible result requires review; the installer does not create a duplicate.
+
+On later runs, choose **Use the installer identity already registered for this host**.
+Teardown removes that identity after the other Entra resources. If Entra cleanup fails,
+it preserves the identity and local credentials so a later run can finish.
+
+If the host cannot use its TPM, choose **Other authentication options**. You can
+explicitly select a client secret or device-code authorization for this run only.
+If tenant policy blocks device codes, choose **Device code blocked: register the
+installer app yourself**. This uses the manual procedure below.
+
+Microsoft documents [application creation](https://learn.microsoft.com/en-us/graph/api/application-post-applications?view=graph-rest-1.0)
+and [application permission grants](https://learn.microsoft.com/en-us/graph/api/serviceprincipal-post-approleassignedto?view=graph-rest-1.0).
 
 ### Manually registered installer app
 
@@ -364,7 +439,7 @@ An existing installer app can use the same procedure from step 4. The wizard kee
 each instruction on screen until you choose Continue. Microsoft documents the
 [admin consent requirements](https://learn.microsoft.com/en-us/entra/identity/enterprise-apps/grant-admin-consent).
 
-**Certificate option.** Choose **Installer app: generate a TPM certificate**.
+**Certificate option.** Choose **Device code blocked: register the installer app yourself**.
 The host needs an accessible TPM 2.0 resource-manager device, `/dev/tpmrm0`, with
 empty owner authorization. The installer creates a non-exportable RSA signing key
 inside that TPM. It does not install a TPM utility or export a plaintext private key.
@@ -432,15 +507,16 @@ the initial prompt. A recorded deployment tenant takes precedence on resume.
 
 Sign-in requests Application.ReadWrite.All, Group.ReadWrite.All,
 AppRoleAssignment.ReadWrite.All and Organization.Read.All. Access and refresh
-tokens stay in process memory. Setup stores only the tenant identifiers.
+tokens stay in process memory. The recommended flow then registers the host certificate.
+The optional **Device-code sign-in for this run only** path does not register an identity.
 If device-code sign-in fails, retry, select an installer app, use Graph Explorer,
 or quit and retain progress.
-Resume asks you to sign in again and refuses a different tenant before it makes
-Entra changes. Tenant consent and sign-in policies still apply.
+A registered host identity can authenticate on resume. Without one, sign in again.
+Setup refuses a different tenant before it makes Entra changes. Tenant consent and sign-in policies still apply.
 
 ### Browser fallback when device codes are blocked
 
-Choose **Browser: Graph Explorer, then paste an access token**. The wizard keeps
+Choose **Other authentication options > Paste an access token from Graph Explorer**. The wizard keeps
 each instruction on screen until you choose Continue.
 
 Graph Explorer provides the sign-in token. The installer makes the API calls.

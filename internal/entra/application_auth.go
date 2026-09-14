@@ -113,6 +113,6 @@ func safeApplicationError(err error) error {
 // CheckApplicationAccess validates application roles and binds the app to the
 // live selected tenant before any mutation. No provider error body is printed.
 func (c *Client) CheckApplicationAccess(ctx context.Context, expectedTenant string) error {
-	_, _, err := c.checkTokenAccess(ctx, expectedTenant, false)
+	_, _, err := c.checkTokenAccess(ctx, expectedTenant, "in the installer app's API permissions, grant admin consent, then retry")
 	return err
 }
