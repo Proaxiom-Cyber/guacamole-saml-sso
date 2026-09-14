@@ -1,0 +1,54 @@
+[
+  {
+    "test": "environment",
+    "utc": "2026-09-14T13:18:56.395972+00:00",
+    "docker": "29.1.3 aarch64",
+    "images": {
+      "postgres:18-alpine": "sha256:6def1cb8d5ffa3443c527419cc13f395ab328c27bf90fcb1e80831aae4103bc3",
+      "guacamole/guacamole:1.6.0": "sha256:e0de4a2e386c990b5f0d196075b1b439e96c73220cd06eaadf137ff15226a775"
+    }
+  },
+  {
+    "test": "streaming_replication",
+    "standby_in_recovery": "t",
+    "rows": "1|before replication"
+  },
+  {
+    "test": "async_partition",
+    "primary_rows": "2",
+    "standby_rows": "1"
+  },
+  {
+    "test": "standby_without_manager",
+    "still_in_recovery": "t"
+  },
+  {
+    "test": "manual_promotion_after_fencing",
+    "in_recovery": "f",
+    "rows": "1|before replication\n3|new primary",
+    "lost_acknowledged_id2": true
+  },
+  {
+    "test": "sync_without_standby",
+    "blocked_after_two_seconds": true,
+    "exit_code": 0,
+    "wait_cancelled": true,
+    "locally_visible_after_cancel": true
+  },
+  {
+    "test": "token_locality_shared_postgres",
+    "app1_token_on_app1": 200,
+    "app1_token_on_app2": 403,
+    "app2_own_token_on_app2": 200
+  },
+  {
+    "test": "app1_stopped",
+    "app1_token_on_surviving_app2": 403,
+    "app2_own_token_on_app2": 200
+  },
+  {
+    "test": "cleanup",
+    "remaining_containers": "",
+    "remaining_network": ""
+  }
+]
