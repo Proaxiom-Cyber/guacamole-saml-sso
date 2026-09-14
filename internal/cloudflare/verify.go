@@ -357,7 +357,38 @@ func accessLoginPath(hostname string) string {
 // redirect itself is the evidence, and it has to be the login for this
 // application and this hostname. Matching the team domain alone would accept a
 // redirect to some other Access application in the same account.
+var accessPropagationWait = 2 * time.Minute
+var accessPropagationPoll = 2 * time.Second
+
+type accessEdgeUnavailable struct {
+	status int
+	target string
+}
+
+func (e *accessEdgeUnavailable) Error() string {
+	return fmt.Sprintf("%s answered HTTP %d with no Access challenge; protection is not verified", e.target, e.status)
+}
+
 func (c *Client) accessChallenge(ctx context.Context, hostname, authDomain, aud string) (string, error) {
+	deadline := time.Now().Add(accessPropagationWait)
+	for {
+		challenge, err := c.accessChallengeOnce(ctx, hostname, authDomain, aud)
+		var unavailable *accessEdgeUnavailable
+		if !errors.As(err, &unavailable) {
+			return challenge, err
+		}
+		if !time.Now().Before(deadline) {
+			return "", fmt.Errorf("Cloudflare Access did not become ready within %s: %w", accessPropagationWait, err)
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(accessPropagationPoll):
+		}
+	}
+}
+
+func (c *Client) accessChallengeOnce(ctx context.Context, hostname, authDomain, aud string) (string, error) {
 	target := "https://" + hostname + "/"
 	req, err := http.NewRequestWithContext(ctx, "GET", target, nil)
 	if err != nil {
@@ -368,6 +399,9 @@ func (c *Client) accessChallenge(ctx context.Context, hostname, authDomain, aud 
 		return "", fmt.Errorf("could not reach %s to check that Access is enforcing: %v", target, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 500 && resp.StatusCode <= 599 {
+		return "", &accessEdgeUnavailable{status: resp.StatusCode, target: target}
+	}
 	loc := resp.Header.Get("Location")
 	if resp.StatusCode < 300 || resp.StatusCode > 399 || loc == "" {
 		return "", fmt.Errorf("%s answered HTTP %d with no Access challenge: the hostname is not protected", target, resp.StatusCode)

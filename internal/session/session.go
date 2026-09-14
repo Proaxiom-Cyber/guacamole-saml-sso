@@ -1421,6 +1421,7 @@ func (o *Options) cloudflareAccess(ctx context.Context, st *state.State, u *ui.U
 	// Verification compares the policy actually stored at Cloudflare with
 	// the allow-list that was applied, so a policy that drifted or admits
 	// everyone is caught rather than assumed correct.
+	u.Say("Checking Cloudflare Access. Edge propagation can take up to two minutes; the connector stays stopped until protection is verified.")
 	v, err := p.VerifyAccess(ctx, app.ID, cloudflare.AccessExpectation{
 		Allow:         allow,
 		EntraTenantID: st.Config["entra-tenant-id"],
