@@ -145,8 +145,19 @@ A mode this host cannot do is refused with the reason — no TPM device, systemd
 older than 250, or a TPM the firmware or driver cannot use — and setup stops
 there. It never answers an unavailable encrypted mode by writing the value in
 plaintext instead. Choose another mode yourself.
-Setup checks that required credentials are available and names exactly
-what to supply when one is missing. Credential values never appear in
+Setup checks the Cloudflare API token as soon as you supply it, before saving it
+or installing Docker. The check uses a read-only zone request and accepts user
+and account API tokens. A rejected token opens a hidden replacement prompt.
+A connection error offers a retry with the same token. Quit retains your progress.
+
+Resume repeats the credential check, including sessions from older releases.
+If a saved token fails, choose replacement to validate and save a new token with
+the same storage method. The database password and completed setup work remain.
+Unattended runs stop with instructions to supply the token again. Environment mode
+uses `GUACDEPLOY_CRED_CLOUDFLARE_API_TOKEN` and does not save a replacement.
+
+Setup names what to supply when a required credential is missing.
+Credential values never appear in
 deployment state, logs, or command arguments. Files written by the tool
 are recorded as material owned by this deployment, so teardown can offer
 their removal; files you placed yourself are pre-existing and stay.
@@ -327,10 +338,17 @@ deployment created are recorded as its own.
 
 ## Cloudflare tunnel, DNS and Access
 
-Setup selects the Cloudflare account and zone from the hostname's apex,
-or from `--zone` when the guess is wrong or several zones share a name.
+Setup finds the most specific visible Cloudflare zone for the hostname by querying
+its parent names. This includes domains such as `demo-customer.com.au` and
+delegated subdomains. Use `--zone` to select an exact zone name.
 It checks the API token's read access before creating anything. The zone
 itself is always pre-existing and is never removed by teardown.
+
+The initial token check proves authentication and Zone Read access. The selected
+zone checks cover DNS and Tunnel read access. Write permissions still need the
+documented DNS, Tunnel and Access scopes; a read check cannot prove write access.
+Cloudflare documents [account API tokens](https://developers.cloudflare.com/fundamentals/api/get-started/account-owned-tokens/)
+and the [zone list API](https://developers.cloudflare.com/api/resources/zones/methods/list/).
 
 Three resources are created, one per phase, each recorded with ownership
 evidence: a remotely managed tunnel whose name carries the deployment

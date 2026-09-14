@@ -85,6 +85,15 @@ type Manager struct {
 	values map[string]string // session cache; never serialised
 }
 
+// Remember keeps an accepted value for this process only. It does not write
+// to the environment, the state file, or a credential file.
+func (m *Manager) Remember(s Spec, value string) {
+	if m.values == nil {
+		m.values = map[string]string{}
+	}
+	m.values[s.Name] = value
+}
+
 // ErrUnattendedPrompt means prompt mode was asked for a value without a
 // terminal. Prompt mode cannot support unattended operation.
 var ErrUnattendedPrompt = errors.New("prompt-mode credentials require an interactive terminal")

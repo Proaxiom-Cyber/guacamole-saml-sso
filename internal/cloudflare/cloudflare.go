@@ -222,10 +222,16 @@ func (c *Client) VerifyToken(ctx context.Context) error {
 	return nil
 }
 
+// CheckToken checks authentication and Zone Read with a read-only request.
+// Unlike /user/tokens/verify, this works for both user and account API tokens.
+// The selected zone and its other permissions still need Preflight.
+func (c *Client) CheckToken(ctx context.Context) error {
+	return c.do(ctx, "GET", "/zones?per_page=1", nil, nil)
+}
+
 // Preflight proves the token works and holds the read permissions this
 // package needs, without mutating anything:
 //
-//	GET /user/tokens/verify                     — token is valid and active
 //	GET /zones/{zone}                           — Zone : Zone : Read
 //	GET /zones/{zone}/dns_records?per_page=1    — Zone : DNS : Read
 //	GET /accounts/{acct}/cfd_tunnel?per_page=1  — Account : Cloudflare Tunnel : Read
@@ -235,9 +241,6 @@ func (c *Client) VerifyToken(ctx context.Context) error {
 // write would create real resources. They are proven by the first Apply,
 // which surfaces HTTP 403 as an APIError naming the failed endpoint.
 func (c *Client) Preflight(ctx context.Context, accountID, zoneID string) error {
-	if err := c.VerifyToken(ctx); err != nil {
-		return err
-	}
 	checks := []struct{ what, path string }{
 		{"read the zone (Zone Read)", "/zones/" + zoneID},
 		{"read DNS records (DNS Read)", "/zones/" + zoneID + "/dns_records?per_page=1"},

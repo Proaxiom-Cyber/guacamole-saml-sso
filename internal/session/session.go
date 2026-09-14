@@ -61,7 +61,7 @@ func Phases(opts *Options) []Phase {
 		{Name: "initialise-deployment", Run: initialiseDeployment},
 		{Name: "host-preflight", Run: opts.hostPreflight},
 		{Name: "credential-mode", Run: opts.credentialMode},
-		{Name: "credential-check", Run: opts.credentialCheck},
+		{Name: "credential-check", Run: opts.credentialCheck, Always: true},
 		{Name: "host-dependencies", Run: opts.hostDependencies},
 		{Name: "stack-configure", Run: opts.stackConfigure},
 		{Name: "cloudflare-select", Run: opts.cloudflareSelect},
@@ -407,12 +407,16 @@ var modeLabels = map[string]string{
 }
 
 func (o *Options) manager(st *state.State, u *ui.UI) *creds.Manager {
-	return &creds.Manager{
+	if o.credentialManager != nil {
+		return o.credentialManager
+	}
+	o.credentialManager = &creds.Manager{
 		Mode:       st.Config["credential-mode"],
 		Dir:        filepath.Join(o.StateDir, "credentials"),
 		ReadSecret: u.SecretReader(),
 		Run:        o.credsRun(),
 	}
+	return o.credentialManager
 }
 
 func (o *Options) credsRun() creds.Runner {
@@ -431,6 +435,16 @@ func (o *Options) credSpecs() []creds.Spec {
 
 func (o *Options) credentialCheck(ctx context.Context, st *state.State, u *ui.UI) error {
 	m := o.manager(st, u)
+	// Validate Cloudflare before storing a new value, generating the database
+	// password, or installing Docker. Recheck on resume, including sessions
+	// from older versions that already marked credential-check complete.
+	for _, s := range o.credSpecs() {
+		if s.Name == "cloudflare-api-token" {
+			if err := o.checkCloudflareCredential(ctx, st, u, m, s); err != nil {
+				return err
+			}
+		}
+	}
 	if creds.Persistent(m.Mode) {
 		for _, s := range o.credSpecs() {
 			// The stored filename differs by mode: plaintext modes store the
@@ -673,8 +687,9 @@ type Options struct {
 	EnsureRecordingDirs func(installDir string) error
 	// AccessVerify is injectable for tests: the real one re-reads the
 	// Access application, its policy and its identity provider.
-	AccessVerify func(ctx context.Context, st *state.State) error
-	Phases       []Phase
+	AccessVerify      func(ctx context.Context, st *state.State) error
+	Phases            []Phase
+	credentialManager *creds.Manager // process-local cache; never part of state
 }
 
 func (o *Options) phases() []Phase {
@@ -1127,11 +1142,8 @@ func lastAttemptUncertain(st *state.State, intent string) bool {
 // in runPhases is the pre-create record the specification requires.
 
 func (o *Options) cloudflareClient(st *state.State, u *ui.UI) *cloudflare.Client {
-	if o.Cloudflare != nil {
-		return o.Cloudflare
-	}
 	m := o.manager(st, u)
-	return &cloudflare.Client{
+	client := &cloudflare.Client{
 		AuthorityNameServers: splitList(st.Config["cloudflare-zone-nameservers"]),
 		Token: func(context.Context) (string, error) {
 			for _, s := range o.credSpecs() {
@@ -1142,6 +1154,11 @@ func (o *Options) cloudflareClient(st *state.State, u *ui.UI) *cloudflare.Client
 			return "", errors.New("no cloudflare-api-token credential is configured")
 		},
 	}
+	if o.Cloudflare != nil {
+		client.Base = o.Cloudflare.Base
+		client.HTTP = o.Cloudflare.HTTP
+	}
+	return client
 }
 
 func (o *Options) provisioner(st *state.State, u *ui.UI) *cloudflare.Provisioner {
@@ -1154,32 +1171,31 @@ func (o *Options) provisioner(st *state.State, u *ui.UI) *cloudflare.Provisioner
 	}
 }
 
-// apexOf returns the registrable domain guess for a hostname. The operator
-// can override it, because no suffix list is shipped.
-func apexOf(hostname string) string {
-	parts := strings.Split(hostname, ".")
-	if len(parts) < 2 {
-		return hostname
-	}
-	return strings.Join(parts[len(parts)-2:], ".")
-}
-
 func (o *Options) cloudflareSelect(ctx context.Context, st *state.State, u *ui.UI) error {
 	cf := o.cloudflareClient(st, u)
-	if err := cf.VerifyToken(ctx); err != nil {
-		return fmt.Errorf("the Cloudflare API token was rejected: %w", err)
-	}
 	apex := o.Zone
+	var zones []cloudflare.Zone
+	var err error
 	if apex == "" {
-		apex = apexOf(st.Config["guac-hostname"])
+		// Query exact parent names, most specific first. Counting two labels
+		// mistakes com.au for a customer's zone and misses delegated zones.
+		apex = strings.TrimSuffix(strings.ToLower(st.Config["guac-hostname"]), ".")
+		for strings.Contains(apex, ".") {
+			zones, err = cf.ZonesByName(ctx, apex)
+			if err != nil || len(zones) > 0 {
+				break
+			}
+			apex = strings.SplitN(apex, ".", 2)[1]
+		}
+	} else {
+		zones, err = cf.ZonesByName(ctx, apex)
 	}
-	zones, err := cf.ZonesByName(ctx, apex)
 	if err != nil {
 		return err
 	}
 	switch {
 	case len(zones) == 0:
-		return fmt.Errorf("no Cloudflare zone named %q is visible to this token; pass --zone with the exact zone name", apex)
+		return fmt.Errorf("no Cloudflare zone for hostname %q is visible to this token; check Zone Read access or pass --zone with the exact zone name", st.Config["guac-hostname"])
 	case len(zones) > 1:
 		return fmt.Errorf("%w: %d Cloudflare zones are named %q; pass --zone to choose one", ErrApprovalRequired, len(zones), apex)
 	}
