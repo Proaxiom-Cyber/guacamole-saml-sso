@@ -253,7 +253,7 @@ func (o *Options) stackRender(ctx context.Context, st *state.State, u *ui.UI) er
 		Provider: "host", Type: "data-directory", Name: filepath.Join(cfg.InstallDir, "data"),
 		Ownership: "created by this deployment; preserved by default at teardown", CreatedAt: now,
 	})
-	u.Say("Stack configuration rendered under %s (a temporary self-signed certificate serves until the origin certificate is issued).", cfg.InstallDir)
+	u.Say("Service configuration ready in %s. Certificate validity is checked in the origin-certificate step.", cfg.InstallDir)
 	return nil
 }
 
@@ -778,17 +778,17 @@ func Run(ctx context.Context, opts Options) error {
 		// forbids, because every completed phase is left alone.
 		u.Say("A completed deployment already exists on this host (deployment %s, created %s).",
 			st.DeploymentID, st.CreatedAt.Format(time.RFC3339))
-		u.Say("This tool manages one deployment per host and does not overwrite it.")
-		u.Say("Run teardown first to start over. Existing installations from the old scripts are not adopted.")
 		// Not overwriting is not the same as doing nothing. A newer version
 		// can carry work this deployment never ran, and the phases that
 		// write desired state -- units, timers, rendered configuration --
 		// must be able to repair a host that is already set up. Completed
 		// one-shot phases are still left exactly as they are.
 		if len(convergeable(st, opts.phases())) > 0 {
-			u.Say("Re-applying the configuration this tool maintains. Completed work is left as it is.")
+			u.Say("Checking credentials and refreshing managed service files. Completed resource-creation steps are skipped.")
 			return runPhases(ctx, store, st, u, &opts, opts.phases())
 		}
+		u.Say("No setup work remains. This tool manages one deployment per host and does not overwrite it.")
+		u.Say("To start a new deployment, run teardown first.")
 		if !u.Interactive {
 			return errors.New("existing deployment present; teardown is required before a new setup")
 		}
