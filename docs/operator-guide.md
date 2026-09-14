@@ -406,6 +406,12 @@ includes the deployment ID. Setup records its ownership before each creation req
 On interruption, setup queries Entra before retrying. An unconfirmed creation with no
 visible result requires review; the installer does not create a duplicate.
 
+Entra can take time to make new objects and permission grants readable. Setup waits
+for explicit replication refusals. On resume, it checks recorded object IDs directly
+instead of assuming that a missing search result means the object does not exist.
+If Entra reports an existing permission grant, setup reads back that exact grant
+before it continues. Permission denials still stop the operation.
+
 On later runs, choose **Use the installer identity already registered for this host**.
 Teardown removes that identity after the other Entra resources. If Entra cleanup fails,
 it preserves the identity and local credentials so a later run can finish.

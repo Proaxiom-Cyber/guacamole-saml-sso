@@ -88,7 +88,19 @@ func (o *Options) automaticInstallerToken(administrator entra.TokenSource) entra
 		}
 		u.Say("Administrator authorized the selected tenant. Registering the host certificate...")
 		applyCtx, applyCancel := context.WithTimeout(ctx, 2*time.Minute)
-		app, err := admin.EnsureInstaller(applyCtx, st.DeploymentID, material.Certificate, st.Config["entra-installer-pending"], checkpoint)
+		known := entra.InstallerApplication{AppID: st.Config["entra-installer-client-id"]}
+		for _, r := range st.Resources {
+			if r.Provider != "entra" {
+				continue
+			}
+			if r.Type == "installer-application" {
+				known.ID = r.ProviderID
+			}
+			if r.Type == "installer-service-principal" {
+				known.SPID = r.ProviderID
+			}
+		}
+		app, err := admin.EnsureInstaller(applyCtx, st.DeploymentID, material.Certificate, known, st.Config["entra-installer-pending"], checkpoint)
 		applyCancel()
 		if err != nil {
 			return "", err

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 )
 
 const graphAppID = "00000003-0000-0000-c000-000000000000"
@@ -35,12 +36,16 @@ func InstallerName(deploymentID string) string   { return "Guacamole Installer (
 
 // collection follows Graph pagination only within the expected Graph API.
 func (c *Client) collection(ctx context.Context, path string) ([]json.RawMessage, error) {
+	return c.collectionUsing(ctx, path, c.call)
+}
+
+func (c *Client) collectionUsing(ctx context.Context, path string, request func(context.Context, string, string, any) (json.RawMessage, error)) ([]json.RawMessage, error) {
 	var result []json.RawMessage
 	for pages := 0; path != ""; pages++ {
 		if pages >= 100 {
 			return nil, errors.New("Graph listing exceeded 100 pages; review the tenant before continuing")
 		}
-		b, err := c.call(ctx, http.MethodGet, path, nil)
+		b, err := request(ctx, http.MethodGet, path, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -101,16 +106,63 @@ func (c *Client) FindInstaller(ctx context.Context, deploymentID string) (*Insta
 	return &app, nil
 }
 
+// recordedInstaller reads acknowledged identifiers directly. Directory search can
+// omit a newly created object; that is never permission to create a replacement.
+func (c *Client) recordedInstaller(ctx context.Context, deploymentID string, known InstallerApplication) (*InstallerApplication, error) {
+	b, err := c.callFresh(ctx, http.MethodGet, "/applications/"+url.PathEscape(known.ID)+"?$select=id,appId,displayName,notes,tags", nil)
+	if err != nil {
+		return nil, err
+	}
+	var app InstallerApplication
+	if json.Unmarshal(b, &app) != nil || app.ID != known.ID || app.AppID == "" || (known.AppID != "" && app.AppID != known.AppID) {
+		return nil, fmt.Errorf("%w: recorded installer application identifiers do not match", ErrRequiresReview)
+	}
+	marker := InstallerMarker(deploymentID)
+	if app.Notes != marker || !slices.Contains(app.Tags, marker) {
+		return nil, ErrNotOwned
+	}
+	if known.SPID != "" {
+		b, err = c.callFresh(ctx, http.MethodGet, "/servicePrincipals/"+url.PathEscape(known.SPID)+"?$select=id,appId,tags", nil)
+		if err != nil {
+			return nil, err
+		}
+		var sp struct {
+			ID, AppID string
+			Tags      []string
+		}
+		if json.Unmarshal(b, &sp) != nil || sp.ID != known.SPID || sp.AppID != app.AppID || !slices.Contains(sp.Tags, marker) {
+			return nil, fmt.Errorf("%w: recorded installer service principal does not match", ErrRequiresReview)
+		}
+		app.SPID = sp.ID
+	} else {
+		// A request without an acknowledged ID still needs collection recovery.
+		current, err := c.FindInstaller(ctx, deploymentID)
+		if err != nil {
+			return nil, err
+		}
+		if current != nil && current.ID == app.ID {
+			app.SPID = current.SPID
+		}
+	}
+	return &app, nil
+}
+
 // EnsureInstaller is called only after explicit consent to the listed application
 // permissions. Checkpoint persists intent BEFORE every mutation, and identifiers
 // after it. Pending records a previous request without an acknowledged response.
 // A negative read cannot prove such a request failed, so it never blindly retries.
-func (c *Client) EnsureInstaller(ctx context.Context, deploymentID string, cert *x509.Certificate, pending string, checkpoint func(string, InstallerApplication) error) (InstallerApplication, error) {
+func (c *Client) EnsureInstaller(ctx context.Context, deploymentID string, cert *x509.Certificate, known InstallerApplication, pending string, checkpoint func(string, InstallerApplication) error) (InstallerApplication, error) {
 	var zero InstallerApplication
 	if cert == nil || checkpoint == nil || deploymentID == "" {
 		return zero, errors.New("installer registration requires a certificate and an intent journal")
 	}
-	found, err := c.FindInstaller(ctx, deploymentID)
+	var found *InstallerApplication
+	var err error
+	if known.ID != "" {
+		found, err = c.recordedInstaller(ctx, deploymentID, known)
+	} else {
+		found, err = c.FindInstaller(ctx, deploymentID)
+	}
 	if err != nil {
 		return zero, err
 	}
@@ -203,6 +255,7 @@ func (c *Client) EnsureInstaller(ctx context.Context, deploymentID string, cert 
 			}
 		}
 	}
+	createdPrincipal := false
 	if app.SPID == "" {
 		if pending == "service-principal" {
 			return app, fmt.Errorf("%w: the earlier installer service principal request is not visible; wait and resume", ErrUncertain)
@@ -221,11 +274,19 @@ func (c *Client) EnsureInstaller(ctx context.Context, deploymentID string, cert 
 			return app, fmt.Errorf("%w: installer service principal response is incomplete", ErrUncertain)
 		}
 		app.SPID = sp.ID
+		createdPrincipal = true
 		if err = checkpoint("", app); err != nil {
 			return app, err
 		}
 	}
-	granted, err := c.collection(ctx, "/servicePrincipals/"+url.PathEscape(app.SPID)+"/appRoleAssignments?$select=appRoleId,resourceId")
+	// Entra can acknowledge creation before another replica can resolve the
+	// principal. Retry only explicit replication refusals for this new object;
+	// an uncertain POST is still journalled and must be reconciled on resume.
+	request := c.call
+	if createdPrincipal {
+		request = c.callFresh
+	}
+	granted, err := c.collectionUsing(ctx, "/servicePrincipals/"+url.PathEscape(app.SPID)+"/appRoleAssignments?$select=appRoleId,resourceId", request)
 	if err != nil {
 		return app, err
 	}
@@ -253,7 +314,13 @@ func (c *Client) EnsureInstaller(ctx context.Context, deploymentID string, cert 
 		if err = checkpoint("permission:"+name, app); err != nil {
 			return app, err
 		}
-		_, err = c.call(ctx, http.MethodPost, "/servicePrincipals/"+url.PathEscape(graph.ID)+"/appRoleAssignedTo", map[string]string{"principalId": app.SPID, "resourceId": graph.ID, "appRoleId": id})
+		_, err = request(ctx, http.MethodPost, "/servicePrincipals/"+url.PathEscape(graph.ID)+"/appRoleAssignedTo", map[string]string{"principalId": app.SPID, "resourceId": graph.ID, "appRoleId": id})
+		var conflict *GraphError
+		if errors.As(err, &conflict) && conflict.Code == "Request_MultipleObjectsWithSameKeyValue" {
+			// A stale list can omit an existing grant. Confirm this exact grant
+			// with reads only; never treat a generic conflict as success.
+			err = c.waitInstallerGrant(ctx, app.SPID, graph.ID, id)
+		}
 		if err != nil {
 			return app, installerMutationError(err, app, checkpoint)
 		}
@@ -262,6 +329,33 @@ func (c *Client) EnsureInstaller(ctx context.Context, deploymentID string, cert 
 		}
 	}
 	return app, checkpoint("", app)
+}
+
+func (c *Client) waitInstallerGrant(ctx context.Context, principal, resource, role string) error {
+	deadline := time.Now().Add(ReplicationWait)
+	for {
+		rows, err := c.collection(ctx, "/servicePrincipals/"+url.PathEscape(principal)+"/appRoleAssignments?$select=appRoleId,resourceId")
+		if err != nil {
+			return err
+		}
+		for _, raw := range rows {
+			var grant struct{ AppRoleID, ResourceID string }
+			if err := json.Unmarshal(raw, &grant); err != nil {
+				return err
+			}
+			if grant.AppRoleID == role && grant.ResourceID == resource {
+				return nil
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("%w: Entra reports an existing permission grant, but it is not readable yet; wait and resume", ErrUncertain)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(replicationPoll):
+		}
+	}
 }
 
 func (c *Client) CleanupInstaller(ctx context.Context, deploymentID, id string) error {
