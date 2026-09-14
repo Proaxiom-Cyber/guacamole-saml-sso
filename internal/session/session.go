@@ -21,6 +21,7 @@ import (
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/cloudflare"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/creds"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/entra"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/entracert"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/host"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recording"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/recoverykey"
@@ -650,36 +651,39 @@ type Options struct {
 	// Azure asks for an Azure Blob destination during a guided run. The
 	// remaining fields answer the questions ahead of time; any one of them
 	// also turns the phase on.
-	Azure              bool
-	AzureSubscription  string
-	AzureAccount       string
-	AzureContainer     string
-	AzureCreate        bool
-	AzureLocation      string
-	AzureResourceGroup string
-	Hostname           string // explicit configuration; guided asks when empty
-	AdminGroup         string
-	OperatorGroup      string
-	InstallDir         string // default /opt/guacamole
-	CredSpecs          []creds.Spec
-	Host               *host.Probes
-	StackRun           stack.Runner    // injectable for tests
-	StackRunOut        stack.OutRunner // injectable for tests
-	Entra              *entra.Client   // injectable; nil selects environment input or guided device-code sign-in
-	EntraTenant        string
-	EntraClientID      string
-	EntraDeviceToken   func(entra.DeviceCodeOptions) (entra.TokenSource, error) // test seam
-	Cloudflare         *cloudflare.Client
-	Zone               string // explicit Cloudflare zone name
-	ACMEContact        string // optional operator address for the ACME account
-	BackupDest         string // scheduled backup destination; default <state-dir>/backups
-	BackupSchedule     string // systemd OnCalendar expression; "" means daily
-	BackupKeep         int    // successful backups to retain; 0 means 7
-	BackupPlaintext    bool   // explicit choice; encryption is the default
-	BackupRequireMount bool   // destination must sit on an approved mounted share
-	NoBackupSchedule   bool   // do not install the timer
-	RecordingBudget    string // local recording storage budget, e.g. "20GiB"; "" declines cleanup
-	AccessEmails       string // comma-separated Access allow-list fallback
+	Azure                 bool
+	AzureSubscription     string
+	AzureAccount          string
+	AzureContainer        string
+	AzureCreate           bool
+	AzureLocation         string
+	AzureResourceGroup    string
+	Hostname              string // explicit configuration; guided asks when empty
+	AdminGroup            string
+	OperatorGroup         string
+	InstallDir            string // default /opt/guacamole
+	CredSpecs             []creds.Spec
+	Host                  *host.Probes
+	StackRun              stack.Runner    // injectable for tests
+	StackRunOut           stack.OutRunner // injectable for tests
+	Entra                 *entra.Client   // injectable; nil selects environment input or guided device-code sign-in
+	EntraTenant           string
+	EntraClientID         string
+	EntraDeviceToken      func(entra.DeviceCodeOptions) (entra.TokenSource, error)                          // test seam
+	EntraApplicationToken func(entra.ApplicationOptions) (entra.TokenSource, error)                         // test seam
+	EntraCertificate      func(context.Context, string, string, entracert.Open) (entracert.Material, error) // test seam
+	entraState            *state.State
+	Cloudflare            *cloudflare.Client
+	Zone                  string // explicit Cloudflare zone name
+	ACMEContact           string // optional operator address for the ACME account
+	BackupDest            string // scheduled backup destination; default <state-dir>/backups
+	BackupSchedule        string // systemd OnCalendar expression; "" means daily
+	BackupKeep            int    // successful backups to retain; 0 means 7
+	BackupPlaintext       bool   // explicit choice; encryption is the default
+	BackupRequireMount    bool   // destination must sit on an approved mounted share
+	NoBackupSchedule      bool   // do not install the timer
+	RecordingBudget       string // local recording storage budget, e.g. "20GiB"; "" declines cleanup
+	AccessEmails          string // comma-separated Access allow-list fallback
 
 	// journalIntent persists what the running phase is about to do, before
 	// it does it. runPhases sets it; phases call it before any cloud
@@ -946,6 +950,7 @@ func Status(dir string, u *ui.UI) error {
 // interactive approval.
 func (o *Options) entraSignin(ctx context.Context, st *state.State, u *ui.UI) error {
 	o.UI = u
+	o.entraState = st
 	if (o.Entra == nil || o.Entra.Token == nil) && os.Getenv(entra.DefaultTokenEnv) == "" && u.Interactive {
 		if err := o.selectEntraTenant(st, u); err != nil {
 			return err
@@ -1138,6 +1143,17 @@ func (o *Options) entraClient() (*entra.Client, error) {
 		return o.Entra, nil
 	}
 	if os.Getenv(entra.DefaultTokenEnv) == "" {
+		if o.entraState != nil && (o.UI == nil || !o.UI.Interactive) {
+			method := o.entraState.Config["entra-auth-method"]
+			if method == "certificate" || method == "secret" {
+				c := &entra.Client{Token: o.manualEntraToken(method)}
+				if o.Entra != nil {
+					c.Do = o.Entra.Do
+				}
+				o.Entra = c
+				return c, nil
+			}
+		}
 		if o.UI != nil && o.UI.Interactive {
 			return o.guidedEntraClient()
 		}

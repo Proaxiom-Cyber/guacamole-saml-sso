@@ -17,12 +17,20 @@ import (
 // verified domains. Neither transport errors nor Graph response bodies reach
 // the prompt: either can contain a malformed credential supplied by the user.
 func (c *Client) CheckBrowserToken(ctx context.Context, expectedTenant string) (tenant string, expires time.Time, err error) {
+	return c.checkTokenAccess(ctx, expectedTenant, true)
+}
+
+func (c *Client) checkTokenAccess(ctx context.Context, expectedTenant string, browser bool) (tenant string, expires time.Time, err error) {
+	help := "in the installer app's API permissions, grant admin consent, then retry"
+	if browser {
+		help = "in Graph Explorer, grant consent and copy a fresh token"
+	}
 	token, err := c.Token(ctx)
 	if err != nil {
-		return "", time.Time{}, errors.New("could not read the pasted access token")
+		return "", time.Time{}, errors.New("could not read the Microsoft Graph access token")
 	}
 	if token == "" || len(token) > 128*1024 || strings.ContainsFunc(token, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) {
-		return "", time.Time{}, errors.New("paste only the access token from Graph Explorer's Access token tab")
+		return "", time.Time{}, errors.New("Microsoft Graph access token is empty or malformed")
 	}
 	expires = accessTokenExpiry(token)
 	if !expires.IsZero() && !expires.After(time.Now().Add(time.Minute)) {
@@ -36,14 +44,14 @@ func (c *Client) CheckBrowserToken(ctx context.Context, expectedTenant string) (
 		return "", time.Time{}, errors.New("Microsoft Graph did not accept the token for application reads; check sign-in, Application.ReadWrite.All consent, network access and tenant policy")
 	}
 	if pf.ClaimsChecked && !pf.MutationOK {
-		return "", time.Time{}, fmt.Errorf("the token is missing permissions: %s; grant consent in Graph Explorer and copy a fresh token", pf.MutationDetail)
+		return "", time.Time{}, fmt.Errorf("the token is missing permissions: %s; %s", pf.MutationDetail, help)
 	}
 	out, err := c.call(ctx, http.MethodGet, "/organization?%24select=id,verifiedDomains", nil)
 	if ctx.Err() != nil {
 		return "", time.Time{}, ctx.Err()
 	}
 	if err != nil {
-		return "", time.Time{}, errors.New("Microsoft Graph could not verify the tenant; grant Organization.Read.All in Graph Explorer and check network access and tenant policy")
+		return "", time.Time{}, fmt.Errorf("Microsoft Graph could not verify the tenant; check Organization.Read.All, network access and tenant policy; %s", help)
 	}
 	var org struct {
 		Value []struct {
@@ -54,7 +62,7 @@ func (c *Client) CheckBrowserToken(ctx context.Context, expectedTenant string) (
 		} `json:"value"`
 	}
 	if json.Unmarshal(out, &org) != nil || len(org.Value) != 1 || org.Value[0].ID == "" {
-		return "", time.Time{}, errors.New("Microsoft Graph did not return a unique tenant; check the directory selected in Graph Explorer")
+		return "", time.Time{}, errors.New("Microsoft Graph did not return a unique tenant; check the selected directory")
 	}
 	tenant = org.Value[0].ID
 	match := expectedTenant == "" || strings.EqualFold(expectedTenant, tenant)
@@ -62,7 +70,7 @@ func (c *Client) CheckBrowserToken(ctx context.Context, expectedTenant string) (
 		match = match || strings.EqualFold(expectedTenant, domain.Name)
 	}
 	if !match {
-		return "", time.Time{}, errors.New("this token belongs to a different tenant; switch to the selected directory in Graph Explorer and copy a new token")
+		return "", time.Time{}, errors.New("this token belongs to a different tenant; authenticate to the selected directory and retry")
 	}
 	return tenant, expires, nil
 }

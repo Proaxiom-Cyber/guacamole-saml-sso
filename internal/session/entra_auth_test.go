@@ -148,7 +148,7 @@ func TestBrowserEntraTokenCorrectsInputAndCachesOnlyInMemory(t *testing.T) {
 	for _, method := range []string{"b\n", "d\nb\n"} {
 		t.Run(strings.TrimSpace(method), func(t *testing.T) {
 			t.Setenv(entra.DefaultTokenEnv, "")
-			u, out := testUI(true, method+"c\nc\n")
+			u, out := testUI(true, method+"c\nc\nc\n")
 			const accepted = "opaque-accepted-fixture"
 			inputs := []string{"rejected-fixture", "wrong-tenant-fixture", "Bearer " + accepted}
 			prompts, deviceCalls, checks := 0, 0, 0
@@ -216,7 +216,7 @@ func TestBrowserEntraTokenCorrectsInputAndCachesOnlyInMemory(t *testing.T) {
 
 func TestBrowserEntraBlankOrCancelledInputStops(t *testing.T) {
 	for _, cancel := range []bool{false, true} {
-		u, _ := testUI(true, "b\nc\nc\n")
+		u, _ := testUI(true, "b\nc\nc\nc\n")
 		u.Secret = func(string) (string, error) {
 			if cancel {
 				return "", context.Canceled

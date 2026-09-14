@@ -546,6 +546,47 @@ func TestLongAccessTokenStaysHiddenAndDoesNotExpandThePrompt(t *testing.T) {
 	}
 }
 
+func TestMultilineConsentInstructionsRenderAsSeparateTerminalRows(t *testing.T) {
+	u, out, _ := newTestUI("c")
+	prompt := "Open your profile menu.\nGrant these permissions:\nApplication.ReadWrite.All\nGroup.ReadWrite.All\nAppRoleAssignment.ReadWrite.All\nOrganization.Read.All"
+	_, err := u.Choose(prompt, []Choice{{Key: 'c', Label: "Continue"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// In raw terminal mode LF moves down without returning to column one.
+	// Every output newline must therefore include CR, including prompt text.
+	if strings.Contains(strings.ReplaceAll(out.String(), "\r\n", ""), "\n") {
+		t.Fatal("multiline prompt emitted a bare LF, causing staircase indentation in a raw terminal")
+	}
+	w := newWizard(bufio.NewReader(strings.NewReader("")), io.Discard, 40, 80, false)
+	for _, row := range w.frame([]string{prompt}) {
+		if strings.ContainsAny(row, "\r\n") {
+			t.Fatal("frame row contains an uncounted line break")
+		}
+	}
+}
+
+func TestLongConsentPromptKeepsInstructionsAndActionsOnSmallScreen(t *testing.T) {
+	u, _, _ := newTestUI("")
+	u.wiz.rows = 24
+	u.PhaseList(twentyPhases)
+	u.PhaseStart("stack-up")
+	u.Say("The Microsoft tenant is selected.\nSign-in is required.\nCompleted work is retained.")
+	lines := u.wiz.frame([]string{
+		"Scroll to the top of Graph Explorer.\nOpen your profile avatar at the top right.\nChoose Consent to permissions.\nFind each permission and choose Consent:\nApplication.ReadWrite.All\nGroup.ReadWrite.All\nAppRoleAssignment.ReadWrite.All\nOrganization.Read.All",
+		"", "> [c] Continue", "  [q] Quit and keep deployment progress", "",
+		"Up/Down or j/k to move, Enter to choose, or press the letter in brackets.",
+	})
+	if len(lines) > 24 {
+		t.Fatalf("consent instructions overflow the terminal: %d rows", len(lines))
+	}
+	for _, want := range []string{"Application.ReadWrite.All", "Group.ReadWrite.All", "AppRoleAssignment.ReadWrite.All", "Organization.Read.All", "[c] Continue", "[q] Quit", "stack-up"} {
+		if !hasLineWith(lines, want) {
+			t.Fatalf("consent screen lost %s", want)
+		}
+	}
+}
+
 func TestRestoreTerminalRunsOnceAndReplaysTheSession(t *testing.T) {
 	u, out, restores := newTestUI("")
 	u.Say("Deployment 01 initialised on rocky10.")

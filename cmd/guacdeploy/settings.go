@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/entra"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/session"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/settings"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/ui"
@@ -17,10 +18,10 @@ import (
 //
 // Cloudflare has no entry because internal/cloudflare never changes a
 // pre-existing setting; see internal/settings/WIRING.md.
-func settingsRegistry() settings.Registry {
+func settingsRegistry(client *entra.Client) settings.Registry {
 	return settings.Registry{
 		"entra": entra.SettingAccessor{
-			Client: &entra.Client{Token: entra.StaticTokenFromEnv(entra.DefaultTokenEnv)},
+			Client: client,
 		},
 	}
 }
@@ -39,7 +40,7 @@ func settingsCmd(ctx context.Context, stateDir string, restore bool, u *ui.UI) e
 			u.Say("No deployment exists on this host.")
 			return nil
 		}
-		settings.Report(u, settings.List(ctx, st, settingsRegistry()))
+		settings.Report(u, settings.List(ctx, st, settingsRegistry(session.EntraClientForOperation(st, stateDir, u))))
 		return nil
 	}
 
@@ -55,5 +56,5 @@ func settingsCmd(ctx context.Context, stateDir string, restore bool, u *ui.UI) e
 	if st == nil {
 		return fmt.Errorf("no deployment exists in %s; there are no settings to restore", stateDir)
 	}
-	return settings.Restore(ctx, st, settingsRegistry(), u, func() error { return store.Save(st) })
+	return settings.Restore(ctx, st, settingsRegistry(session.EntraClientForOperation(st, stateDir, u)), u, func() error { return store.Save(st) })
 }

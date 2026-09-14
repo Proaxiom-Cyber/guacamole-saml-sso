@@ -195,7 +195,9 @@ unanswered question is how a duplicate tunnel gets made.
 
 The credentials died with the host, so recovery asks for the Cloudflare API
 token again, at a hidden prompt or from `GUACDEPLOY_CRED_CLOUDFLARE_API_TOKEN`,
-and needs a Microsoft Graph token in `GUACDEPLOY_GRAPH_TOKEN`. A credential
+and offers the Microsoft authentication choices described below. On a replacement
+VM, use the installer app's client secret, device sign-in, or a supplied Graph
+token for recovery. The old TPM signing key cannot work on the new VM. A credential
 sealed to the old host's TPM cannot be decrypted on a replacement at all;
 that is the point of the mode, and it is why the guide says to keep an
 independent record of anything you cannot recreate.
@@ -332,8 +334,87 @@ credential values. Do not edit it by hand.
 Setup provisions the Entra application, service principal and the two
 groups that carry sign-in, then restarts Guacamole with SAML enabled.
 
-Guided setup asks for the Microsoft tenant ID or a verified domain, then offers
-device-code sign-in or a browser with a pasted access token.
+Guided setup asks for the Microsoft tenant ID or a verified domain. It then offers
+an installer app with a certificate or client secret, device-code sign-in, or
+Graph Explorer. The installer app path does not depend on Graph Explorer or device
+codes. You supply the tenant ID and client ID. The installer obtains and renews
+its own short-lived access tokens internally.
+
+### Manually registered installer app
+
+Use a dedicated app for provisioning. This is separate from the Guacamole SAML
+app that setup creates. The installer does not claim ownership of your manually
+registered app and does not delete it during teardown.
+
+1. Open [Microsoft Entra admin center](https://entra.microsoft.com).
+2. Select **App registrations > New registration**. Name it **Guacamole Installer**.
+3. Select **Accounts in this organizational directory only**. Leave **Redirect URI**
+   empty, then select **Register**.
+4. Select **API permissions > Add a permission > Microsoft Graph > Application
+   permissions**. Add `Application.ReadWrite.All`, `Group.ReadWrite.All`,
+   `AppRoleAssignment.ReadWrite.All`, and `Organization.Read.All`.
+5. Select **Grant admin consent** for your tenant. Use a Privileged Role Administrator
+   or Global Administrator account. These permissions permit tenant-wide application,
+   group, and app-role management; they are not limited to this deployment.
+6. Complete one credential option below.
+7. From **Overview**, enter **Directory (tenant) ID** and **Application (client) ID**
+   into the installer. Do not use the app's Object ID.
+
+An existing installer app can use the same procedure from step 4. The wizard keeps
+each instruction on screen until you choose Continue. Microsoft documents the
+[admin consent requirements](https://learn.microsoft.com/en-us/entra/identity/enterprise-apps/grant-admin-consent).
+
+**Certificate option.** Choose **Installer app: generate a TPM certificate**.
+The host needs an accessible TPM 2.0 resource-manager device, `/dev/tpmrm0`, with
+empty owner authorization. The installer creates a non-exportable RSA signing key
+inside that TPM. It does not install a TPM utility or export a plaintext private key.
+It writes the public certificate to:
+
+```text
+/var/lib/guacdeploy/credentials/entra-installer.cer
+```
+
+Copy this public file to your workstation. For example, use your normal SSH login
+and run this command on the workstation:
+
+```sh
+ssh rocky@YOUR-SERVER 'sudo cat /var/lib/guacdeploy/credentials/entra-installer.cer' > guacdeploy-installer.cer
+```
+
+If sudo requires a terminal for its password prompt, use `ssh -t` instead. This
+copies the public certificate only. In the app registration, select **Certificates
+& secrets > Certificates > Upload certificate**. Upload `guacdeploy-installer.cer`
+and select **Add**. Check its thumbprint against the wizard.
+
+The public certificate is valid for one year. Resume reuses it. The TPM-wrapped
+key blob is `entra-installer.tpm`, under the same owner-only directory. A copied
+disk cannot use the key on another TPM. Root on the running host can use it to sign;
+a virtual TPM also trusts the hypervisor and its VM backups. This differs from the
+general `tpm` credential mode, which decrypts software secrets into memory.
+
+On a replacement VM, generate a new certificate during setup and upload it to the
+same installer app. The previous key cannot migrate. Automatic certificate rotation
+is not included. Use the client-secret option if the certificate expires or the TPM
+is unavailable, then arrange certificate replacement. Ordinary teardown removes
+the local certificate and wrapped key after Entra cleanup. Remove the unused
+certificate registration from the installer app yourself.
+
+Microsoft documents [certificate upload and authentication](https://learn.microsoft.com/en-us/entra/identity-platform/certificate-credentials).
+
+**Client-secret option.** Choose **Installer app: enter a client secret**. In Entra,
+select **Certificates & secrets > Client secrets > New client secret**. Paste the
+secret's **Value**, not its Secret ID, at the hidden prompt. The installer keeps
+this value in memory for the current run. Store your own copy in your vault.
+Subsequent setup, recovery, or teardown runs ask for it again.
+
+Both options check authentication, available application-permission claims, and
+the live tenant before any Entra change. Rejected credentials return to a retry
+choice. Correct the app settings or IDs, then retry. Workload identity policies
+still apply. This path changes the authentication method; it does not disable
+customer policy. Opaque tokens do not expose permission claims, so a later
+operation can still report a missing permission.
+
+### Device-code sign-in
 
 For device-code sign-in, setup shows a Microsoft sign-in URL and a short code.
 Open the URL on your computer or phone,
@@ -350,7 +431,8 @@ the initial prompt. A recorded deployment tenant takes precedence on resume.
 Sign-in requests Application.ReadWrite.All, Group.ReadWrite.All,
 AppRoleAssignment.ReadWrite.All and Organization.Read.All. Access and refresh
 tokens stay in process memory. Setup stores only the tenant identifiers.
-If device-code sign-in fails, choose Retry, switch to the browser option, or Quit.
+If device-code sign-in fails, retry, select an installer app, use Graph Explorer,
+or quit and retain progress.
 Resume asks you to sign in again and refuses a different tenant before it makes
 Entra changes. Tenant consent and sign-in policies still apply.
 
@@ -359,12 +441,16 @@ Entra changes. Tenant consent and sign-in policies still apply.
 Choose **Browser: Graph Explorer, then paste an access token**. The wizard keeps
 each instruction on screen until you choose Continue.
 
+Graph Explorer provides the sign-in token. The installer makes the API calls.
+You do not need to enter a query or select **Run query** in Graph Explorer.
+
 1. Open [Microsoft Graph Explorer](https://developer.microsoft.com/graph/graph-explorer)
    on your computer. Sign in as an administrator and select the deployment's tenant.
-2. Under your profile, choose **Consent to permissions**. Grant these delegated
-   permissions: `Application.ReadWrite.All`, `Group.ReadWrite.All`,
+2. Scroll to the top of Graph Explorer. Open your profile avatar at the top right.
+   Choose **Consent to permissions**. Find each permission and choose **Consent**.
+   Grant these delegated permissions: `Application.ReadWrite.All`, `Group.ReadWrite.All`,
    `AppRoleAssignment.ReadWrite.All`, and `Organization.Read.All`.
-3. Open the **Access token** tab and copy the token.
+3. Open the **Access token** tab beside **Modify Permissions** and copy the token.
 4. In the installer, choose Continue and paste the token at the hidden prompt.
 
 This fallback requires one manual paste. It does not require an SSH tunnel,
@@ -384,11 +470,21 @@ the installer does not replay a failed creation request automatically.
 
 Microsoft documents [Graph Explorer consent and the Access token tab](https://learn.microsoft.com/en-us/graph/graph-explorer/graph-explorer-features).
 
+If the permissions panel shows **Retry again** with no results, its permission
+catalogue may be unavailable. Use the manually registered installer app path.
+
 ### Unattended sign-in
 
 Unattended setup continues to accept a Microsoft Graph token through
 `GUACDEPLOY_GRAPH_TOKEN`. An explicitly supplied token takes precedence over
 the guided sign-in flow. Setup never writes the token to state or logs.
+
+After a successful guided installer-app sign-in, state retains the authentication
+method, tenant ID, and client ID. An unattended resume or teardown can reuse the
+local TPM certificate. For the client-secret method, inject
+`GUACDEPLOY_ENTRA_CLIENT_SECRET` into that process from your credential manager.
+The installer does not save it. Do not put its value in a command line or env file.
+Initial certificate generation and manual app preparation use the guided flow.
 
 The flow uses Microsoft's [Azure Identity SDK](https://pkg.go.dev/github.com/Azure/azure-sdk-for-go/sdk/azidentity#DeviceCodeCredential)
 and [device authorization protocol](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-device-code).

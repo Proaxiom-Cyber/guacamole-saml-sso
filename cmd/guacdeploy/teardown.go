@@ -8,6 +8,7 @@ import (
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/cloudflare"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/creds"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/entra"
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/session"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/settings"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/teardown"
@@ -39,13 +40,13 @@ func teardownCmd(ctx context.Context, stateDir string, consent, deleteData bool,
 		return nil
 	}
 
-	reg := settingsRegistry()
 	ops := teardown.DefaultOps(teardown.HostOptions{
 		DeploymentID: st.DeploymentID,
 		StateDir:     stateDir,
 		InstallDir:   installDirOf(st),
 	})
 	cf, ec := teardownProviders(&ops, st, stateDir, u)
+	reg := settingsRegistry(ec)
 
 	// Reconcile before planning. A phase that created resources and then
 	// failed before recording them leaves nothing in the deployment record,
@@ -124,7 +125,7 @@ func teardownProviders(ops *teardown.Ops, st *state.State, stateDir string, u *u
 
 	// Removing the application removes its service principal and role
 	// assignments with it, so neither is ever deleted separately.
-	ec := &entra.Client{Token: entra.StaticTokenFromEnv(entra.DefaultTokenEnv)}
+	ec := session.EntraClientForOperation(st, stateDir, u)
 	ecfg := entra.Config{DeploymentID: st.DeploymentID, Hostname: st.Config["guac-hostname"]}
 	ops.DeleteEntraApp = func(ctx context.Context, id string) error {
 		return ec.CleanupApp(ctx, ecfg, id)

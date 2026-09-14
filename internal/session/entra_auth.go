@@ -67,7 +67,7 @@ func (o *Options) guidedEntraClient() (*entra.Client, error) {
 	// Select on first use, so callers can construct a client without prompting.
 	// A browser token is supplied by Graph Explorer; it needs no callback server.
 	var source entra.TokenSource
-	browser := false
+	guided := false
 	c := &entra.Client{Token: func(ctx context.Context) (string, error) {
 		for {
 			if err := ctx.Err(); err != nil {
@@ -75,6 +75,8 @@ func (o *Options) guidedEntraClient() (*entra.Client, error) {
 			}
 			if source == nil {
 				choice, err := u.Choose("Microsoft sign-in method", []ui.Choice{
+					{Key: 'a', Label: "Installer app: generate a TPM certificate (recommended)"},
+					{Key: 's', Label: "Installer app: enter a client secret"},
 					{Key: 'd', Label: "Device code: sign in with a short code"},
 					{Key: 'b', Label: "Browser: Graph Explorer, then paste an access token"},
 					{Key: 'q', Label: "Quit and keep deployment progress"},
@@ -83,10 +85,17 @@ func (o *Options) guidedEntraClient() (*entra.Client, error) {
 					return "", err
 				}
 				switch choice {
+				case 'a', 's':
+					guided = true
+					method := "certificate"
+					if choice == 's' {
+						method = "secret"
+					}
+					source = o.manualEntraToken(method)
 				case 'q':
 					return "", entraSignInStopped()
 				case 'b':
-					browser = true
+					guided = true
 					source = o.browserEntraToken()
 				default:
 					u.Say("Microsoft sign-in uses public client %s. Access and refresh tokens stay in memory for this run.", clientID)
@@ -100,14 +109,14 @@ func (o *Options) guidedEntraClient() (*entra.Client, error) {
 			if err == nil {
 				return token, nil
 			}
-			if browser {
-				return "", err // Browser input handles correction; blank input or cancellation stops.
+			if guided {
+				return "", err // These guided sources handle correction before returning.
 			}
 			if ctx.Err() != nil {
 				return "", ctx.Err()
 			}
 			u.Say("%s", err)
-			choice, chooseErr := u.Choose("Microsoft sign-in", []ui.Choice{{Key: 'r', Label: "Retry Microsoft sign-in"}, {Key: 'b', Label: "Use Graph Explorer in a browser instead"}, {Key: 'q', Label: "Quit and keep deployment progress"}})
+			choice, chooseErr := u.Choose("Microsoft sign-in", []ui.Choice{{Key: 'r', Label: "Retry Microsoft sign-in"}, {Key: 'a', Label: "Use an installer app with a TPM certificate"}, {Key: 's', Label: "Use an installer app with a client secret"}, {Key: 'b', Label: "Use Graph Explorer in a browser instead"}, {Key: 'q', Label: "Quit and keep deployment progress"}})
 			if chooseErr != nil {
 				return "", chooseErr
 			}
@@ -115,8 +124,15 @@ func (o *Options) guidedEntraClient() (*entra.Client, error) {
 				return "", entraSignInStopped()
 			}
 			if choice == 'b' {
-				browser = true
+				guided = true
 				source = o.browserEntraToken()
+			} else if choice == 'a' || choice == 's' {
+				guided = true
+				method := "certificate"
+				if choice == 's' {
+					method = "secret"
+				}
+				source = o.manualEntraToken(method)
 			} else {
 				source, err = newSource(options)
 				if err != nil {
@@ -151,8 +167,9 @@ func (o *Options) browserEntraToken() entra.TokenSource {
 				// Keep each instruction on screen until the operator is ready.
 				// A stream of status lines disappears from a small wizard window.
 				steps := []string{
-					"Open https://developer.microsoft.com/graph/graph-explorer\nSign in as an administrator. Select tenant " + o.EntraTenant + ".",
-					"Under your profile, choose Consent to permissions.\nGrant these delegated permissions:\n" + strings.Join(entra.RequiredPermissions, "\n") + "\nOrganization.Read.All\nThen open the Access token tab and copy the token.",
+					"Graph Explorer provides the sign-in token. The installer makes the API calls.\nYou do not need to enter a query or select Run query.\n\nOpen https://developer.microsoft.com/graph/graph-explorer\nSign in as an administrator of tenant " + o.EntraTenant + ".",
+					"In Graph Explorer, scroll to the top of the page.\nOpen your profile avatar at the top right.\nChoose Consent to permissions.\nFind each permission below and choose Consent:\n" + strings.Join(entra.RequiredPermissions, "\n") + "\nOrganization.Read.All",
+					"In Graph Explorer, select the Access token tab beside Modify Permissions.\nCopy the token. You do not need to select Run query.\nChoose Continue here. Paste the token at the hidden terminal prompt.",
 				}
 				for _, step := range steps {
 					choice, err := u.Choose(step, []ui.Choice{{Key: 'c', Label: "Continue"}, {Key: 'q', Label: "Quit and keep deployment progress"}})

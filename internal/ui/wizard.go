@@ -343,11 +343,15 @@ func (w *Wizard) frame(prompt []string) []string {
 	// The prompt is wrapped before the budget is worked out, so a long
 	// question cannot push the top of the screen away.
 	var asked []string
-	for _, l := range prompt {
-		segs := wrapLine(l, w.width()-4)
-		asked = append(asked, segs[0])
-		for _, s := range segs[1:] {
-			asked = append(asked, "    "+s)
+	for _, block := range prompt {
+		// Each frame entry must be one physical row. Embedded LF characters
+		// bypass draw's CRLF handling in raw mode and retain the old column.
+		for _, l := range strings.Split(strings.ReplaceAll(block, "\r\n", "\n"), "\n") {
+			segs := wrapLine(l, w.width()-4)
+			asked = append(asked, segs[0])
+			for _, s := range segs[1:] {
+				asked = append(asked, "    "+s)
+			}
 		}
 	}
 
@@ -356,7 +360,16 @@ func (w *Wizard) frame(prompt []string) []string {
 	// approximation is enough.
 	budget := w.rows - (2 + 3 + 1 + len(asked) + 1) - 1
 	if budget < 6 {
-		budget = 6
+		// Keep a long instruction and its actions visible on small terminals.
+		// Phase history and output remain in the transcript; the active phase
+		// stays above the prompt instead of competing with it for rows.
+		out := []string{"GUACAMOLE DEPLOYMENT (guided setup)"}
+		if len(phases) > 0 {
+			out = append(out, phases[active])
+		}
+		out = append(out, rule)
+		out = append(out, asked...)
+		return append(out, rule, "Ctrl-C  Cancel. Completed work is retained.")
 	}
 	logRoom := budget - len(phases)
 	if logRoom < 3 {
