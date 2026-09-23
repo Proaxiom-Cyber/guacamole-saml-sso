@@ -907,3 +907,19 @@ the same value to Guacamole. The reply URL remains the public website URL with
 If an older installer fails with `HostNameNotOnVerifiedDomain`, save and exit.
 Install the corrected binary and resume the deployment. Keep the website hostname,
 Entra tenant and working installer app registration unchanged.
+
+### Instructions, input, and suggested values
+
+The task instructions appear above the input controls. The **About this option**
+pane explains the selected choice. The live log appears below these controls.
+On small terminals, Tab opens deployment progress and session history.
+
+An empty field shows its suggested value with the label `(suggested)`. Press Enter
+to accept that value, or type a replacement. Suggestions use muted text when the
+terminal supports colour. Secret fields do not show suggested values.
+
+Back keeps text you entered during the current wizard session. When you return to
+the field, that text appears as an editable value, without the suggestion label.
+If instructions exceed the available space, PgUp and PgDn scroll the instructions
+while the input stays visible. Tab opens the full session history. Otherwise,
+PgUp and PgDn scroll the live log; PgDn returns it to live output.

@@ -75,32 +75,34 @@ type Wizard struct {
 	rows, cols int
 	colour     bool
 
-	mu             sync.Mutex
-	names          []string
-	state          map[string]string
-	log            []string
-	prompt         []string // the question on screen now, redrawn with everything else
-	stopped        bool
-	finalScreen    bool
-	started        time.Time
-	phaseStarted   time.Time
-	active         string
-	viewedPhase    string
-	challenge      string
-	details        bool
-	progressView   bool
-	selectionHelp  string
-	scroll         int
-	logScroll      int
-	logPaneActive  bool
-	copyNotice     string
-	plainLink      bool
-	plainLinkFrame string
-	tick           int
-	logPath        string
-	task           taskProgress
-	dockerStatus   map[string]string
-	dockerOrder    []string
+	mu                   sync.Mutex
+	names                []string
+	state                map[string]string
+	log                  []string
+	prompt               []string // the question on screen now, redrawn with everything else
+	stopped              bool
+	finalScreen          bool
+	started              time.Time
+	phaseStarted         time.Time
+	active               string
+	viewedPhase          string
+	challenge            string
+	details              bool
+	progressView         bool
+	enteredValues        map[string]string // non-secret preparation fields, retained during Back navigation
+	selectionHelp        string
+	scroll               int
+	logScroll            int
+	logPaneActive        bool
+	instructionsOverflow bool
+	copyNotice           string
+	plainLink            bool
+	plainLinkFrame       string
+	tick                 int
+	logPath              string
+	task                 taskProgress
+	dockerStatus         map[string]string
+	dockerOrder          []string
 
 	interrupt <-chan struct{}
 	keys      chan keyEvent
@@ -648,7 +650,15 @@ func (w *Wizard) readLine(prompt, def string, hidden bool) (string, error) {
 func (w *Wizard) readLineBack(prompt, def string, hidden, back bool) (string, error) {
 	w.beginPrompt()
 	defer w.endPrompt()
+	if hidden {
+		def = ""
+	}
 	var buf []rune
+	if back && !hidden {
+		if prior, ok := w.enteredValues[prompt]; ok {
+			buf = []rune(prior)
+		}
+	}
 	note := ""
 	for {
 		shown := string(buf)
@@ -658,20 +668,25 @@ func (w *Wizard) readLineBack(prompt, def string, hidden, back bool) (string, er
 			shown = strings.Repeat("*", min(len(buf), 32))
 		}
 		lines := []string{prompt}
-		if def != "" {
-			lines = append(lines, fmt.Sprintf("Default: %s (press Enter to accept it)", def))
-		}
 		if hidden {
 			lines = append(lines, "Input is hidden.")
 		}
 		w.mu.Lock()
 		fieldWidth := w.width() - 8
 		w.mu.Unlock()
-		lines = append(lines, "", "> "+inputTail(shown, fieldWidth)+"_", "")
+		field := "> " + inputTail(shown, fieldWidth) + "_"
+		if len(buf) == 0 && def != "" {
+			field = "> " + inputTail(def, max(1, fieldWidth-12)) + " (suggested)"
+		}
+		lines = append(lines, "", field, "")
 		if note != "" {
 			lines = append(lines, note)
 		}
-		lines = append(lines, "Type the value, then press Enter.")
+		if len(buf) == 0 && def != "" {
+			lines = append(lines, "Enter accepts this default. Type to replace it.")
+		} else {
+			lines = append(lines, "Type the value, then press Enter.")
+		}
 		w.draw(lines)
 
 		k, err := w.readKey()
@@ -683,6 +698,9 @@ func (w *Wizard) readLineBack(prompt, def string, hidden, back bool) (string, er
 		}
 		switch {
 		case k == rune(2) && back:
+			if !hidden && len(buf) > 0 {
+				w.rememberInput(prompt, string(buf))
+			}
 			return "", ErrBack
 		case k == keyPaste:
 			text := strings.ReplaceAll(cleanText(w.inputPaste), "\n", "")
@@ -699,6 +717,9 @@ func (w *Wizard) readLineBack(prompt, def string, hidden, back bool) (string, er
 		case k == keyEnter:
 			v := strings.TrimSpace(string(buf))
 			if v == "" && def != "" {
+				if back {
+					delete(w.enteredValues, prompt)
+				}
 				return def, nil
 			}
 			if v == "" && !hidden {
@@ -707,6 +728,9 @@ func (w *Wizard) readLineBack(prompt, def string, hidden, back bool) (string, er
 			}
 			if hidden {
 				return string(buf), nil
+			}
+			if back {
+				w.rememberInput(prompt, v)
 			}
 			return v, nil
 		case k == keyBackspace:
@@ -721,6 +745,13 @@ func (w *Wizard) readLineBack(prompt, def string, hidden, back bool) (string, er
 			}
 		}
 	}
+}
+
+func (w *Wizard) rememberInput(prompt, value string) {
+	if w.enteredValues == nil {
+		w.enteredValues = make(map[string]string)
+	}
+	w.enteredValues[prompt] = value
 }
 
 func (w *Wizard) endPrompt() {
@@ -781,13 +812,13 @@ func (w *Wizard) viewKey(k rune) bool {
 		}
 		w.scroll = 0
 	case keyPageUp:
-		if !w.details && w.logPaneActive {
+		if !w.details && w.logPaneActive && !w.instructionsOverflow {
 			w.logScroll += max(1, w.rows/3)
 			break
 		}
 		w.scroll = max(0, w.scroll-max(1, w.rows/3))
 	case keyPageDown:
-		if !w.details && w.logPaneActive {
+		if !w.details && w.logPaneActive && !w.instructionsOverflow {
 			w.logScroll = max(0, w.logScroll-max(1, w.rows/3))
 			break
 		}

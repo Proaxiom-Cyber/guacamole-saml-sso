@@ -211,7 +211,7 @@ func (u *UI) Line(prompt, def string) (string, error) {
 	}
 	for {
 		if def != "" {
-			fmt.Fprintf(u.Out, "%s [%s]: ", prompt, def)
+			fmt.Fprintf(u.Out, "%s\n> %s (suggested; Enter accepts this default, or type a replacement): ", prompt, def)
 		} else {
 			fmt.Fprintf(u.Out, "%s: ", prompt)
 		}

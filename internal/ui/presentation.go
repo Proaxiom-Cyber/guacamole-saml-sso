@@ -288,10 +288,6 @@ func (w *Wizard) frame(prompt []string) []string {
 		} else {
 			body = append(body, "Preparing the next step...")
 		}
-		// Keep the last status visible while answering, without replaying the log.
-		if len(prompt) > 0 && len(w.log) > 0 {
-			body = append(body, "", "Latest: "+w.log[len(w.log)-1])
-		}
 		// On short screens the question takes priority over repeated phase
 		// headings. The field and its validation remain pinned below it.
 		if bodyHeight <= 5 && len(prompt) > 0 {
@@ -310,6 +306,11 @@ func (w *Wizard) frame(prompt []string) []string {
 		body = append(body, "", "ABOUT THIS OPTION", w.selectionHelp)
 		body = wrapped(body, contentWidth)
 	}
+	if len(controls) > 0 && paneHeight > 0 && len(body) < bodyHeight {
+		paneHeight += bodyHeight - len(body)
+		bodyHeight = len(body)
+	}
+	w.instructionsOverflow = len(controls) > 0 && len(body) > bodyHeight
 	start := min(w.scroll, max(0, len(body)-bodyHeight))
 	if w.scroll == 0 && focus >= bodyHeight {
 		start = focus - bodyHeight + 2
@@ -318,22 +319,8 @@ func (w *Wizard) frame(prompt []string) []string {
 	w.scroll = start
 	end := min(len(body), start+bodyHeight)
 	visible := body[start:end]
-	if paneHeight > 0 {
-		for len(visible) < bodyHeight {
-			visible = append(visible, "")
-		}
-		history := wrapped(w.log, contentWidth)
-		capacity := paneHeight - 2
-		w.logScroll = min(w.logScroll, max(0, len(history)-capacity))
-		endLog := max(0, len(history)-w.logScroll)
-		startLog := max(0, endLog-capacity)
-		label := "LIVE LOG  ·  PgUp/PgDn history"
-		if w.logScroll > 0 {
-			label = "LOG PAUSED  ·  PgDn to return to live output"
-		}
-		visible = append(visible, strings.Repeat("─", contentWidth), label)
-		visible = append(visible, history[startLog:endLog]...)
-		bodyHeight += paneHeight
+	for len(visible) < bodyHeight {
+		visible = append(visible, "")
 	}
 	var nav []string
 	if sidebar {
@@ -388,6 +375,7 @@ func (w *Wizard) frame(prompt []string) []string {
 		}
 		nav = append(nav, "", "Completed work", "is saved on this host.")
 	}
+	contentStart := len(out)
 	for i := 0; i < bodyHeight; i++ {
 		l := ""
 		if i < len(visible) {
@@ -406,6 +394,9 @@ func (w *Wizard) frame(prompt []string) []string {
 	hint := "Tab  Details   PgUp/PgDn  Scroll   Ctrl-C  Cancel"
 	if w.cols < 104 || w.rows < 26 {
 		hint = "Tab  Deployment progress   PgUp/PgDn  Scroll   Ctrl-C  Cancel"
+	}
+	if w.instructionsOverflow {
+		hint = "PgUp/PgDn  Instructions   Tab  History   Ctrl-C  Cancel"
 	}
 	if w.progressView {
 		hint = "Tab  Details   PgUp/PgDn  Scroll   Ctrl-C  Cancel"
@@ -444,11 +435,55 @@ func (w *Wizard) frame(prompt []string) []string {
 		}
 	}
 
+	// Instructions and controls form one interaction area. History stays below it.
+	if paneHeight > 0 {
+		history := wrapped(w.log, contentWidth)
+		capacity := paneHeight - 2
+		w.logScroll = min(w.logScroll, max(0, len(history)-capacity))
+		endLog := max(0, len(history)-w.logScroll)
+		startLog := max(0, endLog-capacity)
+		label := "LIVE LOG  ·  PgUp/PgDn history"
+		if w.instructionsOverflow {
+			label = "LIVE LOG  ·  Tab for history"
+		}
+		if w.logScroll > 0 {
+			label = "LOG PAUSED  ·  PgDn to return to live output"
+		}
+		prefix, border := "  ", "  "
+		if sidebar {
+			prefix = "  " + strings.Repeat(" ", sideWidth-3) + "│ "
+			border = "  " + strings.Repeat(" ", sideWidth-3) + "├─"
+		}
+		divider := strings.Repeat("─", contentWidth)
+		if helpWidth > 0 {
+			divider = strings.Repeat("─", choiceWidth+1) + "┴" + strings.Repeat("─", helpWidth+1)
+		}
+		out = append(out, fit(border+divider, width), fit(prefix+label, width))
+		for i := 0; i < capacity; i++ {
+			line := ""
+			if startLog+i < endLog {
+				line = history[startLog+i]
+			}
+			out = append(out, fit(prefix+line, width))
+		}
+	}
+
+	// The deployment sidebar spans the full content area, including controls and logs.
+	if sidebar {
+		for i := contentStart; i < len(out); i++ {
+			n := ""
+			if i-contentStart < len(nav) {
+				n = nav[i-contentStart]
+			}
+			runes := []rune(out[i])
+			out[i] = "  " + pad(n, sideWidth-3) + string(runes[sideWidth-1:])
+		}
+	}
 	bottom := []rune("  " + strings.Repeat("─", width-4))
 	if sidebar && sideWidth-1 < len(bottom) {
 		bottom[sideWidth-1] = '┴'
 	}
-	if len(controls) > 0 && helpWidth > 0 {
+	if len(controls) > 0 && helpWidth > 0 && paneHeight == 0 {
 		junction := 2 + choiceWidth + 1
 		if sidebar {
 			junction += sideWidth - 1
@@ -477,6 +512,9 @@ func (w *Wizard) paint(line string) string {
 		return w.paint(left) + "│" + w.paint(right)
 	}
 	reset := "\x1b[0m"
+	if strings.HasPrefix(strings.TrimSpace(line), "> ") && strings.Contains(line, "(suggested)") {
+		return "\x1b[90m" + line + reset
+	}
 	if strings.Contains(line, " | ") {
 		switch eventLevel(line) {
 		case "ERROR":
