@@ -75,22 +75,32 @@ type Wizard struct {
 	rows, cols int
 	colour     bool
 
-	mu           sync.Mutex
-	names        []string
-	state        map[string]string
-	log          []string
-	prompt       []string // the question on screen now, redrawn with everything else
-	stopped      bool
-	started      time.Time
-	phaseStarted time.Time
-	active       string
-	challenge    string
-	details      bool
-	scroll       int
-	tick         int
-	logPath      string
-	task         taskProgress
+	mu            sync.Mutex
+	names         []string
+	state         map[string]string
+	log           []string
+	prompt        []string // the question on screen now, redrawn with everything else
+	stopped       bool
+	finalScreen   bool
+	started       time.Time
+	phaseStarted  time.Time
+	active        string
+	viewedPhase   string
+	challenge     string
+	details       bool
+	progressView  bool
+	selectionHelp string
+	scroll        int
+	logScroll     int
+	logPaneActive bool
+	copyNotice    string
+	tick          int
+	logPath       string
+	task          taskProgress
+	dockerStatus  map[string]string
+	dockerOrder   []string
 
+	interrupt <-chan struct{}
 	keys      chan keyEvent
 	waiting   bool
 	lastFrame []string
@@ -147,6 +157,7 @@ func (u *UI) StartWizard() bool {
 		rows, cols = r, c
 	}
 	w := newWizard(u.In, u.Out, rows, cols, os.Getenv("NO_COLOR") == "")
+	w.interrupt = u.interrupt
 	w.restore = func() { term.Restore(u.fd, prev) }
 	io.WriteString(u.Out, enterAltScreen)
 	u.wiz = w
@@ -252,21 +263,27 @@ func (w *Wizard) stop() {
 			fmt.Fprintln(w.out, line)
 		}
 		if len(w.names) > 0 && len(w.summary) == 0 {
-			fmt.Fprintf(w.out, "Guacamole setup: %d of %d steps complete.\n", done, len(w.names))
+			command := "setup"
+			if len(w.names) > 0 && strings.HasPrefix(w.names[0], "teardown-") {
+				command = "teardown"
+			}
+			fmt.Fprintf(w.out, "Guacamole %s: %d of %d steps complete.\n", command, done, len(w.names))
 		}
 		if w.active != "" && w.state[w.active] == phaseFailed {
-			fmt.Fprintf(w.out, "Needs attention: %s. Progress is saved; run guacdeploy setup to resume.\n", phaseInfo(w.active).Title)
+			command := "setup"
+			if strings.HasPrefix(w.active, "teardown-") {
+				command = "teardown"
+			}
+			fmt.Fprintf(w.out, "Needs attention: %s. Progress is saved; run sudo /usr/local/bin/guacdeploy %s to continue.\n", phaseInfo(w.active).Title, command)
 		}
 
 	})
 }
 
-// cancelled ends the session on an explicit cancel key that arrived as a key
-// rather than a signal. The wizard prints the notice main.go would have
-// printed and returns the error main.go already maps to exit code 130.
+// cancelled stops the operation without closing the terminal view. The caller
+// saves progress and shows the final summary before restoring the terminal.
 func (w *Wizard) cancelled() error {
-	w.stop()
-	io.WriteString(w.out, cancelNotice+"\n")
+	w.say(cancelNotice)
 	return context.Canceled
 }
 
@@ -275,10 +292,14 @@ func (w *Wizard) say(s string) {
 	// replayed transcript reads like ordinary output.
 	w.mu.Lock()
 	for _, line := range strings.Split(cleanText(s), "\n") {
+		w.trackDocker(line)
 		if len(line) > 8192 {
 			line = line[:8192] + " [display shortened; see session log]"
 		}
-		w.log = append(w.log, time.Now().Format("15:04:05")+"  "+line)
+		if w.logScroll > 0 {
+			w.logScroll += len(wrapped([]string{line}, max(1, w.width()-33)))
+		}
+		w.log = append(w.log, time.Now().Format("15:04:05")+" | "+line)
 	}
 	if n := len(w.log) - logCap; n > 0 {
 		w.log = append([]string(nil), w.log[n:]...)
@@ -311,6 +332,8 @@ func (w *Wizard) setPhase(name, state string) {
 	w.state[name] = state
 	if state == phaseRunning || state == phaseFailed {
 		w.task = taskProgress{}
+		w.dockerStatus = nil
+		w.dockerOrder = nil
 		w.active = name
 		w.phaseStarted = time.Now()
 		w.scroll = 0
@@ -410,13 +433,13 @@ func (w *Wizard) renderLocked() {
 			if i > 0 {
 				b.WriteString("\r\n")
 			}
-			b.WriteString(w.paint(l))
+			b.WriteString(w.linkify(w.paint(l)))
 		}
 	} else {
 		for i, l := range lines {
 			if l != w.lastFrame[i] {
 				fmt.Fprintf(&b, "\x1b[%d;1H\x1b[2K", i+1)
-				b.WriteString(w.paint(l))
+				b.WriteString(w.linkify(w.paint(l)))
 			}
 		}
 	}
@@ -440,6 +463,10 @@ func (w *Wizard) animate() {
 				return
 			case <-ticker.C:
 				w.mu.Lock()
+				if w.challenge != "" {
+					w.mu.Unlock()
+					continue
+				}
 				if !reduced {
 					w.tick++
 				}
@@ -553,6 +580,9 @@ func (w *Wizard) choose(prompt string, choices []Choice) (rune, error) {
 	}
 	sel := 0
 	for {
+		w.mu.Lock()
+		w.selectionHelp = choices[sel].Description
+		w.mu.Unlock()
 		lines := []string{prompt, ""}
 		for i, c := range choices {
 			cursor := "  "
@@ -603,6 +633,9 @@ func lowerASCII(r rune) rune {
 // readLine edits one line of input. hidden suppresses the echo for
 // credential prompts: the value is never drawn, logged or retained.
 func (w *Wizard) readLine(prompt, def string, hidden bool) (string, error) {
+	return w.readLineBack(prompt, def, hidden, false)
+}
+func (w *Wizard) readLineBack(prompt, def string, hidden, back bool) (string, error) {
 	w.beginPrompt()
 	defer w.endPrompt()
 	var buf []rune
@@ -639,6 +672,8 @@ func (w *Wizard) readLine(prompt, def string, hidden bool) (string, error) {
 			continue
 		}
 		switch {
+		case k == rune(2) && back:
+			return "", ErrBack
 		case k == keyPaste:
 			text := strings.ReplaceAll(cleanText(w.inputPaste), "\n", "")
 			chars := []rune(text)
@@ -682,8 +717,10 @@ func (w *Wizard) endPrompt() {
 	w.mu.Lock()
 	w.waiting = false
 	w.details = false
+	w.progressView = false
 	w.scroll = 0
 	w.prompt = nil
+	w.selectionHelp = ""
 	w.renderLocked()
 	w.mu.Unlock()
 }
@@ -691,22 +728,55 @@ func (w *Wizard) resetScroll() { w.mu.Lock(); w.scroll = 0; w.mu.Unlock() }
 func (w *Wizard) viewKey(k rune) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if (w.cols < 48 || w.rows < 16) && k != keyCancel {
+	if (w.cols < 48 || w.rows < 16) && k != keyCancel && !(w.finalScreen && (k == 'f' || k == 'F' || k == keyEnter)) {
 		return true
 	}
 	switch k {
 
+	case 'c', 'C':
+		if w.waiting {
+			return false
+		}
+		if target := challengeURL(w.challenge); target != "" {
+			w.copyLinkLocked(target)
+		} else {
+			return false
+		}
+	case rune(25):
+		if target := challengeURL(w.challenge); target != "" {
+			w.copyLinkLocked(target)
+		}
 	case keyDetails:
-		w.details = !w.details
+		if w.cols < 104 || w.rows < 26 {
+			if w.progressView {
+				w.progressView = false
+				w.details = true
+			} else if w.details {
+				w.details = false
+			} else {
+				w.progressView = true
+			}
+		} else {
+			w.details = !w.details
+			w.progressView = false
+		}
 		w.scroll = 0
 	case keyPageUp:
+		if !w.details && w.logPaneActive {
+			w.logScroll += max(1, w.rows/3)
+			break
+		}
 		w.scroll = max(0, w.scroll-max(1, w.rows/3))
 	case keyPageDown:
+		if !w.details && w.logPaneActive {
+			w.logScroll = max(0, w.logScroll-max(1, w.rows/3))
+			break
+		}
 		w.scroll += max(1, w.rows/3)
 	case keyCancel:
 		return false
 	default:
-		return w.details // do not submit a hidden prompt from history
+		return w.details || w.progressView // do not submit a hidden prompt from history
 	}
 	return true
 }
@@ -720,7 +790,13 @@ type keyEvent struct {
 func (w *Wizard) beginPrompt() { w.mu.Lock(); w.waiting = true; w.scroll = 0; w.mu.Unlock() }
 func (w *Wizard) readKey() (rune, error) {
 	if w.keys != nil {
-		e, ok := <-w.keys
+		var e keyEvent
+		var ok bool
+		select {
+		case <-w.interrupt:
+			return keyCancel, nil
+		case e, ok = <-w.keys:
+		}
 		if !ok {
 			return 0, io.EOF
 		}
@@ -767,7 +843,7 @@ func (w *Wizard) startInput() {
 				case w.keys <- keyEvent{key: k, err: err, paste: w.rawPaste}:
 				}
 				w.rawPaste = ""
-			} else if k == keyDetails || k == keyPageUp || k == keyPageDown {
+			} else if k == 'c' || k == 'C' || k == rune(25) || k == keyDetails || k == keyPageUp || k == keyPageDown {
 				w.viewKey(k)
 				w.redraw()
 			}

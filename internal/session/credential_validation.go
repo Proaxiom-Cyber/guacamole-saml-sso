@@ -27,7 +27,55 @@ func (o *Options) checkCloudflareCredential(ctx context.Context, st *state.State
 		}
 	}
 	var err error
+	browser := o.CloudflareAuth == "browser" || o.CloudflareAuth == "manual"
+	manual := o.CloudflareAuth == "manual"
+	if o.CloudflareAuth != "" && o.CloudflareAuth != "browser" && o.CloudflareAuth != "token" && o.CloudflareAuth != "manual" {
+		return errors.New("Cloudflare authentication must be browser, manual, or token")
+	}
+	config := o.cloudflareOAuthConfig()
+	if !stored && os.Getenv(spec.EnvVar()) == "" && u.Interactive && o.CloudflareAuth == "" && config.Validate() == nil && (m.Mode == creds.ModeTPM || m.Mode == creds.ModeHostKey) {
+		choice, e := u.Choose("Connect Cloudflare", []ui.Choice{{Key: 'b', Label: "Sign in with Cloudflare (recommended)", Description: "Approve access in your browser on another device. Setup waits for the authorization to return automatically."}, {Key: 'm', Label: "Sign in with manual return", Description: "Approve access in your browser, then return the result manually to this terminal. Use this if automatic return is unavailable."}, {Key: 't', Label: "Use an API token", Description: "Provide an existing Cloudflare API token through a hidden prompt. Setup checks access before saving it with your selected protection method."}})
+		if e != nil {
+			return e
+		}
+		browser = choice == 'b' || choice == 'm'
+		manual = choice == 'm'
+	}
 	switch {
+	case browser:
+		if !u.Interactive {
+			return errors.New("Cloudflare browser approval needs an interactive setup session; the browser can be on another device")
+		}
+		if m.Mode != creds.ModeTPM && m.Mode != creds.ModeHostKey {
+			return errors.New("Cloudflare browser sign-in needs sealed credentials for renewal; resume with --credentials tpm or --credentials host")
+		}
+		if config.RelayURL != "" && !manual {
+			value, err = config.AuthorizeHosted(ctx, func(address string) error {
+				u.Transient("Open this address on your computer or phone:\n%s\n\nApprove Cloudflare access. Setup continues automatically.\nNo browser is needed on this server.", address)
+				return nil
+			})
+			u.ClearTransient()
+			if err != nil && ctx.Err() == nil {
+				u.Say("%s", err)
+				choice, e := u.Choose("Cloudflare sign-in", []ui.Choice{{Key: 'm', Label: "Use manual return instead", Description: "Continue browser authorization with a manual return to this terminal instead of waiting for automatic return."}, {Key: 'q', Label: "Stop and keep progress", Description: "Finish this run and retain recorded progress. Resume later from this host; this does not remove deployment resources."}})
+				if e != nil {
+					return e
+				}
+				if choice == 'q' {
+					return err
+				}
+				value = ""
+			}
+		}
+		if value == "" && ctx.Err() == nil {
+			value, err = config.Authorize(ctx, func(address string) (string, error) {
+				u.Transient("Open this address on your computer or phone:\n%s\n\nApprove Cloudflare access. A localhost connection error is expected.\nCopy the full address from your browser, then paste it below.", address)
+				return u.SecretReader()("Paste returned localhost address (hidden)")
+			})
+		}
+
+		u.ClearTransient()
+
 	case stored, !creds.Persistent(m.Mode):
 		value, err = m.Get(spec)
 	case os.Getenv(spec.EnvVar()) != "":
@@ -41,20 +89,28 @@ func (o *Options) checkCloudflareCredential(ctx context.Context, st *state.State
 	if err != nil {
 		return err
 	}
-	changed := !stored
+	if cloudflare.IsOAuthCredential(value) && m.Mode == creds.ModeFile {
+		return errors.New("Cloudflare browser sign-in cannot use plaintext credential storage")
+	}
+	changed := !stored || browser
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		value = strings.TrimSpace(value)
-		u.Say("Checking the Cloudflare API token...")
+		u.Say("Checking Cloudflare access...")
 		// Copy the transport seam, but always test the candidate value, not
 		// the previous token cached by a client or a credential manager.
 		client := cloudflare.Client{}
 		if o.Cloudflare != nil {
 			client = *o.Cloudflare
 		}
-		client.Token = func(context.Context) (string, error) { return value, nil }
+		candidate := &creds.Manager{Mode: creds.ModePrompt, Protect: u.Protect}
+		if stored && !browser && cloudflare.IsOAuthCredential(value) {
+			candidate = m
+		}
+		candidate.Remember(spec, value)
+		client.Token = cloudflare.CredentialTokenSource(candidate, spec, config.HTTP)
 		checkCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		if value == "" {
 			err = &cloudflare.APIError{Status: http.StatusUnauthorized}
@@ -63,10 +119,17 @@ func (o *Options) checkCloudflareCredential(ctx context.Context, st *state.State
 		}
 		cancel()
 		if err == nil {
+			value, _ = candidate.Get(spec)
+			if cloudflare.IsOAuthCredential(value) {
+				changed = true
+			}
 			break
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if cloudflare.IsOAuthCredential(value) {
+			return errors.New("Cloudflare sign-in could not be validated. Check the connection, then resume setup. To replace the sign-in, use --cloudflare-auth browser")
 		}
 		var apiErr *cloudflare.APIError
 		rejected := errors.As(err, &apiErr) && (apiErr.Status == http.StatusBadRequest || apiErr.Status == http.StatusUnauthorized || apiErr.Status == http.StatusForbidden)
@@ -87,7 +150,7 @@ func (o *Options) checkCloudflareCredential(ctx context.Context, st *state.State
 		if rejected {
 			label = "Enter a replacement API token"
 		}
-		choice, chooseErr := u.Choose("Cloudflare token check", []ui.Choice{{Key: 'r', Label: label}, {Key: 'q', Label: "Quit and keep deployment progress"}})
+		choice, chooseErr := u.Choose("Cloudflare token check", []ui.Choice{{Key: 'r', Label: label, Description: "Provide or retry a Cloudflare token and check its access before continuing. Fix expired credentials or missing permissions first."}, {Key: 'q', Label: "Quit and keep deployment progress", Description: "Finish this run and retain recorded progress. Resume later from this host; this does not remove deployment resources."}})
 		if chooseErr != nil {
 			return chooseErr
 		}
@@ -119,7 +182,7 @@ func (o *Options) checkCloudflareCredential(ctx context.Context, st *state.State
 		}
 	}
 	m.Remember(spec, value)
-	u.Say("Cloudflare accepted the token and the Zone Read check passed. Setup will check the selected zone and service permissions next.")
+	u.Say("Cloudflare access and the Zone Read check passed. Setup will check the selected zone and service permissions next.")
 	return nil
 }
 
@@ -130,4 +193,21 @@ func recordCredentialResource(st *state.State, kind, name string) {
 		}
 	}
 	st.Resources = append(st.Resources, state.Resource{ID: state.NewID(), Provider: "host", Type: kind, Name: name, Ownership: "written by this deployment", CreatedAt: time.Now().UTC()})
+}
+
+func (o *Options) cloudflareOAuthConfig() cloudflare.OAuthConfig {
+	c := o.CloudflareOAuth
+	if c.RelayURL == "" {
+		c.RelayURL = os.Getenv("GUACDEPLOY_CLOUDFLARE_OAUTH_RELAY")
+	}
+	if c.RelayURL == "" {
+		c.RelayURL = cloudflare.OAuthRelayURL
+	}
+	if c.ClientID == "" {
+		c.ClientID = os.Getenv("GUACDEPLOY_CLOUDFLARE_OAUTH_CLIENT_ID")
+	}
+	if c.ClientID == "" {
+		c.ClientID = cloudflare.OAuthClientID
+	}
+	return c
 }

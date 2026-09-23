@@ -120,9 +120,10 @@ type Options struct {
 	// DefaultRenewBefore.
 	RenewBefore time.Duration
 
-	DNS  Solver       // required for issuance
-	Run  Runner       // command seam for the nginx reload; nil means ExecRunner
-	HTTP *http.Client // ACME transport; nil means the default
+	Progress func(string) // non-secret task status for the guided view and log
+	DNS      Solver       // required for issuance
+	Run      Runner       // command seam for the nginx reload; nil means ExecRunner
+	HTTP     *http.Client // ACME transport; nil means the default
 
 	// VerifyAddr is the origin address Verify dials; "" means
 	// 127.0.0.1:443.
@@ -169,7 +170,7 @@ func (o *Options) defaults() error {
 	}
 	if o.newACME == nil {
 		o.newACME = func(key crypto.Signer, dir string, hc *http.Client) acmeClient {
-			return &acme.Client{Key: key, DirectoryURL: dir, HTTPClient: hc, UserAgent: "guacdeploy"}
+			return &acme.Client{Key: key, DirectoryURL: dir, HTTPClient: hc, UserAgent: "guacdeploy", RetryBackoff: certificateRetryBackoff}
 		}
 	}
 	return nil
@@ -241,6 +242,8 @@ func Inspect(path string) (Certificate, error) {
 // Nothing is written until the CA has returned a complete chain, so a
 // failure at any earlier step leaves the installed certificate untouched.
 func Issue(ctx context.Context, o Options) (Issued, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
 	if err := o.defaults(); err != nil {
 		return Issued{}, err
 	}
@@ -257,6 +260,7 @@ func Issue(ctx context.Context, o Options) (Issued, error) {
 	if o.Contact != "" {
 		acct.Contact = []string{o.Contact}
 	}
+	o.report("Connecting to the certificate authority and checking the ACME account.")
 	reg, err := client.Register(ctx, acct, acme.AcceptTOS)
 	if errors.Is(err, acme.ErrAccountAlreadyExists) {
 		reg, err = client.GetReg(ctx, "")
@@ -265,6 +269,7 @@ func Issue(ctx context.Context, o Options) (Issued, error) {
 		return Issued{}, fmt.Errorf("register with the certificate authority at %s: %w", o.DirectoryURL, err)
 	}
 
+	o.report("Requesting a certificate for " + o.Hostname + ".")
 	order, err := client.AuthorizeOrder(ctx, acme.DomainIDs(o.Hostname))
 	if err != nil {
 		return Issued{}, fmt.Errorf("request a certificate for %s: %w", o.Hostname, err)
@@ -281,6 +286,7 @@ func Issue(ctx context.Context, o Options) (Issued, error) {
 			return Issued{}, err
 		}
 	}
+	o.report("Waiting for the certificate authority to approve the order.")
 	if _, err := client.WaitOrder(ctx, order.URI); err != nil {
 		return Issued{}, fmt.Errorf("the certificate authority did not accept the order for %s: %w", o.Hostname, err)
 	}
@@ -295,6 +301,7 @@ func Issue(ctx context.Context, o Options) (Issued, error) {
 	if err != nil {
 		return Issued{}, err
 	}
+	o.report("Collecting the signed certificate.")
 	chain, _, err := client.CreateOrderCert(ctx, order.FinalizeURL, csr, true)
 	if err != nil {
 		return Issued{}, fmt.Errorf("collect the certificate for %s: %w", o.Hostname, err)
@@ -338,13 +345,17 @@ func solveDNS01(ctx context.Context, o Options, c acmeClient, authz *acme.Author
 	defer func() {
 		// Cleanup must run even when ctx is already cancelled, otherwise
 		// cancelling setup leaves the record behind.
-		if cerr := o.DNS.CleanUp(context.WithoutCancel(ctx)); cerr != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if cerr := o.DNS.CleanUp(cleanupCtx); cerr != nil {
 			err = errors.Join(err, fmt.Errorf("remove the DNS-01 challenge record: %w", cerr))
 		}
 	}()
+	o.report("Publishing the temporary DNS validation record and checking visibility.")
 	if err := o.DNS.Present(ctx, value); err != nil {
 		return err
 	}
+	o.report("DNS validation record is visible. Waiting for certificate validation.")
 	if _, err := c.Accept(ctx, chal); err != nil {
 		return fmt.Errorf("submit the dns-01 challenge for %s: %w", authz.Identifier.Value, err)
 	}
@@ -460,4 +471,10 @@ func NormaliseContact(contact string) (string, error) {
 		return "", fmt.Errorf("the certificate account contact %q is not an email address; the certificate authority uses it to warn about expiry", contact)
 	}
 	return c, nil
+}
+
+func (o Options) report(message string) {
+	if o.Progress != nil {
+		o.Progress(message)
+	}
 }

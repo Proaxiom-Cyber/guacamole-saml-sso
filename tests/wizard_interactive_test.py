@@ -66,6 +66,9 @@ def exercise(binary, action):
             os.killpg(proc.pid, signal.SIGTERM)
         else:
             os.write(master, {"quit": b"q", "escape": b"\x1b", "ctrl-c": b"\x03"}[action])
+        read_until(lambda: b"Finish and return to the shell" in output)
+        assert b"__WIZARD_EXIT__=" not in output, "summary exited without acknowledgement"
+        os.write(master, b"f")
         read_until(lambda: re.search(rb"__WIZARD_EXIT__=(-?\d+)\r?\n", output) is not None)
         assert b"\x1b[?1049l" in output, "alternate screen was left enabled"
         assert termios.tcgetattr(slave) == original, "terminal settings were not restored"

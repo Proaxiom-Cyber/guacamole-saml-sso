@@ -477,3 +477,7 @@ MIT. See [LICENSE](LICENSE).
 
 Apache Guacamole is a trademark of the Apache Software Foundation. This project is not
 affiliated with or endorsed by the ASF.
+
+Cloudflare browser approval uses the shared Proaxiom Cyber sign-in service, with
+manual return as a fallback. See [Cloudflare sign-in](docs/cloudflare-sign-in.md).
+The deployment server needs no browser or listening port.

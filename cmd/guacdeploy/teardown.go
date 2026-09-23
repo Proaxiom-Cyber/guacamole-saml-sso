@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/cloudflare"
@@ -36,10 +35,23 @@ func teardownCmd(ctx context.Context, stateDir string, consent, deleteData bool,
 		return err
 	}
 	if st == nil {
-		u.Say("No deployment exists on this host. There is nothing to tear down.")
+		u.Summary("No deployment exists on this host. There is nothing to tear down.")
 		return nil
 	}
 
+	u.PhaseList([]string{"teardown-review", "teardown-remove", "teardown-result"})
+	u.PhaseStart("teardown-review")
+	if u.FullScreen() && !deleteData {
+		choice, err := u.Choose("What should happen to your data?\n\nKeep the database, recordings and backups for recovery, or include them in the removal plan.\nNo resources are removed until you confirm the plan.", []ui.Choice{{Key: 'k', Label: "Keep data and backups (recommended)", Description: "Remove the selected deployment services while preserving data and backups for recovery. Retained items remain listed in the removal summary."}, {Key: 'd', Label: "Also remove local data and backups", Description: "Include local database data, recordings and backups in the removal plan. Deletion needs a separate confirmation and cannot be undone."}, {Key: 'q', Label: "Cancel teardown", Description: "Leave teardown before applying the removal plan. Existing resources remain in place."}})
+		if err != nil {
+			return err
+		}
+		if choice == 'q' {
+			u.Summary("Teardown cancelled. Nothing was removed.")
+			return nil
+		}
+		deleteData = choice == 'd'
+	}
 	ops := teardown.DefaultOps(teardown.HostOptions{
 		DeploymentID: st.DeploymentID,
 		StateDir:     stateDir,
@@ -61,26 +73,52 @@ func teardownCmd(ctx context.Context, stateDir string, consent, deleteData bool,
 	plan := teardown.BuildPlan(st, settings.List(ctx, st, reg), deleteData)
 	plan.Reconciled = rec
 
-	if _, err = teardown.Run(ctx, st, plan, ops, u, teardown.Options{
+	result, err := teardown.Run(ctx, st, plan, ops, u, teardown.Options{
 		Consent:  consent,
 		Registry: reg,
 		Save:     func() error { return store.Save(st) },
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
+	if st.Config == nil {
+		st.Config = map[string]string{}
+	}
+	st.Config["teardown-completed"] = "true"
+	if err := store.Save(st); err != nil {
+		return err
+	}
+	keptData := false
+	for _, item := range plan.Items {
+		if item.Kind == teardown.KindData && item.Action == teardown.ActionPreserve {
+			keptData = true
+		}
+	}
+	for _, outcome := range result.Outcomes {
+		if outcome.Item.Kind == teardown.KindData && outcome.Status == teardown.StatusPreserved {
+			keptData = true
+		}
+	}
 
-	// Starting over requires cleanup first. The record goes only when
-	// nothing this deployment created is recorded any more; anything still
-	// in it — kept data, an installed package — is what setup will see and
-	// refuse to build over.
-	if len(st.Resources) == 0 {
-		if err := store.Delete(st); err != nil {
-			return err
+	// Host dependencies and the encrypted recovery export are audit history,
+	// not an active deployment. Retire that history only after teardown succeeds.
+	if !keptData && canRetireDeployment(st) {
+		if len(st.Resources) == 0 {
+			if err := store.Delete(st); err != nil {
+				return err
+			}
+		} else {
+			path, err := store.Archive(st)
+			if err != nil {
+				return err
+			}
+			u.Say("Cleanup finished. Previous deployment records and the encrypted recovery export are archived in %s.", path)
+			u.Say("Docker packages remain installed and can be reused by the next deployment.")
 		}
 		u.Say("The deployment record is removed. Setup starts a new deployment from clean.")
 		return nil
 	}
-	u.Say("The deployment record is kept: %d item(s) listed above are still recorded, so setup will not build a new deployment over them.", len(st.Resources))
+	u.Say("The deployment record is kept because deployment data or other resources remain. Setup will not build a new deployment over them.")
 	return nil
 }
 
@@ -106,14 +144,7 @@ func teardownProviders(ops *teardown.Ops, st *state.State, stateDir string, u *u
 		ReadSecret: u.SecretReader(), Protect: u.Protect,
 	}
 	cf := &cloudflare.Provisioner{
-		Client: &cloudflare.Client{Token: func(context.Context) (string, error) {
-			for _, s := range creds.Required {
-				if s.Name == "cloudflare-api-token" {
-					return m.Get(s) // in-memory only; never journalled
-				}
-			}
-			return "", errors.New("no cloudflare-api-token credential is configured")
-		}},
+		Client:       &cloudflare.Client{Token: cloudflare.CredentialTokenSource(m, cloudflareSpec(), nil)},
 		AccountID:    st.Config["cloudflare-account-id"],
 		ZoneID:       st.Config["cloudflare-zone-id"],
 		Hostname:     st.Config["guac-hostname"],
@@ -217,4 +248,16 @@ func findCloudflare(cf *cloudflare.Provisioner) teardown.Finder {
 		}
 		return f, nil
 	}
+}
+
+// Data, provider resources, and unknown resource kinds keep their recovery record.
+func canRetireDeployment(st *state.State) bool {
+	for _, r := range st.Resources {
+		switch r.Provider + "/" + r.Type {
+		case "host/package", "host/service-enablement", "host/recovery-key-export":
+		default:
+			return false
+		}
+	}
+	return true
 }

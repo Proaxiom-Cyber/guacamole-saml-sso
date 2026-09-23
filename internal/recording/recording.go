@@ -107,7 +107,11 @@ var chownDir = os.Chown
 // It is idempotent: a directory already owned by the guacd account is left
 // alone, so a re-run that is not root still succeeds.
 func EnsureDirs(installDir string) error {
-	p := Dir(installDir)
+	return EnsurePath(Dir(installDir))
+}
+
+// EnsurePath prepares a dedicated recording directory.
+func EnsurePath(p string) error {
 	if err := os.MkdirAll(p, 0o755); err != nil {
 		return fmt.Errorf("create the recordings directory %s: %w", p, err)
 	}

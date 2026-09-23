@@ -20,10 +20,14 @@ func (o *Options) selectEntraTenant(st *state.State, u *ui.UI) error {
 		o.EntraTenant = os.Getenv("GUACDEPLOY_ENTRA_TENANT_ID")
 	}
 	if o.EntraTenant == "" {
-		u.Explain("Choose the Microsoft tenant that will own the application and groups.\nThis can differ from the Cloudflare DNS domain.", "Enter the tenant ID or a verified domain from Microsoft Entra. The public Guacamole hostname and Cloudflare zone do not identify your Microsoft tenant. A saved choice below has not yet been verified; you can correct it before signing in.")
+		suggestedTenant := st.Config["entra-login-tenant"]
+		if suggestedTenant == "" {
+			suggestedTenant = st.Config["cloudflare-zone-name"]
+		}
+		u.Explain("Choose the Microsoft Entra tenant for sign-in.\nIt can differ from the Cloudflare domain used to host the site.", "We suggest your saved tenant, or the Cloudflare domain for a new deployment. Press Enter to accept, or enter a different verified Entra domain or tenant ID. For example, a site hosted under slqaccess.qld.gov.au can use the Entra tenant slq.qld.gov.au. Microsoft sign-in will verify the selected tenant.")
 		for {
 			var err error
-			o.EntraTenant, err = u.Line("Microsoft tenant ID or verified domain", st.Config["entra-login-tenant"])
+			o.EntraTenant, err = u.Line("Microsoft tenant ID or verified domain", suggestedTenant)
 			if err != nil {
 				return err
 			}
@@ -40,7 +44,9 @@ func (o *Options) selectEntraTenant(st *state.State, u *ui.UI) error {
 	if st.Config == nil {
 		st.Config = map[string]string{}
 	}
-	st.Config["entra-login-tenant"] = o.EntraTenant
+	if st.Config["setup-plan-approved"] != "true" {
+		st.Config["entra-login-tenant"] = o.EntraTenant
+	}
 	u.Say("Microsoft sign-in tenant: %s. This sign-in needs administrator consent for application, group, role assignment and organization permissions.", o.EntraTenant)
 	return nil
 }
@@ -82,16 +88,18 @@ func (o *Options) guidedEntraClient() (*entra.Client, error) {
 			}
 			if source == nil {
 				label := "Connect with Microsoft (recommended): device code + host certificate"
+				help := "Sign in to Microsoft with a device code and register this host’s certificate for later installer authentication. Tenant policy must permit device-code sign-in."
 				if o.journalIntent == nil {
 					label = "Sign in with Microsoft for this run"
+					help = "Authorize this run with a Microsoft device code. No persistent installer identity is registered. Tenant policy must permit device-code sign-in."
 				}
-				choices := []ui.Choice{{Key: 'd', Label: label}, {Key: 'a', Label: "Device code blocked: register the installer app yourself"}, {Key: 'x', Label: "Other authentication options"}, {Key: 'q', Label: "Quit and keep deployment progress"}}
+				choices := []ui.Choice{{Key: 'd', Label: label, Description: help}, {Key: 'a', Label: "Device code blocked: register the installer app yourself", Description: "Follow the Entra registration instructions and upload this host’s public certificate. The private key remains on this host. Use this when tenant policy blocks device-code sign-in."}, {Key: 'x', Label: "Other authentication options", Description: "Compare alternative ways to authorize this run. Availability depends on your tenant policy and administrator permissions."}, {Key: 'q', Label: "Quit and keep deployment progress", Description: "Finish this run and retain recorded progress. Resume later from this host; this does not remove deployment resources."}}
 				if o.entraState != nil && o.entraState.Config["entra-auth-method"] != "" {
-					choices = append([]ui.Choice{{Key: 'r', Label: "Use the installer identity already registered for this host"}}, choices...)
+					choices = append([]ui.Choice{{Key: 'r', Label: "Use the installer identity already registered for this host", Description: "Authenticate with this host’s existing installer app and certificate. Its permissions and certificate must still be valid."}}, choices...)
 				}
 				choice, err := u.Choose("Connect Microsoft Entra\n\nMicrosoft sign-in authorizes setup. The host certificate authenticates the installer.\nThe recommended path does both, without copying a certificate or a token.", choices)
 				if err == nil && choice == 'x' {
-					choice, err = u.Choose("Other authentication options\n\nThese options depend on your tenant policy. Credentials stay in memory for this run.", []ui.Choice{{Key: 's', Label: "Use an installer app with a client secret"}, {Key: 'b', Label: "Paste an access token from Graph Explorer"}, {Key: 'o', Label: "Device-code sign-in for this run only"}, {Key: 'q', Label: "Stop and keep progress"}})
+					choice, err = u.Choose("Other authentication options\n\nThese options depend on your tenant policy. Credentials stay in memory for this run.", []ui.Choice{{Key: 's', Label: "Use an installer app with a client secret", Description: "Supply the tenant ID, client ID and secret for an authorized installer app. The secret is used in memory for this run."}, {Key: 'b', Label: "Paste an access token from Graph Explorer", Description: "Sign in through Graph Explorer with the required permissions, then paste its short-lived access token into a hidden prompt."}, {Key: 'o', Label: "Device-code sign-in for this run only", Description: "Authorize this run with a Microsoft device code. This does not register a persistent installer identity, and tenant policy can block it."}, {Key: 'q', Label: "Stop and keep progress", Description: "Finish this run and retain recorded progress. Resume later from this host; this does not remove deployment resources."}})
 				}
 
 				if err != nil {
@@ -139,7 +147,7 @@ func (o *Options) guidedEntraClient() (*entra.Client, error) {
 				return "", ctx.Err()
 			}
 			u.Say("%s", err)
-			choice, chooseErr := u.Choose("Microsoft sign-in", []ui.Choice{{Key: 'r', Label: "Retry Microsoft sign-in"}, {Key: 'o', Label: "Device-code sign-in for this run only (no stored installer identity)"}, {Key: 'a', Label: "Use an installer app with a TPM certificate"}, {Key: 's', Label: "Use an installer app with a client secret"}, {Key: 'b', Label: "Use Graph Explorer in a browser instead"}, {Key: 'q', Label: "Quit and keep deployment progress"}})
+			choice, chooseErr := u.Choose("Microsoft sign-in", []ui.Choice{{Key: 'r', Label: "Retry Microsoft sign-in", Description: "Start Microsoft authorization again. Check the account, permissions and tenant policy if the previous attempt failed."}, {Key: 'o', Label: "Device-code sign-in for this run only (no stored installer identity)", Description: "Authorize this run with a Microsoft device code. No persistent installer identity is registered. You must authorize later runs again."}, {Key: 'a', Label: "Use an installer app with a TPM certificate", Description: "Use a registered installer app and a certificate whose private key is protected by this host’s TPM. Setup guides you through the required registration."}, {Key: 's', Label: "Use an installer app with a client secret", Description: "Supply the tenant ID, client ID and secret for an authorized installer app. The secret is used in memory for this run."}, {Key: 'b', Label: "Use Graph Explorer in a browser instead", Description: "Use browser sign-in to obtain a short-lived Graph token with the required permissions. Setup will provide instructions and a hidden token prompt."}, {Key: 'q', Label: "Quit and keep deployment progress", Description: "Finish this run and retain recorded progress. Resume later from this host; this does not remove deployment resources."}})
 			if chooseErr != nil {
 				return "", chooseErr
 			}
@@ -202,7 +210,7 @@ func (o *Options) browserEntraToken() entra.TokenSource {
 					"In Graph Explorer, select the Access token tab beside Modify Permissions.\nCopy the token. You do not need to select Run query.\nChoose Continue here. Paste the token at the hidden terminal prompt.",
 				}
 				for _, step := range steps {
-					choice, err := u.Choose(step, []ui.Choice{{Key: 'c', Label: "Continue"}, {Key: 'q', Label: "Quit and keep deployment progress"}})
+					choice, err := u.Choose(step, []ui.Choice{{Key: 'c', Label: "Continue", Description: "Continue after completing the browser instructions above. Setup will check the supplied identity before using it."}, {Key: 'q', Label: "Quit and keep deployment progress", Description: "Finish this run and retain recorded progress. Resume later from this host; this does not remove deployment resources."}})
 					if err != nil {
 						return "", err
 					}

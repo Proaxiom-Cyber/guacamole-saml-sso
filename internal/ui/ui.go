@@ -26,8 +26,9 @@ var ErrInputRequired = errors.New("interactive input required")
 
 // Choice is one selectable option in a prompt.
 type Choice struct {
-	Key   rune
-	Label string
+	Key         rune
+	Label       string
+	Description string
 }
 
 // UI wraps input/output for one session.
@@ -39,10 +40,12 @@ type UI struct {
 	// Secret overrides hidden input, for tests.
 	Secret func(prompt string) (string, error)
 
-	fd      int
-	saved   *term.State
-	journal *journal
-	wiz     *Wizard // non-nil once StartWizard succeeds; never cleared
+	fd        int
+	saved     *term.State
+	journal   *journal
+	summary   []string
+	interrupt chan struct{}
+	wiz       *Wizard // non-nil once StartWizard succeeds; never cleared
 }
 
 // SecretReader returns the hidden-input function for this UI, or nil when
@@ -65,7 +68,7 @@ func (u *UI) SecretReader() func(string) (string, error) {
 // terminal and the flag to allow it. When interactive, the terminal state is
 // saved so RestoreTerminal can undo a prompt interrupted mid-read.
 func New(allowInteractive bool) *UI {
-	u := &UI{In: bufio.NewReader(os.Stdin), Out: os.Stdout, fd: int(os.Stdin.Fd())}
+	u := &UI{In: bufio.NewReader(os.Stdin), Out: os.Stdout, fd: int(os.Stdin.Fd()), interrupt: make(chan struct{}, 1)}
 	if allowInteractive && term.IsTerminal(u.fd) {
 		u.Interactive = true
 		if s, err := term.GetState(u.fd); err == nil {
@@ -91,13 +94,20 @@ func (u *UI) RestoreTerminal() {
 // Say writes one line to the user.
 func (u *UI) Say(format string, args ...any) {
 	s := u.safe(fmt.Sprintf(format, args...))
-	u.record("INFO", s)
+	u.record(eventLevel(s), s)
 	if w := u.wizard(); w != nil {
 		w.say(s)
 		return
 	}
 	if u.journal != nil {
-		fmt.Fprintf(u.Out, "%s  %s\n", time.Now().Format("15:04:05"), s)
+		for i, line := range strings.Split(s, "\n") {
+			stamp := "        "
+			if i == 0 {
+				stamp = time.Now().Format("15:04:05")
+			}
+			fmt.Fprintf(u.Out, "%s | %s\n", stamp, line)
+		}
+		fmt.Fprintln(u.Out)
 	} else {
 		fmt.Fprintln(u.Out, s)
 	}
@@ -171,6 +181,9 @@ func (u *UI) Choose(prompt string, choices []Choice) (rune, error) {
 		fmt.Fprintf(u.Out, "%s\n", prompt)
 		for _, c := range choices {
 			fmt.Fprintf(u.Out, "  [%c] %s\n", c.Key, c.Label)
+			if c.Description != "" {
+				fmt.Fprintf(u.Out, "      %s\n", c.Description)
+			}
 		}
 		fmt.Fprint(u.Out, "> ")
 		line, err := u.In.ReadString('\n')
@@ -219,7 +232,12 @@ func (u *UI) Line(prompt, def string) (string, error) {
 
 // Confirm asks a yes/no question.
 func (u *UI) Confirm(prompt string) (bool, error) {
-	k, err := u.Choose(prompt, []Choice{{'y', "Yes"}, {'n', "No"}})
+	return u.ConfirmWithHelp(prompt, "Approve the action described above. Read the listed changes and consequences before continuing.", "Decline this action. It will not be performed; the workflow may return to an earlier choice or finish with progress retained.")
+}
+
+// ConfirmWithHelp explains both outcomes for decisions with specific consequences.
+func (u *UI) ConfirmWithHelp(prompt, yesHelp, noHelp string) (bool, error) {
+	k, err := u.Choose(prompt, []Choice{{Key: 'y', Label: "Yes", Description: yesHelp}, {Key: 'n', Label: "No", Description: noHelp}})
 	return k == 'y', err
 }
 
@@ -261,6 +279,7 @@ func (u *UI) Explain(summary, detail string) {
 
 // Summary is retained after the alternate screen closes.
 func (u *UI) Summary(lines ...string) {
+	u.summary = append([]string(nil), lines...)
 	if w := u.wizard(); w != nil {
 		w.mu.Lock()
 		w.summary = append([]string{}, lines...)
@@ -280,4 +299,40 @@ func (u *UI) ErrorText(err error) string {
 		return ""
 	}
 	return u.safe(err.Error())
+}
+
+// FullScreen reports whether the guided terminal view is active.
+func (u *UI) FullScreen() bool { return u.wizard() != nil }
+
+// Interrupt releases a pending wizard prompt after an operating-system signal.
+// It does not restore the terminal; the caller first saves state and shows the result.
+func (u *UI) Interrupt() {
+	if u.interrupt != nil {
+		select {
+		case u.interrupt <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// ReviewPhase moves the visible task focus without rewriting execution history.
+// The returned function restores the previous focus after a nested review screen.
+func (u *UI) ReviewPhase(name string) func() {
+	w := u.wizard()
+	if w == nil {
+		return func() {}
+	}
+	w.mu.Lock()
+	previous := w.viewedPhase
+	w.viewedPhase = name
+	w.scroll = 0
+	w.mu.Unlock()
+	w.redraw()
+	return func() {
+		w.mu.Lock()
+		w.viewedPhase = previous
+		w.scroll = 0
+		w.mu.Unlock()
+		w.redraw()
+	}
 }

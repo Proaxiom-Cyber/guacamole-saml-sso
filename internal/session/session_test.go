@@ -59,7 +59,7 @@ func core(o Options) Options {
 	if o.Phases != nil {
 		return o
 	}
-	all := Phases(&o)
+	all := withoutPhases(Phases(&o), "configure-review")
 	for i, p := range all {
 		if p.Name == "host-dependencies" {
 			o.Phases = all[:i+1]
@@ -1395,7 +1395,7 @@ func TestTPMModeStoresSealedBlobsAndNoPlaintext(t *testing.T) {
 	var calls []string
 	d, run := sealingHost(t, &calls)
 
-	o := Options{StateDir: dir, UI: u, Host: fakeHost(t), CredentialMode: creds.ModeTPM,
+	o := Options{CloudflareAuth: "token", StateDir: dir, UI: u, Host: fakeHost(t), CredentialMode: creds.ModeTPM,
 		CredDetector: d, CredsRun: run}
 	if err := Run(context.Background(), core(o)); err != nil {
 		t.Fatalf("tpm-mode setup: %v", err)

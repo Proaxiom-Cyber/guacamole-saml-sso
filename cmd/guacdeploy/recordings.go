@@ -31,7 +31,7 @@ func recordingsRunCmd(stateDir, recordingsDir, dest string, budget int64, plaint
 		return fmt.Errorf("no deployment exists in %s; there are no recordings to manage", stateDir)
 	}
 	if recordingsDir == "" {
-		recordingsDir = recording.Dir(installDirFrom(st))
+		recordingsDir = deploymentRecordingDir(st)
 	}
 	rep, err := recording.Run(recording.Options{
 		Dir: recordingsDir, Dest: dest, StateDir: stateDir,
@@ -68,7 +68,7 @@ func recordingsEnableCmd(ctx context.Context, run backup.Runner, stateDir, conne
 	} else {
 		u.Say("Session recording is on for %q.", connection)
 	}
-	u.Say("Recordings are written to %s and are complete when the session ends.", recording.Dir(installDirFrom(st)))
+	u.Say("Recordings are written to %s and are complete when the session ends.", deploymentRecordingDir(st))
 	return nil
 }
 
@@ -114,4 +114,11 @@ func recordingsRestoreCmd(stateDir, file, out, identityFile string, u *ui.UI) er
 	}
 	u.Say("Recording written to %s. Play it back with the Guacamole session recording player.", out)
 	return nil
+}
+
+func deploymentRecordingDir(st *state.State) string {
+	if p := st.Config["recording-dir"]; p != "" {
+		return p
+	}
+	return recording.Dir(installDirFrom(st))
 }

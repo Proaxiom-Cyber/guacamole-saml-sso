@@ -47,7 +47,12 @@ services:
       # guacdeploy creates ./recordings and gives it to the guacd container
       # account. Docker would otherwise create it root-owned, guacd could not
       # write, and sessions would run unrecorded without failing.
-      - ./recordings:/recordings:z
+      - type: bind
+        source: {{printf "%q" .RecordingsDir}}
+        target: /recordings
+        bind:
+          create_host_path: false
+          selinux: z
     healthcheck:
       test: ["CMD", "nc", "-z", "127.0.0.1", "4822"]
       interval: 5s
@@ -135,7 +140,13 @@ services:
     volumes:
       # Read-only: guacd owns these files, and the web application must never
       # be able to alter or delete session evidence.
-      - ./recordings:/recordings:ro,z
+      - type: bind
+        source: {{printf "%q" .RecordingsDir}}
+        target: /recordings
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: z
       - {{ .RuntimeSecretsDir }}/guacamole:/run/secrets:ro,z
 
   # Started only when COMPOSE_PROFILES in .env contains "cloudflare".

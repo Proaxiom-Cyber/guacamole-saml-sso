@@ -249,10 +249,32 @@ func (m *Manager) Store(ctx context.Context, s Spec, value string) (createdDir b
 	if createdDir, err = m.ensureDir(); err != nil {
 		return false, err
 	}
-	if err := os.WriteFile(m.sealPath(s), []byte(blob), 0o600); err != nil {
+	// Refresh tokens rotate. Replace the encrypted blob atomically so a
+	// interrupted write does not truncate the last usable credential.
+	f, err := os.CreateTemp(m.Dir, ".sealed-*")
+	if err != nil {
 		return createdDir, err
 	}
-	return createdDir, nil
+	defer os.Remove(f.Name())
+	if _, err = f.WriteString(blob); err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return createdDir, err
+	}
+	if closeErr != nil {
+		return createdDir, closeErr
+	}
+	if err = os.Rename(f.Name(), m.sealPath(s)); err != nil {
+		return createdDir, err
+	}
+	dir, err := os.Open(m.Dir)
+	if err != nil {
+		return createdDir, err
+	}
+	defer dir.Close()
+	return createdDir, dir.Sync()
 }
 
 // seal encrypts one value. The value goes in through stdin and never

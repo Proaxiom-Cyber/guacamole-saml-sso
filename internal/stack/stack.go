@@ -62,6 +62,7 @@ const DefaultRuntimeSecretsDir = "/run/guacdeploy/secrets"
 // records in deployment state.
 type Config struct {
 	InstallDir      string // default /opt/guacamole
+	RecordingsDir   string // dedicated directory; default below InstallDir
 	Hostname        string // public hostname, also the TLS server name
 	AdminGroup      string
 	OperatorGroup   string
@@ -85,6 +86,9 @@ type Config struct {
 func (c *Config) defaults() {
 	if c.InstallDir == "" {
 		c.InstallDir = "/opt/guacamole"
+	}
+	if c.RecordingsDir == "" {
+		c.RecordingsDir = filepath.Join(c.InstallDir, "recordings")
 	}
 	if c.HTTPSPort == "" {
 		c.HTTPSPort = "443"

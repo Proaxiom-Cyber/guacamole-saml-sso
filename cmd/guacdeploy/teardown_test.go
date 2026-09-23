@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/session"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/state"
 	"github.com/Proaxiom-Cyber/guacamole-saml-sso/internal/teardown"
 )
@@ -94,8 +97,7 @@ func TestTeardownRemovesTheRecordOnlyWhenEmpty(t *testing.T) {
 		t.Errorf("the clean restart was not reported:\n%s", out)
 	}
 
-	// A package this deployment installed is kept on purpose, so the record
-	// is kept with it.
+	// Packages remain installed, but their record becomes archived history.
 	dir = write(t, []state.Resource{{
 		ID: "r-pkg", Provider: "host", Type: "package",
 		Name: "docker-ce", Ownership: "installed by this deployment",
@@ -104,10 +106,10 @@ func TestTeardownRemovesTheRecordOnlyWhenEmpty(t *testing.T) {
 	if err := teardownCmd(context.Background(), dir, true, false, u); err != nil {
 		t.Fatalf("teardown failed: %v", err)
 	}
-	if st, err = state.Read(dir); err != nil || st == nil {
-		t.Fatalf("the record was removed while something is still recorded: %v", err)
+	if st, err = state.Read(dir); err != nil || st != nil {
+		t.Fatalf("the completed deployment was not retired: %v", err)
 	}
-	if !strings.Contains(out.String(), "will not build a new deployment over them") {
+	if !strings.Contains(out.String(), "archived") {
 		t.Errorf("the kept record was not explained:\n%s", out)
 	}
 }
@@ -124,5 +126,86 @@ func TestInstallDirComesFromTheRecord(t *testing.T) {
 	}
 	if got := installDirOf(&state.State{}); got != "" {
 		t.Errorf("want empty for a record with no installation directory, got %q", got)
+	}
+}
+
+func TestCompletedCleanupAllowsFreshSetupWithRetainedHostPackages(t *testing.T) {
+	dir := t.TempDir()
+	store, err := state.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := &state.State{DeploymentID: "old", Config: map[string]string{}, Resources: []state.Resource{{ID: "pkg", Provider: "host", Type: "package", Name: "docker-ce", Ownership: "installed by deployment"}}, Actions: []state.Action{{ID: "interrupted", Intent: "credential-check"}}}
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	u, out := cmdUI()
+	if err := teardownCmd(context.Background(), dir, true, true, u); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Run(context.Background(), session.Options{StateDir: dir, UI: u, Phases: []session.Phase{}}); err != nil {
+		t.Fatalf("fresh setup after successful cleanup failed: %v\n%s", err, out.String())
+	}
+	next, err := state.Read(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.DeploymentID == "old" {
+		t.Fatal("cleanup resumed the old deployment")
+	}
+}
+
+func TestRetainedBackupDoesNotBecomeInterruptedSetup(t *testing.T) {
+	dir := t.TempDir()
+	store, err := state.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := &state.State{DeploymentID: "retained", Config: map[string]string{"backup-dest": t.TempDir()}, Actions: []state.Action{{ID: "a", Intent: "credential-check"}}}
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	u, out := cmdUI()
+	if err := teardownCmd(context.Background(), dir, true, false, u); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	err = session.Run(context.Background(), session.Options{StateDir: dir, UI: u, Phases: []session.Phase{}})
+	if err == nil || strings.Contains(err.Error(), "interrupted work exists") || !strings.Contains(err.Error(), "retained data") {
+		t.Fatalf("wrong post-teardown behavior: %v", err)
+	}
+	if st, err := state.Read(dir); err != nil || st == nil {
+		t.Fatal("retained data lost its record")
+	}
+}
+
+func TestTeardownDeletesDataBeforeRetiringItsParentDirectory(t *testing.T) {
+	dir := t.TempDir()
+	install := filepath.Join(t.TempDir(), "guacamole")
+	if err := os.MkdirAll(filepath.Join(install, "recordings"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := state.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := &state.State{DeploymentID: "old", Config: map[string]string{}, Resources: []state.Resource{
+		{ID: "config", Provider: "host", Type: "config-directory", Name: install, Ownership: "rendered by deployment"},
+	}}
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	u, out := cmdUI()
+	if err := teardownCmd(context.Background(), dir, true, true, u); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(install); !os.IsNotExist(err) {
+		t.Fatalf("empty installation directory survived teardown: %v\n%s", err, out.String())
+	}
+	if st, err := state.Read(dir); err != nil || st != nil {
+		t.Fatalf("active deployment survived full teardown: %v", err)
 	}
 }

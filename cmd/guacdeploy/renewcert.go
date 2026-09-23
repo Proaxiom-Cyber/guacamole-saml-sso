@@ -131,7 +131,7 @@ func cloudflareToken(stateDir string, st *state.State) (cloudflare.TokenSource, 
 			cloudflareSpec().EnvVar())
 	}
 	m := &creds.Manager{Mode: mode, Dir: filepath.Join(stateDir, "credentials")}
-	return func(context.Context) (string, error) { return m.Get(cloudflareSpec()) }, nil
+	return cloudflare.CredentialTokenSource(m, cloudflareSpec(), nil), nil
 }
 
 func cloudflareSpec() creds.Spec {

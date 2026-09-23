@@ -18,7 +18,7 @@ func (u *UI) Preview(ctx context.Context) error {
 	u.PhaseStart("entra-signin")
 	u.Say("PREVIEW ONLY. Example deployment: guac.example.com. No resources will be created.")
 	for {
-		c, err := u.Choose("Connect Microsoft Entra\n\nMicrosoft sign-in authorizes setup. The host certificate authenticates the installer.\nThe recommended path does both, without copying a certificate or a token.", []Choice{{'d', "Connect with Microsoft: device code + host certificate"}, {'a', "Device code blocked: register the installer app yourself"}, {'p', "Preview task progress and logo animation"}, {'e', "Preview a recoverable failure"}, {'q', "Close preview"}})
+		c, err := u.Choose("Connect Microsoft Entra\n\nMicrosoft sign-in authorizes setup. The host certificate authenticates the installer.\nThe recommended path does both, without copying a certificate or a token.", []Choice{{Key: 'd', Label: "Connect with Microsoft: device code + host certificate"}, {Key: 'a', Label: "Device code blocked: register the installer app yourself", Description: "Follow the Entra registration instructions and upload this host’s public certificate. The private key remains on this host. Use this when tenant policy blocks device-code sign-in."}, {Key: 'p', Label: "Preview task progress and logo animation"}, {Key: 'e', Label: "Preview a recoverable failure"}, {Key: 'q', Label: "Close preview"}})
 		if err != nil {
 			return err
 		}
@@ -41,7 +41,7 @@ func (u *UI) Preview(ctx context.Context) error {
 		}
 		if c == 'e' {
 			u.PhaseFailed("entra-signin", fmt.Errorf("Microsoft sign-in was blocked by tenant policy. Use manual app registration to continue"))
-			c, err = u.Choose("Progress is saved. Choose the manual registration path, or try sign-in again.", []Choice{{'c', "Back to sign-in choices"}, {'q', "Close preview"}})
+			c, err = u.Choose("Progress is saved. Choose the manual registration path, or try sign-in again.", []Choice{{Key: 'c', Label: "Back to sign-in choices"}, {Key: 'q', Label: "Close preview"}})
 			if err != nil {
 				return err
 			}
@@ -52,7 +52,7 @@ func (u *UI) Preview(ctx context.Context) error {
 			continue
 		}
 		if c == 'a' {
-			_, err = u.Choose("Register the installer app in your browser\n\nOpen https://entra.microsoft.com\nGo to App registrations > New registration.\nName: Guacamole Installer\nChoose Accounts in this organizational directory only.\nLeave Redirect URI empty, then select Register.\n\nNext: grant application permissions and upload this host's public certificate.", []Choice{{'c', "Back to preview"}})
+			_, err = u.Choose("Register the installer app in your browser\n\nOpen https://entra.microsoft.com\nGo to App registrations > New registration.\nName: Guacamole Installer\nChoose Accounts in this organizational directory only.\nLeave Redirect URI empty, then select Register.\n\nNext: grant application permissions and upload this host's public certificate.", []Choice{{Key: 'c', Label: "Back to preview"}})
 			if err != nil {
 				return err
 			}
@@ -69,7 +69,7 @@ func (u *UI) Preview(ctx context.Context) error {
 		u.ClearTransient()
 		u.Say("PREVIEW: certificate registered. Installer identity verified.")
 		u.PhaseDone("entra-signin")
-		c, err = u.Choose("Microsoft Entra connected\n\nThe host can now authenticate with its TPM certificate.\nThe private key stays in the TPM.\n\nIn a real deployment, setup now configures Guacamole sign-in and access groups.", []Choice{{'r', "Replay preview"}, {'q', "Close preview"}})
+		c, err = u.Choose("Microsoft Entra connected\n\nThe host can now authenticate with its TPM certificate.\nThe private key stays in the TPM.\n\nIn a real deployment, setup now configures Guacamole sign-in and access groups.", []Choice{{Key: 'r', Label: "Replay preview"}, {Key: 'q', Label: "Close preview"}})
 		if err != nil {
 			return err
 		}

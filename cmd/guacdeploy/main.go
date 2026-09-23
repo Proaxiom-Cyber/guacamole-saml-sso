@@ -32,8 +32,10 @@ var version = "dev" // set with -ldflags "-X main.version=..."
 
 const usage = `Usage: guacdeploy [command] [flags]
 
+Run without arguments for the interactive main menu.
+
 Commands:
-  setup    Start or resume the deployment (default)
+  setup    Start or resume the deployment
   status   Show the deployment record
   backup-key  Generate the backup recovery key (guided only); --verify demonstrates recovery
   backup   Export the database, encrypted with the backup key, into a directory
@@ -62,6 +64,7 @@ Flags for setup:
   --hostname NAME          Public hostname for the deployment
   --admin-group NAME       Identity-provider group for administrators
   --operator-group NAME    Identity-provider group for operators
+  --cloudflare-auth MODE  Cloudflare browser approval or API token (browser, manual, token)
   --zone NAME              Cloudflare zone name (default: the hostname's apex)
   --access-emails LIST     Cloudflare Access allow-list when Entra groups are unavailable
   --acme-contact ADDR      Operator address for the certificate account
@@ -131,9 +134,10 @@ Flags for the recordings commands:
 
 func main() { os.Exit(run(os.Args[1:])) }
 
-func run(args []string) int {
+func run(args []string) (code int) {
+	showMenu := len(args) == 0
 	cmd := "setup"
-	if len(args) > 0 && args[0][0] != '-' {
+	if len(args) > 0 && len(args[0]) > 0 && args[0][0] != '-' {
 		cmd, args = args[0], args[1:]
 	}
 
@@ -145,6 +149,7 @@ func run(args []string) int {
 	hostname := fs.String("hostname", "", "public hostname for the deployment")
 	adminGroup := fs.String("admin-group", "", "identity-provider group for administrators")
 	operatorGroup := fs.String("operator-group", "", "identity-provider group for operators")
+	cloudflareAuth := fs.String("cloudflare-auth", "", "Cloudflare authentication: browser, manual or token")
 	zone := fs.String("zone", "", "Cloudflare zone name (default: the hostname's apex)")
 	accessEmails := fs.String("access-emails", "", "comma-separated Cloudflare Access allow-list, used when Entra groups are unavailable")
 	acmeContact := fs.String("acme-contact", "", "operator address for the certificate account, e.g. mailto:ops@example.com")
@@ -177,44 +182,86 @@ func run(args []string) int {
 	deleteData := fs.Bool("delete-data", false, "teardown: also delete the database, recordings and backups")
 	stateDir := fs.String("state-dir", state.DefaultDir(), "state directory")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
-	if err := fs.Parse(args); err != nil {
+	parseErr := fs.Parse(args)
+
+	u := ui.New(!*nonInteractive)
+	var err error
+	guided := u.Interactive && cmd != "version"
+	ctx, cancel := context.WithCancel(context.Background())
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		select {
+		case <-sig:
+			cancel()
+			u.Interrupt()
+		case <-ctx.Done():
+		}
+	}()
+
+	defer func() {
+		defer signal.Stop(sig)
+		defer cancel()
+		if failure := recover(); failure != nil {
+			err = errors.New("An unexpected internal error stopped the operation. Review saved progress before trying again.")
+			code = 1
+		}
+		if guided {
+			if err == nil && code != 0 {
+				err = fmt.Errorf("The operation stopped (exit status %d).", code)
+			}
+			if finalErr := u.FinalScreen(cmd, err); finalErr != nil && code == 0 {
+				code = 130
+			}
+		}
+		u.RestoreTerminal()
+		u.FinishLog(err)
+	}()
+	if parseErr != nil {
+		if errors.Is(parseErr, flag.ErrHelp) {
+			guided = false
+			return 0
+		}
+		err = parseErr
+		u.StartWizard()
 		return 2
 	}
 
-	u := ui.New(!*nonInteractive)
-	defer u.RestoreTerminal()
+	if showMenu && u.Interactive {
+		u.StartWizard()
+		var selected string
+		selected, err = mainMenu(u, *stateDir)
+		if err != nil {
+			return 130
+		}
+		if selected == "" {
+			u.Summary("Session closed. No deployment changes were requested.")
+			return 0
+		}
+		cmd = selected
+	}
 	if cmd == "setup" {
 		// Validate on every invocation, before creating the log or running
 		// phases that may already be complete in a resumed deployment.
-		normalised, err := certs.NormaliseContact(*acmeContact)
+		var normalised string
+		normalised, err = certs.NormaliseContact(*acmeContact)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "guacdeploy: %s\n", u.ErrorText(err))
+			if !guided {
+				fmt.Fprintf(os.Stderr, "guacdeploy: %s\n", u.ErrorText(err))
+			}
 			return 2
 		}
 		*acmeContact = normalised
 	}
 	if cmd == "setup" || cmd == "teardown" || cmd == "recover" {
-		if err := u.StartLog(*stateDir, cmd); err != nil {
-			fmt.Fprintf(os.Stderr, "guacdeploy: %s\n", u.ErrorText(err))
+		if err = u.StartLog(*stateDir, cmd); err != nil {
+			if !guided {
+				fmt.Fprintf(os.Stderr, "guacdeploy: %s\n", u.ErrorText(err))
+			}
 			return 1
 		}
-		defer func() { u.RestoreTerminal(); u.FinishLog(nil) }()
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sig // fires only on a real signal; leaks harmlessly on normal exit
-		cancel()
-		u.RestoreTerminal()
-		u.FinishLog(context.Canceled)
-		fmt.Fprintln(os.Stderr, "\nCancelled. Completed work is saved; run guacdeploy again to resume or clean up.")
-		os.Exit(130)
-	}()
-
-	var err error
 	switch cmd {
 	case "preview":
 		u.StartWizard()
@@ -227,14 +274,15 @@ func run(args []string) int {
 			StateDir: *stateDir, UI: u, Resume: *resume,
 			InstallDependencies: *installDeps, CredentialMode: *credMode,
 			Hostname: *hostname, AdminGroup: *adminGroup, OperatorGroup: *operatorGroup,
-			Zone: *zone, AccessEmails: *accessEmails, ACMEContact: *acmeContact,
+			CloudflareAuth: *cloudflareAuth,
+			Zone:           *zone, AccessEmails: *accessEmails, ACMEContact: *acmeContact,
 			Azure: *azureDest, AzureSubscription: *azureSubscription,
 			AzureAccount: *azureAccount, AzureContainer: *azureContainer,
 			AzureCreate: *azureCreate, AzureLocation: *azureLocation,
 			AzureResourceGroup: *azureResourceGroup,
 			BackupDest:         *backupDest, BackupSchedule: *backupSchedule, BackupKeep: *backupKeep,
 			BackupPlaintext: *plaintext, BackupRequireMount: *requireMount,
-			NoBackupSchedule: *noBackupSchedule, RecordingBudget: *recordingBudget,
+			NoBackupSchedule: *noBackupSchedule, RecordingBudget: *recordingBudget, RecordingDir: *recordingsDir,
 		}
 		if s := os.Getenv("GUACDEPLOY_TEST_SLEEP_PHASE"); s != "" {
 			// Test hook: replace the registry with a slow phase so session
@@ -253,7 +301,7 @@ func run(args []string) int {
 				}},
 			}
 		}
-		err = session.Run(ctx, opts)
+		err = runWithRecovery(ctx, u, "setup", func() error { return session.Run(ctx, opts) })
 	case "status":
 		err = session.Status(*stateDir, u)
 	case "backup-key":
@@ -290,7 +338,8 @@ func run(args []string) int {
 		}
 		err = settingsCmd(ctx, *stateDir, *restore, u)
 	case "teardown":
-		err = teardownCmd(ctx, *stateDir, *yes, *deleteData, u)
+		u.StartWizard()
+		err = runWithRecovery(ctx, u, "teardown", func() error { return teardownCmd(ctx, *stateDir, *yes, *deleteData, u) })
 	case "recover":
 		err = recoverCmd(ctx, *stateDir, *file, *keyExport, *yes, u)
 	case "azure-upload":
@@ -310,13 +359,9 @@ func run(args []string) int {
 		return 2
 	}
 
-	// Leave the alternate screen before anything is written to stderr. The
-	// deferred restore runs too late: the final message below would be drawn
-	// on the full-screen buffer and disappear with it, so a failure before
-	// the first phase gave the operator exit 1 and a blank terminal.
-	// RestoreTerminal is idempotent.
-	u.RestoreTerminal()
-	u.FinishLog(err)
+	if !guided {
+		u.RestoreTerminal()
+	}
 
 	switch {
 	case err == nil:
@@ -324,12 +369,16 @@ func run(args []string) int {
 	case errors.Is(err, session.ErrApprovalRequired), errors.Is(err, ui.ErrInputRequired),
 		errors.Is(err, settings.ErrApprovalRequired),
 		errors.Is(err, teardown.ErrApprovalRequired), errors.Is(err, teardown.ErrReviewRequired):
-		fmt.Fprintf(os.Stderr, "guacdeploy: %s\n", u.ErrorText(err))
+		if !guided {
+			fmt.Fprintf(os.Stderr, "guacdeploy: %s\n", u.ErrorText(err))
+		}
 		return 3
 	case errors.Is(err, context.Canceled):
 		return 130
 	default:
-		fmt.Fprintf(os.Stderr, "guacdeploy: %s\n", u.ErrorText(err))
+		if !guided {
+			fmt.Fprintf(os.Stderr, "guacdeploy: %s\n", u.ErrorText(err))
+		}
 		return 1
 	}
 }

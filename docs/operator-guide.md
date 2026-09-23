@@ -18,13 +18,27 @@ The progress bar counts completed steps. It does not estimate the time remaining
 During work, large terminals animate the Proaxiom mark. It stops when setup asks a
 question. Network checks also show a task bar with the number of completed checks.
 The final check result reports failures separately.
-Wide terminals also show the surrounding deployment stages.
+Wide terminals also show the surrounding deployment stages. The interface uses
+available terminal width. On tall screens, current-step status appears above a
+separate live log pane. Container startup shows each container's latest state.
+Docker startup events and container logs appear in the log pane and session log.
 
 - Use the arrow keys to move between actions. Press Enter to select an action.
 - Press the letter in brackets to select an action directly.
 - Press Tab to switch between the current task and session details.
-- Use Page Up and Page Down to read longer instructions or history.
-- Press Ctrl-C to cancel. Completed work remains available for resume.
+- Use Page Up to pause the live log and read earlier events. Use Page Down to
+  return to the latest events. On compact screens, these keys scroll instructions.
+- During browser sign-in, press Ctrl-Y to copy the complete link. This requests
+  clipboard access from your local terminal, including over SSH. If the terminal
+  blocks access, use its hyperlink menu to copy the address.
+- You can still Cmd-click or Ctrl-click the sign-in link to open it.
+- Press Ctrl-C to stop the current operation. Completed work remains available.
+- Review the final summary, then press F to return to the shell. Success, errors,
+  cancellation, and leaving the main menu all use this screen. Teardown lists
+  the resources that were removed or preserved.
+- The summary remains available in plain interactive terminals. Unattended runs
+  do not wait for input. A lost SSH connection or forced kill cannot show a
+  summary; reconnect and inspect saved progress.
 
 The terminal must have at least 48 columns and 16 rows. Below that size, resize it
 before answering. The installer ignores action keys until the interface is visible.
@@ -49,9 +63,10 @@ An alternate `--state-dir` also changes the log directory. The directory uses mo
 0700; each log uses mode 0600. The terminal prints the path when the command ends.
 To follow a running session, use `sudo tail -f` with its log path.
 
-Logs contain application events and phase results. They do not record terminal
-input, device sign-in codes, private keys, or a raw subprocess transcript. The
-in-memory redactor removes known credentials and common token formats. Logs can
+Logs contain application events, phase results, Docker startup events, and bounded
+container log output from startup. The installer excludes terminal input and device
+sign-in challenges. Its redactor removes known credentials and common token formats.
+Container output can contain application data. Logs can
 contain hostnames, resource IDs, and tenant names; review them before sharing.
 
 Each log has a 16 MiB limit. If writing fails or reaches the limit, the exit report
@@ -815,3 +830,53 @@ Azure account is the ordinary case.
 against a fake identity platform and a fake management plane. No device
 code has been entered by a person, no real subscription listed, no storage
 account created, and no role assignment watched taking effect.
+
+## Recording storage
+
+Setup asks for a recording directory before it renders the container configuration.
+The default is `/opt/guacamole/recordings`. To use a separate local drive, mount and
+configure that drive first, then select a new dedicated directory beneath it.
+Setup does not format disks or connect NFS/CIFS shares.
+
+Use `--recordings-dir /absolute/new-directory` for unattended setup. A custom
+folder must not exist yet; its parent must exist and must not use symbolic links.
+Setup saves the choice for resume, playback, recording cleanup, and teardown.
+Changing an existing deployment's recording directory requires a separate migration.
+
+The Manage recordings step asks for the storage budget, such as `20GiB`. This is
+not a disk allocation or a hard quota. Cleanup removes the oldest completed
+recordings when usage exceeds the budget, even if backup failed. Active recordings
+remain. Choose `none` to leave cleanup disabled.
+
+Automatic NFS/CIFS setup is not included in this build. That flow needs an early
+storage choice, mount-package installation, share credentials, permission checks,
+and tests for unavailable shares and reboot recovery.
+
+## Editable setup before deployment
+
+Fresh interactive setup now collects configuration after credential preparation and
+before dependency installation or deployment resource creation. The configuration
+sections cover the Cloudflare domain, hostname, Microsoft tenant, access groups,
+recording storage, recording budget, and scheduled backups.
+
+- Choose an active Cloudflare domain visible to the current credentials. Enter a
+  website name beneath that domain. Accounts with several domains have a paged list.
+- Enter or accept the Microsoft verified domain. The installer discovers its tenant
+  ID from Microsoft's public metadata. Sign-in still checks the selected tenant and
+  permissions before Microsoft resources are created. The tenant domain can differ
+  from the website domain.
+- Choose recording storage from writable, mounted local filesystems or NFS/CIFS
+  shares. The installer uses a dedicated recording directory. It does not format
+  drives or connect shares. Share permissions must permit the container accounts to
+  use that directory. A missing or changed selected mount stops startup.
+- Press Ctrl-B in a configuration field, or select Back in a menu. In plain terminal
+  mode, enter `/back` in a text field. The review screen also offers each section for
+  editing. Choose Deploy only when the answers are correct.
+- Save for later retains a draft and creates no deployment resources. Recovery key
+  passphrases stay in memory and are not saved with the draft. An interrupted run
+  can therefore need the passphrase again.
+
+After Deploy, the approved configuration is fixed for that deployment. Back is not
+an undo operation for completed infrastructure changes. Existing deployments keep
+their configuration and use resume or teardown. Authentication renewal and approval
+for changes to pre-existing resources can still require interaction during execution.

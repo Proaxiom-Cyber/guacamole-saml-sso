@@ -109,7 +109,7 @@ func TestCloudflareEntryRetriesBeforeSealing(t *testing.T) {
 				prompts++
 				return v, nil
 			}
-			o := Options{StateDir: t.TempDir(), Cloudflare: client, CredsRun: run, CredSpecs: []creds.Spec{creds.Required[0]}}
+			o := Options{CloudflareAuth: "token", StateDir: t.TempDir(), Cloudflare: client, CredsRun: run, CredSpecs: []creds.Spec{creds.Required[0]}}
 			st := &state.State{Config: map[string]string{"credential-mode": mode}}
 			if err := o.credentialCheck(context.Background(), st, u); err != nil {
 				t.Fatal(err)

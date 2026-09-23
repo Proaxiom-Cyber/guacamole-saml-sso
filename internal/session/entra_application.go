@@ -51,7 +51,7 @@ func (o *Options) manualEntraToken(method string) entra.TokenSource {
 			if !interactive || o.reuseEntraIdentity {
 				return nil
 			}
-			choice, err := u.Choose(message, []ui.Choice{{Key: 'c', Label: "Continue"}, {Key: 'q', Label: "Quit and keep deployment progress"}})
+			choice, err := u.Choose(message, []ui.Choice{{Key: 'c', Label: "Continue", Description: "Continue after completing the browser instructions above. Setup will check the supplied identity before using it."}, {Key: 'q', Label: "Quit and keep deployment progress", Description: "Finish this run and retain recorded progress. Resume later from this host; this does not remove deployment resources."}})
 			if err != nil {
 				return err
 			}
@@ -76,7 +76,7 @@ func (o *Options) manualEntraToken(method string) entra.TokenSource {
 					return "", err
 				}
 				u.Say("%s", err)
-				choice, chooseErr := u.Choose("Installer certificate unavailable", []ui.Choice{{Key: 's', Label: "Use a client secret instead"}, {Key: 'q', Label: "Quit and keep deployment progress"}})
+				choice, chooseErr := u.Choose("Installer certificate unavailable", []ui.Choice{{Key: 's', Label: "Use a client secret instead", Description: "Authenticate an installer app with a secret instead of this host’s certificate. The secret is used in memory for this run."}, {Key: 'q', Label: "Quit and keep deployment progress", Description: "Finish this run and retain recorded progress. Resume later from this host; this does not remove deployment resources."}})
 				if chooseErr != nil {
 					return "", chooseErr
 				}
@@ -201,7 +201,7 @@ func (o *Options) manualEntraToken(method string) entra.TokenSource {
 			}
 			o.reuseEntraIdentity = false
 			u.Say("%s", err)
-			choice, chooseErr := u.Choose("Correct the installer app settings in Entra, then retry.", []ui.Choice{{Key: 'r', Label: "Retry and check the IDs and credential"}, {Key: 'q', Label: "Quit and keep deployment progress"}})
+			choice, chooseErr := u.Choose("Correct the installer app settings in Entra, then retry.", []ui.Choice{{Key: 'r', Label: "Retry and check the IDs and credential", Description: "Check the installer app settings again after correcting them in Entra. This reuses the identifiers and credential you provided."}, {Key: 'q', Label: "Quit and keep deployment progress", Description: "Finish this run and retain recorded progress. Resume later from this host; this does not remove deployment resources."}})
 			if chooseErr != nil {
 				return "", chooseErr
 			}

@@ -109,7 +109,7 @@ var (
 	ErrRequiresReview = errors.New("name-only match requires review; a matching name alone never establishes ownership")
 	// ErrPreExisting: a DNS record already occupies the hostname without
 	// this deployment's marker. It is never overwritten without approval.
-	ErrPreExisting = errors.New("a pre-existing DNS record occupies this hostname; approval is required, it will not be overwritten")
+	ErrPreExisting = errors.New("a pre-existing Cloudflare resource occupies this hostname; resolve the conflict before retrying, it will not be overwritten")
 	// ErrNotOwned: a delete target does not carry this deployment's marker.
 	ErrNotOwned = errors.New("resource does not carry this deployment's ownership marker; refusing to delete")
 )
@@ -498,4 +498,24 @@ func (p *Provisioner) DeleteRecord(ctx context.Context, recordID string) error {
 		return fmt.Errorf("DNS record %s (%s) does not carry marker %q: %w", recordID, r.Name, p.marker(), ErrNotOwned)
 	}
 	return p.Client.do(ctx, "DELETE", "/zones/"+p.ZoneID+"/dns_records/"+recordID, nil, nil)
+}
+
+// AccessibleZones lists active DNS zones visible to the supplied credentials.
+func (c *Client) AccessibleZones(ctx context.Context) ([]Zone, error) {
+	var zones []Zone
+	for page := 1; page <= 1000; page++ {
+		var batch []Zone
+		if err := c.do(ctx, "GET", fmt.Sprintf("/zones?per_page=50&page=%d", page), nil, &batch); err != nil {
+			return nil, err
+		}
+		for _, z := range batch {
+			if z.Status == "active" {
+				zones = append(zones, z)
+			}
+		}
+		if len(batch) < 50 {
+			return zones, nil
+		}
+	}
+	return nil, fmt.Errorf("too many Cloudflare zones; narrow the credential scope")
 }

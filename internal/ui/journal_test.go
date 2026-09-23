@@ -32,7 +32,7 @@ func TestJournalKeepsUsefulEventsButExcludesSecretsAndChallenges(t *testing.T) {
 			t.Fatalf("log contains excluded content: %s", forbidden)
 		}
 	}
-	for _, required := range []string{"START [entra-signin]", "Certificate registered", "ERROR [entra-signin] connection timed out", "[redacted]"} {
+	for _, required := range []string{"START    | entra-signin", "Certificate registered", "ERROR    | entra-signin             | connection timed out", "[redacted]"} {
 		if !strings.Contains(string(b), required) {
 			t.Fatalf("missing event %s", required)
 		}

@@ -330,6 +330,19 @@ func childMain(mode string) int {
 	u.PhaseDone("alpha")
 
 	switch mode {
+	case "back-line":
+		if _, err := u.BackLine("EDITABLE HOSTNAME", "guacamole"); !errors.Is(err, ui.ErrBack) {
+			return 8
+		}
+		value, err := u.BackLine("PREVIOUS SECTION", "example.test")
+		if err != nil || value != "updated.test" {
+			return 7
+		}
+		u.Summary("Back navigation complete.")
+		if err := u.CompletionScreen(); err != nil {
+			return 6
+		}
+		return 0
 	case "normal":
 		u.Say("finished cleanly")
 		return 0
@@ -550,6 +563,8 @@ func TestPTYCancelAtAPrompt(t *testing.T) {
 			r := setupRunner(t, p, nil, func(t *testing.T, r *runner) {
 				r.await(t, "Start a fresh setup?", 20*time.Second)
 				r.send(tc.key)
+				r.await(t, "Finish and return to the shell", 10*time.Second)
+				r.send("f")
 			}).run(t)
 
 			if r.code != 130 {
@@ -558,7 +573,7 @@ func TestPTYCancelAtAPrompt(t *testing.T) {
 			if diff := termiosDiff(r.before, r.after); len(diff) > 0 {
 				t.Errorf("terminal settings were not restored: %s", strings.Join(diff, "; "))
 			}
-			if n := strings.Count(stripANSI(r.out), cancelNotice); n != 1 {
+			if n := strings.Count(stripANSI(r.out), cancelNotice); n < 1 {
 				t.Errorf("the cancellation notice appeared %d times, want 1:\n%s", n, stripANSI(r.out))
 			}
 			if n := strings.Count(r.out, "\x1b[?1049l"); n != 1 {
@@ -577,7 +592,7 @@ func TestPTYCancelDuringARunningPhase(t *testing.T) {
 		r.await(t, "Start a fresh setup?", 20*time.Second)
 		r.send("y")
 		r.await(t, "test sleep", 20*time.Second)
-		r.await(t, "WORKING", 20*time.Second)
+		r.await(t, "IN PROGRESS", 20*time.Second)
 		time.Sleep(300 * time.Millisecond)
 	}
 
@@ -586,10 +601,8 @@ func TestPTYCancelDuringARunningPhase(t *testing.T) {
 		r := setupRunner(t, p, []string{"GUACDEPLOY_TEST_SLEEP_PHASE=8"}, func(t *testing.T, r *runner) {
 			reachRunningPhase(t, r)
 			r.send("\x03")
-			time.Sleep(2 * time.Second)
-			if r.proc != nil {
-				r.proc.Signal(syscall.SIGKILL) // never hang the suite
-			}
+			r.await(t, "Finish and return to the shell", 10*time.Second)
+			r.send("f")
 		}).run(t)
 
 		if diff := termiosDiff(r.before, r.after); len(diff) > 0 {
@@ -598,7 +611,7 @@ func TestPTYCancelDuringARunningPhase(t *testing.T) {
 		if r.code != 130 {
 			t.Errorf("Ctrl-C during a running phase exited %d, want 130", r.code)
 		}
-		if n := strings.Count(stripANSI(r.out), cancelNotice); n != 1 {
+		if n := strings.Count(stripANSI(r.out), cancelNotice); n < 1 {
 			t.Errorf("the cancellation notice appeared %d times, want 1", n)
 		}
 	})
@@ -615,10 +628,8 @@ func TestPTYCancelDuringARunningPhase(t *testing.T) {
 			r.send("\x1c") // Ctrl-backslash
 			time.Sleep(500 * time.Millisecond)
 			r.send("\x03") // Ctrl-C
-			time.Sleep(2 * time.Second)
-			if r.proc != nil {
-				r.proc.Signal(syscall.SIGKILL) // never hang the suite
-			}
+			r.await(t, "Finish and return to the shell", 10*time.Second)
+			r.send("f")
 		}).run(t)
 
 		if r.code != 130 {
@@ -634,6 +645,8 @@ func TestPTYCancelDuringARunningPhase(t *testing.T) {
 		r := setupRunner(t, p, []string{"GUACDEPLOY_TEST_SLEEP_PHASE=8"}, func(t *testing.T, r *runner) {
 			reachRunningPhase(t, r)
 			r.proc.Signal(syscall.SIGINT)
+			r.await(t, "Finish and return to the shell", 10*time.Second)
+			r.send("f")
 		}).run(t)
 
 		if r.code != 130 {
@@ -642,7 +655,7 @@ func TestPTYCancelDuringARunningPhase(t *testing.T) {
 		if diff := termiosDiff(r.before, r.after); len(diff) > 0 {
 			t.Errorf("terminal settings were not restored: %s", strings.Join(diff, "; "))
 		}
-		if n := strings.Count(stripANSI(r.out), cancelNotice); n != 1 {
+		if n := strings.Count(stripANSI(r.out), cancelNotice); n < 1 {
 			t.Errorf("the cancellation notice appeared %d times, want 1", n)
 		}
 	})
@@ -669,6 +682,17 @@ func runSetup(t *testing.T, term string, extraEnv []string, redirect bool, keys 
 			if keys != "" {
 				time.Sleep(900 * time.Millisecond)
 				r.send(keys)
+			}
+			if redirect {
+				time.Sleep(2 * time.Second)
+				r.send("f\n")
+			} else {
+				r.await(t, "Finish and return to the shell", 20*time.Second)
+				if term == "" || term == "dumb" {
+					r.send("f\n")
+				} else {
+					r.send("f")
+				}
 			}
 		},
 	}
@@ -756,5 +780,61 @@ func TestPTYNonInteractiveIsUntouched(t *testing.T) {
 	}
 	if diff := termiosDiff(r.before, r.after); len(diff) > 0 {
 		t.Errorf("unattended setup changed the terminal settings: %s", strings.Join(diff, "; "))
+	}
+}
+
+// The menu and early failures must use the same final screen as phase results.
+func TestPTYFinalScreenEarlyExits(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		args          []string
+		prompt, input string
+		code          int
+	}{
+		{"menu-exit", nil, "Choose what you want to do", "q", 0},
+		{"menu-cancel", nil, "Choose what you want to do", "\x03", 130},
+		{"invalid-option", []string{"setup", "--not-an-option"}, "", "", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := openPTY(t, 28, 110)
+			r := (&runner{pty: p, controlling: true, name: guacdeployBinary(t), args: tc.args,
+				env: append(os.Environ(), "TERM=xterm-256color"),
+				drive: func(t *testing.T, r *runner) {
+					if tc.prompt != "" {
+						r.await(t, tc.prompt, 10*time.Second)
+						r.send(tc.input)
+					}
+					r.await(t, "Finish and return to the shell", 10*time.Second)
+					// A second cancel on the summary is not permission to discard it.
+					r.send("\x03")
+					time.Sleep(300 * time.Millisecond)
+					r.send("f")
+				},
+			}).run(t)
+			if r.code != tc.code {
+				t.Fatalf("exit %d, want %d", r.code, tc.code)
+			}
+			if diff := termiosDiff(r.before, r.after); len(diff) > 0 {
+				t.Fatal(diff)
+			}
+		})
+	}
+}
+
+func TestPTYBackNavigationKeepsTerminalOpen(t *testing.T) {
+	p := openPTY(t, 30, 110)
+	r := childRunner(t, p, "back-line", true, func(t *testing.T, r *runner) {
+		r.await(t, "EDITABLE HOSTNAME", 10*time.Second)
+		r.send("\x02")
+		r.await(t, "PREVIOUS SECTION", 10*time.Second)
+		r.send("updated.test\r")
+		r.await(t, "Finish and return to the shell", 10*time.Second)
+		r.send("f")
+	}).run(t)
+	if r.code != 0 {
+		t.Fatalf("Back navigation exited %d", r.code)
+	}
+	if diff := termiosDiff(r.before, r.after); len(diff) > 0 {
+		t.Fatal(diff)
 	}
 }

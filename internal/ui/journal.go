@@ -75,6 +75,11 @@ func (u *UI) StartLog(stateDir, command string) error {
 			u.Protect(value)
 		}
 	}
+	if w := u.wizard(); w != nil {
+		w.mu.Lock()
+		w.logPath = u.LogPath()
+		w.mu.Unlock()
+	}
 	u.record("INFO", "Session started: "+command)
 	return nil
 }
@@ -129,8 +134,12 @@ func (u *UI) record(level, message string) {
 	if j.file == nil || j.err != nil {
 		return
 	}
-	for _, line := range strings.Split(message, "\n") {
-		entry := fmt.Sprintf("%s %-5s [%s] %s\n", time.Now().UTC().Format(time.RFC3339Nano), level, j.phase, line)
+	lines := strings.Split(message, "\n")
+	for i, line := range lines {
+		entry := fmt.Sprintf("%s | %-8s | %-24s | %s\n", time.Now().UTC().Format("2006-01-02T15:04:05.000Z"), level, j.phase, line)
+		if i == len(lines)-1 {
+			entry += "\n"
+		}
 		if j.size+len(entry) > maxLogBytes {
 			j.err = fmt.Errorf("session log reached its 16 MiB limit")
 			return

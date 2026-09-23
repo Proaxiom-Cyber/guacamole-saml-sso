@@ -93,13 +93,14 @@ const (
 // that fronts it, then the tunnel itself. Entra comes next, because nothing
 // local depends on it. Host units go before the containers so no timer fires
 // against a half-removed stack, the containers go before the credentials
-// they were started with, and those go before the rendered configuration.
-// Data is last, and only ever with explicit intent.
+// they were started with. Approved data removal precedes the rendered
+// configuration, so its parent directory is checked after its children are gone.
+// Data is removed only with explicit intent.
 var Order = []Kind{
 	KindDNSRecord, KindAccessApp, KindTunnel,
 	KindEntraApp, KindEntraGroup, KindInstallerIdentity,
-	KindHostUnit, KindContainer, KindCredential, KindConfigDir,
-	KindData, KindHostChange,
+	KindHostUnit, KindContainer, KindCredential, KindData,
+	KindConfigDir, KindHostChange,
 }
 
 // Action is what the plan will do with one recorded resource.
@@ -308,7 +309,11 @@ func BuildPlan(st *state.State, pending []settings.Entry, deleteData bool) Plan 
 	// nothing about them is provider state. They are still content this
 	// teardown could destroy, so the plan has to show them either way.
 	if installDir != "" {
-		p.Items = append(p.Items, dataItem(filepath.Join(installDir, "recordings"),
+		recordingsPath := st.Config["recording-dir"]
+		if recordingsPath == "" {
+			recordingsPath = filepath.Join(installDir, "recordings")
+		}
+		p.Items = append(p.Items, dataItem(recordingsPath,
 			"recordings-directory", "session recordings held on this host", deleteData))
 	}
 	if dest := st.Config["backup-dest"]; dest != "" {
@@ -604,16 +609,26 @@ func Run(ctx context.Context, st *state.State, plan Plan, ops Ops, u *ui.UI, o O
 		u.Say("")
 		u.Say("Continuing without prompts: explicit consent was given on the command line.")
 	default:
-		ok, err := u.Confirm(fmt.Sprintf("Remove the %d resource(s) listed above?", len(plan.Removable())))
+		var review strings.Builder
+		fmt.Fprintf(&review, "Review teardown\n\nDeployment: %s\n\nRemove:\n", plan.DeploymentID)
+		for _, it := range plan.Removable() {
+			fmt.Fprintf(&review, "  - %s\n", it)
+		}
+		review.WriteString("\nKeep:\n")
+		for _, it := range plan.Preserved() {
+			fmt.Fprintf(&review, "  - %s\n", it)
+		}
+		review.WriteString("\nUnrelated resources remain unchanged.\nRemove the listed resources?")
+		ok, err := u.ConfirmWithHelp(review.String(), "Remove the resources listed under Remove. Items listed under Keep stay in place. Data deletion requires a separate confirmation.", "Cancel teardown. No resources in this plan will be removed.")
 		if err != nil {
 			return Result{}, err
 		}
 		if !ok {
-			u.Say("Nothing was removed.")
+			u.Summary("Teardown cancelled. Nothing was removed.")
 			return Result{}, nil
 		}
 		if len(plan.Destroys()) > 0 {
-			ok, err := u.Confirm("Permanently delete the data listed above? It cannot be recovered.")
+			ok, err := u.ConfirmWithHelp("Permanently delete the data listed above? It cannot be recovered.", "Permanently delete the listed deployment data as part of teardown. This cannot be undone.", "Keep the data but continue removing the other approved resources. The final summary will list the retained data.")
 			if err != nil {
 				return Result{}, err
 			}
@@ -624,6 +639,8 @@ func Run(ctx context.Context, st *state.State, plan Plan, ops Ops, u *ui.UI, o O
 		}
 	}
 
+	u.PhaseDone("teardown-review")
+	u.PhaseStart("teardown-remove")
 	// Restoring a changed pre-existing setting comes before any delete: the
 	// restore writes to the object, so the object has to still exist.
 	res := plan.Reconciled.seed()
@@ -660,8 +677,11 @@ func Run(ctx context.Context, st *state.State, plan Plan, ops Ops, u *ui.UI, o O
 		}
 	}
 
+	processed := 0
+	u.TaskProgress("Removal groups checked", 0, len(Order))
 	installerRetained := false
 	for _, k := range Order {
+		u.Say("Checking removal: %s", k)
 		var step []Outcome
 		hold := false
 		if k == KindInstallerIdentity {
@@ -707,15 +727,36 @@ func Run(ctx context.Context, st *state.State, plan Plan, ops Ops, u *ui.UI, o O
 				return res, err
 			}
 		}
+		processed++
+		u.TaskProgress("Removal groups checked", processed, len(Order))
 	}
+	u.PhaseDone("teardown-remove")
+	u.PhaseStart("teardown-result")
 	for _, it := range plan.Preserved() {
 		res.Outcomes = append(res.Outcomes, Outcome{Item: it, Status: StatusPreserved, Detail: it.Detail})
 	}
 
 	res.Report(u)
 	if !res.Complete() {
+		u.PhaseFailed("teardown-result", incomplete(res))
 		return res, incomplete(res)
 	}
+	u.PhaseDone("teardown-result")
+
+	summary := []string{"Teardown complete."}
+	kept := false
+	for _, out := range res.Outcomes {
+		if out.Status == StatusPreserved {
+			kept = true
+		}
+		summary = append(summary, fmt.Sprintf("%s: %s", out.Status, out.Item))
+	}
+	if kept {
+		summary = append(summary, "Preserved resources and data remain available. See the session log for details.")
+	} else {
+		summary = append(summary, "No resources were preserved by this removal plan.")
+	}
+	u.Summary(summary...)
 	return res, nil
 }
 

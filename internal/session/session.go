@@ -63,6 +63,7 @@ func Phases(opts *Options) []Phase {
 		{Name: "host-preflight", Run: opts.hostPreflight},
 		{Name: "credential-mode", Run: opts.credentialMode},
 		{Name: "credential-check", Run: opts.credentialCheck, Always: true},
+		{Name: "configure-review", Run: opts.configureReview, Always: true},
 		{Name: "host-dependencies", Run: opts.hostDependencies},
 		{Name: "stack-configure", Run: opts.stackConfigure},
 		{Name: "cloudflare-select", Run: opts.cloudflareSelect},
@@ -149,6 +150,7 @@ func (o *Options) stackRunOut() stack.OutRunner {
 func (o *Options) stackConfig(st *state.State) stack.Config {
 	return stack.Config{
 		InstallDir:      o.installDir(),
+		RecordingsDir:   st.Config["recording-dir"],
 		Hostname:        st.Config["guac-hostname"],
 		AdminGroup:      st.Config["admin-group"],
 		OperatorGroup:   st.Config["operator-group"],
@@ -233,13 +235,23 @@ func (o *Options) stackConfigure(ctx context.Context, st *state.State, u *ui.UI)
 }
 
 func (o *Options) stackRender(ctx context.Context, st *state.State, u *ui.UI) error {
+	if err := o.validateRecordingMount(ctx, st); err != nil {
+		return err
+	}
+	if err := o.selectRecordingLocation(st, u); err != nil {
+		return err
+	}
 	cfg := o.stackConfig(st)
 	if err := stack.Render(cfg); err != nil {
 		return err
 	}
 	// guacd writes recordings into a bind mount that must exist, and be
 	// owned by the container account, before the container starts.
-	if err := o.ensureRecordingDirs()(cfg.InstallDir); err != nil {
+	if cfg.RecordingsDir == "" || cfg.RecordingsDir == filepath.Join(cfg.InstallDir, "recordings") {
+		if err := o.ensureRecordingDirs()(cfg.InstallDir); err != nil {
+			return err
+		}
+	} else if err := recording.EnsurePath(cfg.RecordingsDir); err != nil {
 		return err
 	}
 	now := time.Now().UTC()
@@ -289,6 +301,9 @@ func (o *Options) stackSecrets(st *state.State, u *ui.UI) (password, tunnelToken
 }
 
 func (o *Options) stackUp(ctx context.Context, st *state.State, u *ui.UI) error {
+	if err := o.validateRecordingMount(ctx, st); err != nil {
+		return err
+	}
 	password, token, err := o.stackSecrets(st, u)
 	if err != nil {
 		return err
@@ -296,7 +311,22 @@ func (o *Options) stackUp(ctx context.Context, st *state.State, u *ui.UI) error 
 	cfg := o.stackConfig(st)
 	cfg.InitializeDatabase = true
 	u.Say("Checking the database schema before starting the Guacamole stack (guacd, PostgreSQL, Guacamole, nginx) and waiting for container health.")
-	if err := stack.Up(ctx, o.stackRun(), cfg, password, token); err != nil {
+	u.Protect(password)
+	u.Protect(token)
+	run := o.stackRun()
+	if o.StackRun == nil {
+		run = stack.StreamingRunner(func(line string) { u.Say("[docker] %s", line) })
+	}
+	stopLogs := func() {}
+	if o.StackRun == nil {
+		stopLogs = stack.FollowStartupLogs(ctx, cfg, func(line string) { u.Say("[docker] %s", line) })
+	}
+	err = stack.Up(ctx, run, cfg, password, token)
+	stopLogs()
+	if o.StackRun == nil {
+		stack.StartupLogs(ctx, o.stackRun(), cfg, func(line string) { u.Say("[docker] %s", line) })
+	}
+	if err != nil {
 		return err
 	}
 	names, err := stack.Containers(ctx, o.stackRun(), cfg, password, token)
@@ -329,13 +359,15 @@ func (o *Options) stackHealth(ctx context.Context, st *state.State, u *ui.UI) er
 }
 
 func (o *Options) credentialMode(ctx context.Context, st *state.State, u *ui.UI) error {
+	restoreView := u.ReviewPhase("credential-mode")
+	defer restoreView()
 	// What this host can actually do decides what is offered. An unsupported
 	// mode is shown with its reason rather than hidden, so the operator can
 	// see that encrypted storage was considered and why it is unavailable —
 	// and is never answered with a weaker mode chosen on their behalf.
 	supported := o.CredDetector.Detect(ctx)
 	mode := o.CredentialMode
-	if mode == "" {
+	for mode == "" {
 		if !u.Interactive {
 			return fmt.Errorf("%w: no credential mode selected; pass --credentials %s",
 				ErrApprovalRequired, strings.Join(creds.AllModes, "|"))
@@ -348,24 +380,41 @@ func (o *Options) credentialMode(ctx context.Context, st *state.State, u *ui.UI)
 				continue
 			}
 			u.Explain("Available: "+modeLabels[s.Mode], creds.Explain(s.Mode))
-			choices = append(choices, ui.Choice{Key: modeKeys[s.Mode], Label: modeLabels[s.Mode]})
+			choices = append(choices, ui.Choice{Key: modeKeys[s.Mode], Label: modeLabels[s.Mode], Description: credentialHelp[s.Mode]})
 		}
-		k, err := u.Choose("Protect service credentials\n\nThese credentials keep Guacamole and its services running after a reboot.\nTPM protection is preferred when this host supports it.\nOpen Details for the available storage methods and recovery implications.", choices)
+		if u.FullScreen() {
+			choices = append(choices, ui.Choice{Key: 'b', Label: "Back to host checks", Description: "Review the host checks. No host changes are undone."})
+		}
+		k, err := u.Choose("Protect service credentials\n\nThese credentials keep Guacamole and its services running after a reboot.\nTPM protection is preferred when this host supports it.\nMove between options to compare their protection and recovery requirements.", choices)
 		if err != nil {
 			return err
+		}
+		if k == 'b' {
+			restoreHostView := u.ReviewPhase("host-preflight")
+			next, err := u.Choose("Host checks\n\n"+st.Config["os"]+"\nRequired host checks have completed. Any approved kernel repairs remain installed.\nNo service credentials have been stored at this point.", []ui.Choice{{Key: 'c', Label: "Continue to credential protection", Description: "Return to the credential protection choices. Reviewing host checks does not repeat or undo completed repairs."}, {Key: 'q', Label: "Save and finish later", Description: "Finish this run and retain recorded progress. Resume later from this host; this does not remove deployment resources."}})
+			restoreHostView()
+			if err != nil {
+				return err
+			}
+			if next == 'q' {
+				return context.Canceled
+			}
+			continue
 		}
 		for _, s := range supported {
 			if modeKeys[s.Mode] == k {
 				mode = s.Mode
 			}
 		}
+
 		if mode == creds.ModeFile {
 			ok, err := u.Confirm("Plaintext storage is an approved exception, protected only by file permissions. Select it?")
 			if err != nil {
 				return err
 			}
 			if !ok {
-				return errors.New("plaintext storage not approved; run setup again to choose another mode")
+				mode = ""
+				continue
 			}
 		}
 	}
@@ -436,6 +485,28 @@ func (o *Options) credSpecs() []creds.Spec {
 }
 
 func (o *Options) credentialCheck(ctx context.Context, st *state.State, u *ui.UI) error {
+	stored := false
+	for _, r := range st.Resources {
+		if r.Provider == "host" && strings.HasPrefix(r.Type, "credential-") {
+			stored = true
+		}
+	}
+	if u.FullScreen() && !stored && st.Config["setup-plan-approved"] != "true" {
+		for {
+			next, err := u.Choose("Connect Cloudflare\n\nProtection: "+st.Config["credential-mode"]+"\nContinue to authenticate and validate access. Back lets you change protection before credentials are stored.", []ui.Choice{{Key: 'c', Label: "Continue to Cloudflare sign-in", Description: "Authenticate to Cloudflare and validate access. Credentials will use the protection method shown above."}, {Key: 'b', Label: "Back to credential protection", Description: "Change the protection method before credentials are stored. This does not undo host preparation."}})
+			if err != nil {
+				return err
+			}
+			if next == 'c' {
+				break
+			}
+			o.CredentialMode = ""
+			if err := o.credentialMode(ctx, st, u); err != nil {
+				return err
+			}
+			o.credentialManager = nil
+		}
+	}
 	m := o.manager(st, u)
 	// Validate Cloudflare before storing a new value, generating the database
 	// password, or installing Docker. Recheck on resume, including sessions
@@ -635,6 +706,9 @@ func initialiseDeployment(ctx context.Context, st *state.State, u *ui.UI) error 
 
 // Options selects the session behaviour.
 type Options struct {
+	backupPassphrase    string
+	MountedStorage      func(context.Context) ([]mountedStorage, error)
+	DiscoverTenant      func(context.Context, string) (string, error)
 	StateDir            string
 	UI                  *ui.UI
 	Resume              bool   // unattended only: explicit consent to continue interrupted work
@@ -676,6 +750,8 @@ type Options struct {
 	EntraApplicationToken func(entra.ApplicationOptions) (entra.TokenSource, error)                         // test seam
 	EntraCertificate      func(context.Context, string, string, entracert.Open) (entracert.Material, error) // test seam
 	entraState            *state.State
+	CloudflareAuth        string // browser or token; empty offers configured browser sign-in
+	CloudflareOAuth       cloudflare.OAuthConfig
 	Cloudflare            *cloudflare.Client
 	Zone                  string // explicit Cloudflare zone name
 	ACMEContact           string // optional operator address for the ACME account
@@ -685,6 +761,7 @@ type Options struct {
 	BackupPlaintext       bool   // explicit choice; encryption is the default
 	BackupRequireMount    bool   // destination must sit on an approved mounted share
 	NoBackupSchedule      bool   // do not install the timer
+	RecordingDir          string
 	RecordingBudget       string // local recording storage budget, e.g. "20GiB"; "" declines cleanup
 	AccessEmails          string // comma-separated Access allow-list fallback
 
@@ -732,7 +809,7 @@ func Run(ctx context.Context, opts Options) error {
 				return err
 			}
 			if !ok {
-				u.Say("Nothing changed.")
+				u.Summary("Setup was not started. Nothing changed.")
 				return nil
 			}
 		}
@@ -741,6 +818,9 @@ func Run(ctx context.Context, opts Options) error {
 			return err
 		}
 		return runPhases(ctx, store, st, u, &opts, opts.phases())
+
+	case st.Config["teardown-completed"] == "true":
+		return fmt.Errorf("%w: the previous deployment was removed, but retained data or resources still need review. Run teardown to review their removal, or restore the retained data. Old setup work will not resume", ErrApprovalRequired)
 
 	case len(st.Pending()) > 0:
 		showInterrupted(u, st)
@@ -751,9 +831,9 @@ func Run(ctx context.Context, opts Options) error {
 			return fmt.Errorf("%w: interrupted work exists; pass --resume to continue it, or run interactively to choose resume or cleanup", ErrApprovalRequired)
 		}
 		k, err := u.Choose("What do you want to do?", []ui.Choice{
-			{Key: 'r', Label: "Resume the interrupted work"},
-			{Key: 'c', Label: "Clean up and remove the interrupted deployment record"},
-			{Key: 'q', Label: "Quit and decide later"},
+			{Key: 'r', Label: "Resume the interrupted work", Description: "Check saved progress and continue incomplete work. Resources already created remain recorded for recovery and teardown."},
+			{Key: 'c', Label: "Clean up and remove the interrupted deployment record", Description: "Review cleanup of resources created by the interrupted deployment. Retained resources must be resolved before a fresh deployment can start."},
+			{Key: 'q', Label: "Quit and decide later", Description: "Keep the interrupted deployment and its saved progress. No cleanup is started."},
 		})
 		if err != nil {
 			return err
@@ -764,7 +844,7 @@ func Run(ctx context.Context, opts Options) error {
 		case 'c':
 			return cleanup(store, st, u)
 		default:
-			u.Say("Nothing changed. Interrupted work is retained.")
+			u.Summary("Nothing changed. Interrupted work is retained.", "Run sudo /usr/local/bin/guacdeploy to resume or remove the deployment.")
 			return nil
 		}
 
@@ -817,7 +897,7 @@ func cleanup(store *state.Store, st *state.State, u *ui.UI) error {
 	if err := store.Delete(st); err != nil {
 		return err
 	}
-	u.Say("Deployment record removed. No created resources existed. Run setup again for a fresh start.")
+	u.Summary("Deployment record removed. No created resources existed. Run setup again for a fresh start.")
 	return nil
 }
 
@@ -928,6 +1008,10 @@ func Status(dir string, u *ui.UI) error {
 		u.Say("No deployment exists on this host.")
 		return nil
 	}
+	if st.Config["teardown-completed"] == "true" {
+		u.Say("Teardown completed for deployment %s. Retained data or resources remain; old setup work will not resume.", st.DeploymentID)
+		return nil
+	}
 	u.Say("Deployment %s", st.DeploymentID)
 	u.Say("Created:  %s", st.CreatedAt.Format(time.RFC3339))
 	u.Say("Updated:  %s", st.UpdatedAt.Format(time.RFC3339))
@@ -1002,6 +1086,9 @@ func (o *Options) entraSignin(ctx context.Context, st *state.State, u *ui.UI) er
 	}
 	if prior := st.Config["entra-tenant-id"]; prior != "" && !strings.EqualFold(prior, tenant) {
 		return errors.New("the Microsoft sign-in belongs to a different tenant than this deployment; sign in to the original tenant and resume")
+	}
+	if selected := st.Config["entra-discovered-tenant-id"]; selected != "" && !strings.EqualFold(selected, tenant) {
+		return errors.New("Microsoft sign-in belongs to a different tenant than the approved configuration")
 	}
 	st.Config["entra-tenant-id"] = tenant
 	u.Say("Microsoft Graph access checked for tenant %s.", tenant)
@@ -1198,14 +1285,7 @@ func (o *Options) cloudflareClient(st *state.State, u *ui.UI) *cloudflare.Client
 	m := o.manager(st, u)
 	client := &cloudflare.Client{
 		AuthorityNameServers: splitList(st.Config["cloudflare-zone-nameservers"]),
-		Token: func(context.Context) (string, error) {
-			for _, s := range o.credSpecs() {
-				if s.Name == "cloudflare-api-token" {
-					return m.Get(s) // in-memory only; never journalled
-				}
-			}
-			return "", errors.New("no cloudflare-api-token credential is configured")
-		},
+		Token:                cloudflare.CredentialTokenSource(m, creds.Spec{Name: "cloudflare-api-token"}, o.cloudflareOAuthConfig().HTTP),
 	}
 	if o.Cloudflare != nil {
 		client.Base = o.Cloudflare.Base
@@ -1245,6 +1325,15 @@ func (o *Options) cloudflareSelect(ctx context.Context, st *state.State, u *ui.U
 	}
 	if err != nil {
 		return err
+	}
+	if selected := st.Config["cloudflare-zone-id"]; selected != "" && st.Config["setup-plan-approved"] == "true" {
+		filtered := []cloudflare.Zone{}
+		for _, z := range zones {
+			if z.ID == selected {
+				filtered = append(filtered, z)
+			}
+		}
+		zones = filtered
 	}
 	switch {
 	case len(zones) == 0:
@@ -1516,6 +1605,7 @@ func (o *Options) originCertificate(ctx context.Context, st *state.State, u *ui.
 		return errors.New("the origin certificate needs the Cloudflare zone; run zone selection first")
 	}
 	opts := certs.Options{
+		Progress:     func(message string) { u.Say("%s", message) },
 		Hostname:     st.Config["guac-hostname"],
 		InstallDir:   o.installDir(),
 		StateDir:     o.StateDir,
@@ -1653,6 +1743,10 @@ func (o *Options) recordingSchedule(ctx context.Context, st *state.State, u *ui.
 	// Same rule as the backup schedule: a repeat run without the flag keeps
 	// the budget the operator already chose.
 	o.RecordingBudget = firstNonEmpty(o.RecordingBudget, st.Config["recording-budget"])
+	if o.RecordingBudget == "none" {
+		u.Say("No recording budget was selected. Scheduled recording cleanup is not installed.")
+		return nil
+	}
 	if o.RecordingBudget == "" {
 		// The specification asks for the budget during setup. Without this,
 		// a guided deployment silently ended with recordings accumulating
@@ -1675,7 +1769,7 @@ func (o *Options) recordingSchedule(ctx context.Context, st *state.State, u *ui.
 		Run:          backup.ExecRunner,
 		DeploymentID: st.DeploymentID,
 		StateDir:     o.StateDir,
-		Dir:          filepath.Join(o.installDir(), "recordings"),
+		Dir:          firstNonEmpty(st.Config["recording-dir"], filepath.Join(o.installDir(), "recordings")),
 		Dest:         dest,
 		Budget:       budget,
 		Plaintext:    o.BackupPlaintext,
@@ -1718,6 +1812,9 @@ func StartStack(ctx context.Context, stateDir string, u *ui.UI) error {
 		return errors.New("no deployment exists on this host, so there is no stack to start")
 	}
 	o := &Options{StateDir: stateDir, UI: u}
+	if err := o.validateRecordingMount(ctx, st); err != nil {
+		return err
+	}
 	password, token, err := o.stackSecrets(st, u)
 	if err != nil {
 		return err
@@ -1858,7 +1955,7 @@ func chooseFromList(u *ui.UI) func(string, []string) (int, error) {
 		}
 		choices := make([]ui.Choice, 0, len(options))
 		for i, opt := range options {
-			choices = append(choices, ui.Choice{Key: rune('1' + i), Label: opt})
+			choices = append(choices, ui.Choice{Key: rune('1' + i), Label: opt, Description: prompt + "\nSelected resource: " + opt + ". Setup will validate access before using this resource."})
 		}
 		k, err := u.Choose(prompt, choices)
 		if err != nil {
@@ -1906,28 +2003,32 @@ func (o *Options) offerBackupKey(st *state.State, u *ui.UI) (bool, error) {
 	}
 	u.Say("Scheduled backups are encrypted with a key generated here on the server.")
 	u.Say("The private key leaves as one passphrase-encrypted file, which you copy off this host and keep with its passphrase, separately.")
-	want, err := u.Confirm("Generate the backup key now and install the schedule?")
-	if err != nil || !want {
-		return false, err
-	}
-	secret := u.SecretReader()
-	if secret == nil {
-		return false, nil
-	}
-	pass, err := secret("Backup key passphrase")
-	if err != nil {
-		return false, err
-	}
+	pass := o.backupPassphrase
 	if pass == "" {
-		return false, errors.New("empty passphrase rejected: recovery would depend on an unprotected export")
+		want, err := u.Confirm("Generate the backup key now and install the schedule?")
+		if err != nil || !want {
+			return false, err
+		}
+		secret := u.SecretReader()
+		if secret == nil {
+			return false, nil
+		}
+		pass, err = secret("Backup key passphrase")
+		if err != nil {
+			return false, err
+		}
+		if pass == "" {
+			return false, errors.New("empty passphrase rejected: recovery would depend on an unprotected export")
+		}
+		confirm, err := secret("Confirm passphrase")
+		if err != nil {
+			return false, err
+		}
+		if confirm != pass {
+			return false, errors.New("passphrases do not match; no key was generated and no schedule was installed")
+		}
 	}
-	confirm, err := secret("Confirm passphrase")
-	if err != nil {
-		return false, err
-	}
-	if confirm != pass {
-		return false, errors.New("passphrases do not match; no key was generated and no schedule was installed")
-	}
+
 	id, err := recoverykey.Generate()
 	if err != nil {
 		return false, err

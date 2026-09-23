@@ -186,21 +186,17 @@ func TestCancelAtAnyPoint(t *testing.T) {
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("cancel returned %v, want context.Canceled", err)
 			}
+			if *restores != 0 || strings.Contains(out.String(), leaveAltScreen) {
+				t.Fatal("cancel restored the terminal before the final screen")
+			}
+			if !strings.Contains(strings.Join(u.wiz.log, " "), cancelNotice) {
+				t.Fatal("missing cancellation status")
+			}
+			u.RestoreTerminal()
 			if *restores != 1 {
-				t.Errorf("terminal restored %d times, want 1", *restores)
+				t.Fatal("terminal was not restored at exit")
 			}
-			if !strings.Contains(out.String(), cancelNotice) {
-				t.Error("cancelling did not explain what happens to completed work")
-			}
-			if !strings.Contains(out.String(), leaveAltScreen) {
-				t.Error("cancelling did not leave the full-screen view")
-			}
-			// The wizard is finished: later output is line-oriented.
-			out.Reset()
-			u.Say("after cancel")
-			if got := out.String(); got != "after cancel\n" {
-				t.Errorf("after cancelling Say wrote %q", got)
-			}
+
 		})
 	}
 }
@@ -249,7 +245,7 @@ func TestPhaseStatusTransitions(t *testing.T) {
 func TestPhaseStatusShowsUndeclaredPhases(t *testing.T) {
 	u, _, _ := newTestUI("")
 	u.PhaseStart("stack-up")
-	if !hasLineWith(u.wiz.snapshot(), "Start the services") || !hasLineWith(u.wiz.snapshot(), "WORKING") {
+	if !hasLineWith(u.wiz.snapshot(), "Start the services") || !hasLineWith(u.wiz.snapshot(), "IN PROGRESS") {
 		t.Fatal("undeclared current task is not visible")
 	}
 }
@@ -263,7 +259,7 @@ func TestFailedPhaseExplainsActionRetentionAndRecovery(t *testing.T) {
 
 	// The block wraps to the screen, so the assertion reads the presented
 	// text rather than one line of it.
-	flat := flatten(u.wiz.snapshot())
+	flat := strings.ReplaceAll(flatten(u.wiz.snapshot()), " | ", " ")
 	for _, want := range []string{
 		"Failed action: phase credential-check failed: the postgres password is missing",
 		"Retained work: completed work is retained; 2 of 20 phase(s) completed.",
@@ -865,7 +861,7 @@ func TestBracketedPasteCannotSubmitAChoiceOrLeakHiddenInput(t *testing.T) {
 	}
 }
 func TestDetailsDoesNotSubmitOrLoseAField(t *testing.T) {
-	u, _, _ := newTestUI("value\t\r\t\r")
+	u, _, _ := newTestUI("value\t\r\t\r\t\r")
 	got, err := u.Line("Hostname", "")
 	if err != nil || got != "value" {
 		t.Fatalf("details lost the input: %s %v", got, err)

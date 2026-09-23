@@ -146,7 +146,7 @@ if [ "$install_only" -eq 1 ] || [ ! -t 0 ] || [ ! -t 1 ]; then
   exit 0
 fi
 
-echo "get-guacdeploy: starting the setup wizard"
+echo "get-guacdeploy: opening the deployment menu"
 # exec preserves the terminal and the wizard's exit status. Remove downloads
 # first: replacing this shell does not run its EXIT trap.
 rm -rf "$tmp"

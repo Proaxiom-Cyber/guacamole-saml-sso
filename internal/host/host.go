@@ -178,7 +178,7 @@ func Preflight(f *Facts) error {
 
 var ErrKernelModulesMissing = errors.New("Docker needs netfilter kernel modules (xt_addrtype) that are not installed")
 
-var ErrRebootRequired = errors.New("the next boot kernel has the required modules. Run 'sudo reboot', reconnect, then run 'sudo guacdeploy' and choose Resume")
+var ErrRebootRequired = errors.New("the next boot kernel has the required modules. Run 'sudo reboot', reconnect, then run 'sudo /usr/local/bin/guacdeploy setup' and choose Resume")
 
 // InstallKernelSupport adds the host packages after the caller obtains consent.
 // The caller must gather facts again: a successful package transaction does not

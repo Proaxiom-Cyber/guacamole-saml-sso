@@ -15,7 +15,7 @@ import (
 // sign-in. DNS ownership does not establish Microsoft tenant membership.
 func TestEntraTenantIndependentOfCloudflare(t *testing.T) {
 	for _, tc := range []struct{ name, zone, saved, input string }{
-		{"different domains", "slqaccess.qld.gov.au", "", "\nslq.qld.gov.au\n"},
+		{"different domains", "slqaccess.qld.gov.au", "", "slq.qld.gov.au\n"},
 		{"correct unverified resume", "slqaccess.qld.gov.au", "slqaccess.qld.gov.au", "slq.qld.gov.au\n"},
 		{"same domain", "slq.qld.gov.au", "", "slq.qld.gov.au\n"},
 	} {
@@ -82,5 +82,35 @@ func TestEntraTenantRepromptsInvalidInput(t *testing.T) {
 	}
 	if o.EntraTenant != "slq.qld.gov.au" {
 		t.Fatal("valid correction was not accepted")
+	}
+}
+
+func TestEntraTenantSuggestedDefault(t *testing.T) {
+	for _, tc := range []struct{ name, saved, want string }{
+		{"new deployment uses Cloudflare domain", "", "demo-customer.com.au"},
+		{"resume keeps chosen tenant", "other.onmicrosoft.com", "other.onmicrosoft.com"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GUACDEPLOY_ENTRA_TENANT_ID", "")
+			u, _ := testUI(true, "\n")
+			st := &state.State{Config: map[string]string{"cloudflare-zone-name": "demo-customer.com.au", "entra-login-tenant": tc.saved}}
+			o := Options{}
+			if err := o.selectEntraTenant(st, u); err != nil {
+				t.Fatal(err)
+			}
+			if o.EntraTenant != tc.want {
+				t.Fatalf("got %q, want %q", o.EntraTenant, tc.want)
+			}
+		})
+	}
+}
+
+func TestEntraTenantSuggestionRequiresInteractiveConfirmation(t *testing.T) {
+	t.Setenv("GUACDEPLOY_ENTRA_TENANT_ID", "")
+	u, _ := testUI(false, "")
+	st := &state.State{Config: map[string]string{"cloudflare-zone-name": "demo-customer.com.au"}}
+	o := Options{}
+	if err := o.selectEntraTenant(st, u); err == nil {
+		t.Fatal("unattended run accepted an unconfirmed DNS-domain suggestion")
 	}
 }

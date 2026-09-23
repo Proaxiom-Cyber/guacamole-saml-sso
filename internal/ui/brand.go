@@ -9,11 +9,11 @@ import (
 // Terminal adaptation of branding/logos/proaxiom-submark.png. Keep the stagger
 // and final dot; terminal cells replace curves without needing image protocols.
 var brandBars = []string{
-	"      ━━━━━━━━━━━━",
-	"          ━━━━━━━━━━",
-	"    ━━━━━━━━━━━━",
-	"  ━━━━━━━",
-	"━━━━━━━  ●",
+	"      █████████████",
+	"           ██████████",
+	"   █████████████",
+	" ████████",
+	"████████  ■",
 }
 
 // These are the shared Proaxiom palette, not inferred terminal theme colours.
@@ -34,6 +34,9 @@ func brandInk(row int, background bool) string {
 
 func (w *Wizard) brandHeader(width int, progress string, busy bool) []string {
 	mode := "GUIDED SETUP"
+	if len(w.names) > 0 && strings.HasPrefix(w.names[0], "teardown-") {
+		mode = "GUIDED TEARDOWN"
+	}
 	if w.details {
 		mode = "SESSION DETAILS"
 	}
@@ -45,10 +48,10 @@ func (w *Wizard) brandHeader(width int, progress string, busy bool) []string {
 	for i, bar := range brandBars {
 		// A moving bright segment communicates activity; it is never a percentage.
 		if busy && os.Getenv("GUACDEPLOY_REDUCED_MOTION") == "" && w.tick%10/2 == i {
-			bar = strings.ReplaceAll(bar, "━", "═")
+			bar = strings.ReplaceAll(bar, "█", "▓")
 		}
 		if os.Getenv("GUACDEPLOY_ASCII") != "" {
-			bar = strings.NewReplacer("━", "-", "═", "=", "●", "o").Replace(bar)
+			bar = strings.NewReplacer("█", "#", "▓", "=", "■", "#").Replace(bar)
 		}
 		lines = append(lines, fit("  "+pad(bar, 24)+text[i], width))
 	}
@@ -61,10 +64,10 @@ func (w *Wizard) paintBrand(line string) (string, bool) {
 	}
 	for i, bar := range brandBars {
 		prefix := "  " + pad(bar, 24)
-		variants := []string{prefix, strings.ReplaceAll(prefix, "━", "═")}
+		variants := []string{prefix, strings.ReplaceAll(prefix, "█", "▓")}
 		if os.Getenv("GUACDEPLOY_ASCII") != "" {
 			for j := range variants {
-				variants[j] = strings.NewReplacer("━", "-", "═", "=", "●", "o").Replace(variants[j])
+				variants[j] = strings.NewReplacer("█", "#", "▓", "=", "■", "#").Replace(variants[j])
 			}
 		}
 		for _, v := range variants {
