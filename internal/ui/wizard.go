@@ -75,30 +75,32 @@ type Wizard struct {
 	rows, cols int
 	colour     bool
 
-	mu            sync.Mutex
-	names         []string
-	state         map[string]string
-	log           []string
-	prompt        []string // the question on screen now, redrawn with everything else
-	stopped       bool
-	finalScreen   bool
-	started       time.Time
-	phaseStarted  time.Time
-	active        string
-	viewedPhase   string
-	challenge     string
-	details       bool
-	progressView  bool
-	selectionHelp string
-	scroll        int
-	logScroll     int
-	logPaneActive bool
-	copyNotice    string
-	tick          int
-	logPath       string
-	task          taskProgress
-	dockerStatus  map[string]string
-	dockerOrder   []string
+	mu             sync.Mutex
+	names          []string
+	state          map[string]string
+	log            []string
+	prompt         []string // the question on screen now, redrawn with everything else
+	stopped        bool
+	finalScreen    bool
+	started        time.Time
+	phaseStarted   time.Time
+	active         string
+	viewedPhase    string
+	challenge      string
+	details        bool
+	progressView   bool
+	selectionHelp  string
+	scroll         int
+	logScroll      int
+	logPaneActive  bool
+	copyNotice     string
+	plainLink      bool
+	plainLinkFrame string
+	tick           int
+	logPath        string
+	task           taskProgress
+	dockerStatus   map[string]string
+	dockerOrder    []string
 
 	interrupt <-chan struct{}
 	keys      chan keyEvent
@@ -425,6 +427,14 @@ func (w *Wizard) renderLocked() {
 	if w.stopped {
 		return
 	}
+	if w.plainLink && !w.waiting && !w.finalScreen && w.renderPlainLinkLocked() {
+		return
+	}
+	if w.plainLinkFrame != "" {
+		w.lastFrame = nil
+		w.plainLinkFrame = ""
+	}
+	w.plainLink = false
 	var b strings.Builder
 	lines := w.frame(w.prompt)
 	if w.keys == nil || len(w.lastFrame) != len(lines) {
@@ -728,11 +738,20 @@ func (w *Wizard) resetScroll() { w.mu.Lock(); w.scroll = 0; w.mu.Unlock() }
 func (w *Wizard) viewKey(k rune) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if !w.waiting && w.plainLink && (k == 'b' || k == 'B' || k == keyEnter) {
+		w.plainLink = false
+		return true
+	}
 	if (w.cols < 48 || w.rows < 16) && k != keyCancel && !(w.finalScreen && (k == 'f' || k == 'F' || k == keyEnter)) {
 		return true
 	}
 	switch k {
 
+	case 'l', 'L':
+		if w.waiting || challengeURL(w.challenge) == "" {
+			return false
+		}
+		w.plainLink = true
 	case 'c', 'C':
 		if w.waiting {
 			return false
@@ -843,7 +862,7 @@ func (w *Wizard) startInput() {
 				case w.keys <- keyEvent{key: k, err: err, paste: w.rawPaste}:
 				}
 				w.rawPaste = ""
-			} else if k == 'c' || k == 'C' || k == rune(25) || k == keyDetails || k == keyPageUp || k == keyPageDown {
+			} else if k == 'l' || k == 'L' || k == 'b' || k == 'B' || k == keyEnter || k == 'c' || k == 'C' || k == rune(25) || k == keyDetails || k == keyPageUp || k == keyPageDown {
 				w.viewKey(k)
 				w.redraw()
 			}

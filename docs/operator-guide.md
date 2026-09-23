@@ -880,3 +880,14 @@ After Deploy, the approved configuration is fixed for that deployment. Back is n
 an undo operation for completed infrastructure changes. Existing deployments keep
 their configuration and use resume or teardown. Authentication renewal and approval
 for changes to pre-existing resources can still require interaction during execution.
+
+### Copy sign-in links in PuTTY
+
+On either browser sign-in screen, press **L** to show the full address as plain
+text. Select the address in PuTTY, then paste it into your browser. The installer
+writes the address as one logical line. Your terminal can wrap it visually.
+
+The Microsoft device code remains visible below the address. Press **B** or
+**Enter** to return to setup. Sign-in continues while this view is open. The link
+view closes when the sign-in challenge is cleared. Links do not enter the session
+log. **C** remains available for terminals that support clipboard requests.

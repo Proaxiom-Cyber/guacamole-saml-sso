@@ -37,5 +37,28 @@ func (w *Wizard) linkify(line string) string {
 // Terminals may refuse it; never claim clipboard confirmation we cannot receive.
 func (w *Wizard) copyLinkLocked(target string) {
 	fmt.Fprintf(w.out, "\x1b]52;c;%s\x07", base64.StdEncoding.EncodeToString([]byte(target)))
-	w.copyNotice = "Copy requested. If blocked, use the link menu to copy its address."
+	w.copyNotice = "Copy requested. If nothing copies, press L to select the plain-text address."
+}
+
+// Write the URL as one uninterrupted logical line. The terminal handles visual
+// wrapping, so selection can copy the complete address without pane borders or
+// inserted newlines. Do not send the challenge to event history or a log.
+func (w *Wizard) renderPlainLinkLocked() bool {
+	target := challengeURL(w.challenge)
+	if target == "" {
+		return false
+	}
+	identity := fmt.Sprintf("%dx%d:%s", w.cols, w.rows, w.challenge)
+	if identity == w.plainLinkFrame {
+		return true
+	}
+	fmt.Fprint(w.out, homeAndClear)
+	fmt.Fprint(w.out, "SIGN-IN LINK — SELECT AND COPY\r\n\r\nSelect the address below, then paste it into your browser.\r\nIn PuTTY, selecting text normally copies it.\r\nB or Enter returns to setup. Sign-in continues while this view is open.\r\n\r\n")
+	fmt.Fprint(w.out, target)
+	fmt.Fprint(w.out, "\r\n\r\n")
+	// Keep Microsoft's device code and provider instructions available too.
+	instructions := strings.Replace(w.challenge, target, "(address shown above)", 1)
+	fmt.Fprint(w.out, strings.ReplaceAll(instructions, "\n", "\r\n"))
+	w.plainLinkFrame = identity
+	return true
 }

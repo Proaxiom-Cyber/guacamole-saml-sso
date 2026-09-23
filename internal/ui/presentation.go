@@ -272,7 +272,7 @@ func (w *Wizard) frame(prompt []string) []string {
 				challenge = strings.Replace(challenge, target, signInLinkLabel, 1)
 			}
 			if challengeURL(w.challenge) != "" {
-				body = append(body, "CONTINUE IN YOUR BROWSER", "", "[ C  COPY SIGN-IN LINK ]", "Press C, then paste into your browser.", "Setup continues after you complete sign-in.", w.copyNotice, "", "Or use the clickable link below:")
+				body = append(body, "CONTINUE IN YOUR BROWSER", "", "[ C  COPY SIGN-IN LINK ]", "Press C, then paste into your browser.", "[ L  SHOW LINK AS PLAIN TEXT ]", "PuTTY: press L, then select the address to copy.", "Setup continues after you complete sign-in.", w.copyNotice, "", "Or use the clickable link below:")
 			}
 			body = append(body, challenge, "Ctrl-Y also copies the complete link.", "")
 		}

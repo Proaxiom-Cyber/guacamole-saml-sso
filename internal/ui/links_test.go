@@ -91,3 +91,52 @@ func TestCopyKeyOnlyActsDuringBrowserWait(t *testing.T) {
 		t.Fatal("copy shortcut active without a sign-in link")
 	}
 }
+
+func TestPlainLinkViewPreservesLongURLAndDeviceCode(t *testing.T) {
+	for _, target := range []string{"https://example.com/start/" + strings.Repeat("abcdef", 40), "https://microsoft.com/devicelogin"} {
+		u, out, _ := newTestUI("")
+		w := u.wiz
+		w.challenge = "Open this address:\n" + target + "\nEnter this code: TEST-CODE"
+		if !w.viewKey('l') {
+			t.Fatal("L did not open plain link")
+		}
+		w.redraw()
+		got := out.String()
+		if !strings.Contains(got, "\r\n\r\n"+target+"\r\n\r\n") {
+			t.Fatal("address was wrapped or decorated")
+		}
+		if !strings.Contains(got, "TEST-CODE") {
+			t.Fatal("device code missing")
+		}
+		if len(w.log) != 0 || strings.Contains(strings.Join(w.notes, ""), target) {
+			t.Fatal("transient link entered history")
+		}
+		out.Reset()
+		w.redraw()
+		if out.Len() != 0 {
+			t.Fatal("unchanged view redraw interferes with selection")
+		}
+		w.viewKey('b')
+		w.redraw()
+		if w.plainLink || !strings.Contains(out.String(), signInLinkLabel) {
+			t.Fatal("B did not restore setup")
+		}
+		w.viewKey('l')
+		w.redraw()
+		out.Reset()
+		u.ClearTransient()
+		if w.plainLink || strings.Contains(out.String(), target) {
+			t.Fatal("expired link remained visible")
+		}
+	}
+}
+
+func TestPlainLinkShortcutDoesNotInterceptInput(t *testing.T) {
+	u, out, _ := newTestUI("")
+	w := u.wiz
+	w.waiting = true
+	w.challenge = "https://example.com/start/fixture"
+	if w.viewKey('l') || w.plainLink || out.Len() != 0 {
+		t.Fatal("L intercepted prompt input")
+	}
+}
