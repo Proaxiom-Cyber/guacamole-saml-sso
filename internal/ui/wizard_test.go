@@ -905,10 +905,10 @@ func TestMinimumScreenKeepsFieldAndValidationVisible(t *testing.T) {
 	u.wiz.rows = 16
 	u.wiz.cols = 48
 	u.Line("Identity-provider group for administrators", "Guacamole Administrators")
-	if !strings.Contains(out.String(), "> _") {
+	if !strings.Contains(out.String(), "> Guacamole Administrators") {
 		t.Fatal("default value pushed input off screen")
 	}
-	if !strings.Contains(out.String(), "Default: Guacamole Administrators") {
+	if !strings.Contains(out.String(), "(suggested)") {
 		t.Fatal("default value was hidden")
 	}
 }
