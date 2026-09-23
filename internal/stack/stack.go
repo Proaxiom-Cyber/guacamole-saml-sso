@@ -67,6 +67,7 @@ type Config struct {
 	AdminGroup      string
 	OperatorGroup   string
 	HTTPSPort       string // default 443
+	SAMLEntityID    string // service-provider identifier; defaults to legacy website identifier
 	SAMLMetadataURL string // empty until the Entra slice configures it
 	// SAMLGroupAttribute is the SAML attribute carrying group membership.
 	// Entra names it with a full claim URI, not "groups"; leaving the
@@ -84,6 +85,9 @@ type Config struct {
 }
 
 func (c *Config) defaults() {
+	if c.SAMLEntityID == "" {
+		c.SAMLEntityID = "https://" + c.Hostname + "/guacamole"
+	}
 	if c.InstallDir == "" {
 		c.InstallDir = "/opt/guacamole"
 	}
@@ -162,8 +166,8 @@ func Render(cfg Config) error {
 	env := fmt.Sprintf(
 		"# Non-secret configuration rendered by guacdeploy. Credentials never\n"+
 			"# belong in this file; the database password arrives at start time.\n"+
-			"GUAC_VERSION=%s\nGUAC_HOSTNAME=%s\nGUAC_ADMIN_GROUP=%s\nGUAC_OPERATOR_GROUP=%s\nHTTPS_PORT=%s\nSAML_IDP_METADATA_URL=%s\nSAML_GROUP_ATTRIBUTE=%s\nCOMPOSE_PROFILES=%s\n",
-		GuacVersion, cfg.Hostname, cfg.AdminGroup, cfg.OperatorGroup, cfg.HTTPSPort, cfg.SAMLMetadataURL, cfg.SAMLGroupAttribute, cfg.ComposeProfiles)
+			"GUAC_VERSION=%s\nGUAC_HOSTNAME=%s\nGUAC_ADMIN_GROUP=%s\nGUAC_OPERATOR_GROUP=%s\nHTTPS_PORT=%s\nSAML_ENTITY_ID=%s\nSAML_IDP_METADATA_URL=%s\nSAML_GROUP_ATTRIBUTE=%s\nCOMPOSE_PROFILES=%s\n",
+		GuacVersion, cfg.Hostname, cfg.AdminGroup, cfg.OperatorGroup, cfg.HTTPSPort, cfg.SAMLEntityID, cfg.SAMLMetadataURL, cfg.SAMLGroupAttribute, cfg.ComposeProfiles)
 
 	files := map[string]struct {
 		content string

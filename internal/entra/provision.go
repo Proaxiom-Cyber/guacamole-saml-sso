@@ -27,7 +27,8 @@ const (
 
 // Config identifies one deployment's Entra sign-in.
 type Config struct {
-	Hostname      string // public hostname; entity ID becomes https://<hostname>/guacamole
+	Hostname      string // public website and SAML reply URL
+	entityID      string // selected from the existing app, or api://<appId> for a new app
 	DeploymentID  string // ownership marker value, from state.State.DeploymentID
 	AdminGroup    string // display name of the administrator group
 	OperatorGroup string // display name of the operator group
@@ -37,6 +38,13 @@ type Config struct {
 	// of a reusable pre-existing resource: it may be our half-landed
 	// creation or somebody else's application, and only a person can tell.
 	AfterUncertainCreate bool
+}
+
+func (cfg Config) samlEntityID() string {
+	if cfg.entityID != "" {
+		return cfg.entityID
+	}
+	return EntityID(cfg.Hostname)
 }
 
 func (cfg Config) validate() error {
@@ -177,6 +185,14 @@ func (c *Client) Plan(ctx context.Context, cfg Config) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
+	if app != nil {
+		cfg.entityID = "api://" + app.AppID
+		// Preserve working deployments created by earlier versions.
+		if slices.Equal(app.IdentifierUris, []string{EntityID(cfg.Hostname)}) {
+			cfg.entityID = EntityID(cfg.Hostname)
+		}
+		p.Config = cfg
+	}
 	switch {
 	case app == nil:
 		// AfterUncertainCreate with no match: the query-before-retry ran
@@ -196,8 +212,8 @@ func (c *Client) Plan(ctx context.Context, cfg Config) (*Plan, error) {
 		}
 		// Pre-existing. Refuse when it serves another entity ID: reusing it
 		// would break whatever it currently signs in.
-		if len(app.IdentifierUris) > 0 && !slices.Equal(app.IdentifierUris, []string{EntityID(cfg.Hostname)}) {
-			return nil, fmt.Errorf("%w: application %q has entity ID(s) %v, not %s; refusing to repurpose it", ErrRequiresReview, app.DisplayName, app.IdentifierUris, EntityID(cfg.Hostname))
+		if len(app.IdentifierUris) > 0 && !slices.Equal(app.IdentifierUris, []string{cfg.samlEntityID()}) {
+			return nil, fmt.Errorf("%w: application %q has entity ID(s) %v, not %s; refusing to repurpose it", ErrRequiresReview, app.DisplayName, app.IdentifierUris, cfg.samlEntityID())
 		}
 		p.App = &Found{ObjectID: app.ID, AppID: app.AppID, DisplayName: app.DisplayName, Marker: app.marker()}
 	}
@@ -341,9 +357,9 @@ func desiredOptionalClaims() map[string]any {
 
 func appChanges(a *appRecord, cfg Config) []FieldChange {
 	var ch []FieldChange
-	if !slices.Equal(a.IdentifierUris, []string{EntityID(cfg.Hostname)}) {
+	if !slices.Equal(a.IdentifierUris, []string{cfg.samlEntityID()}) {
 		ch = append(ch, FieldChange{"application.identifierUris",
-			mustJSON(a.IdentifierUris), mustJSON([]string{EntityID(cfg.Hostname)})})
+			mustJSON(a.IdentifierUris), mustJSON([]string{cfg.samlEntityID()})})
 	}
 	if !slices.Equal(a.Web.RedirectUris, []string{ReplyURL(cfg.Hostname)}) {
 		ch = append(ch, FieldChange{"application.web.redirectUris",
@@ -398,6 +414,7 @@ type AppliedGroup struct {
 
 // Result is what Apply did, for the caller to record.
 type Result struct {
+	EntityID    string // service-provider identifier, separate from the reply URL
 	TenantID    string
 	MetadataURL string // for the stack's SAML_IDP_METADATA_URL
 	App         Applied
@@ -437,7 +454,6 @@ func (c *Client) Apply(ctx context.Context, plan *Plan) (*Result, error) {
 			"displayName":           AppDisplayName(cfg.Hostname),
 			"notes":                 marker,
 			"tags":                  []string{marker},
-			"identifierUris":        []string{EntityID(cfg.Hostname)},
 			"web":                   map[string]any{"redirectUris": []string{ReplyURL(cfg.Hostname)}},
 			"groupMembershipClaims": "ApplicationGroup",
 			"optionalClaims":        desiredOptionalClaims(),
@@ -473,13 +489,6 @@ func (c *Client) Apply(ctx context.Context, plan *Plan) (*Result, error) {
 		} else {
 			res.App.Evidence = "pre-existing application reused with approval; no ownership marker (never eligible for cleanup)"
 			res.Changes = plan.Changes
-		}
-		if patch := appPatchBody(plan.Changes); len(patch) > 0 {
-			// Never PATCH notes or tags here: a pre-existing application
-			// must not be stamped with an ownership marker it did not earn.
-			if _, err := c.call(ctx, http.MethodPatch, "/applications/"+res.App.ObjectID, patch); err != nil {
-				return nil, err
-			}
 		}
 	}
 
@@ -535,6 +544,24 @@ func (c *Client) Apply(ctx context.Context, plan *Plan) (*Result, error) {
 	}
 	if len(spPatch) > 0 {
 		if _, err := write(ctx, http.MethodPatch, "/servicePrincipals/"+sp.ObjectID, spPatch); err != nil {
+			return nil, err
+		}
+	}
+
+	// Assign an app-ID-based identifier only after creation gives us its ID.
+	// This avoids requiring the public website domain to be verified in Entra.
+	patch := appPatchBody(plan.Changes)
+	if res.App.CreatedApp {
+		cfg.entityID = "api://" + res.App.AppID
+		patch["identifierUris"] = []string{cfg.samlEntityID()}
+	}
+	if len(patch) > 0 {
+		// Do not change ownership markers on pre-existing applications.
+		appWrite := c.call
+		if res.App.CreatedApp {
+			appWrite = c.callFresh
+		}
+		if _, err := appWrite(ctx, http.MethodPatch, "/applications/"+res.App.ObjectID, patch); err != nil {
 			return nil, err
 		}
 	}
@@ -611,6 +638,7 @@ func (c *Client) Apply(ctx context.Context, plan *Plan) (*Result, error) {
 		res.Groups = append(res.Groups, ag)
 	}
 
+	res.EntityID = cfg.samlEntityID()
 	res.MetadataURL = MetadataURL(res.TenantID, res.App.AppID)
 	return res, nil
 }

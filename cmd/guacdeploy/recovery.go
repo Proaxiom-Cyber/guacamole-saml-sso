@@ -58,7 +58,10 @@ func recoveryGuidance(err error) (string, string) {
 	if strings.Contains(text, "ratelimited") || strings.Contains(text, "too many certificates") {
 		return "Certificate issuance limit reached", "The certificate authority has temporarily refused another certificate. View technical details for its retry time. Retrying now will not help. Keep this deployment and resume after that time; do not remove it to retry. Completed work is saved."
 	}
-	if strings.Contains(text, "identifieruris") {
+	if strings.Contains(text, "hostnamenotonverifieddomain") || (strings.Contains(text, "identifieruris") && strings.Contains(text, "verified domain")) {
+		return "Entra rejected the application identifier", "Entra refused the SAML application identifier under its domain policy. Keep the website and tenant settings unchanged. Use a current installer that supports separate website and application identifiers. Review the technical details before retrying."
+	}
+	if strings.Contains(text, "identifieruris") && strings.Contains(text, "already exists") {
 		return "Entra application already exists", "Another Entra application uses this site's identifier URI. Review that application in Entra before retrying. Do not delete an application used by another deployment."
 	}
 	if strings.Contains(text, "pre-existing") && strings.Contains(text, "access application") {

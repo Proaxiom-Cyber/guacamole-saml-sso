@@ -155,6 +155,7 @@ func (o *Options) stackConfig(st *state.State) stack.Config {
 		AdminGroup:      st.Config["admin-group"],
 		OperatorGroup:   st.Config["operator-group"],
 		SAMLMetadataURL: st.Config["saml-metadata-url"],
+		SAMLEntityID:    st.Config["saml-entity-id"],
 		// Entra's groups claim is a full URI. Fall back to it whenever a
 		// metadata URL exists but nothing recorded the attribute, so the
 		// compose default "groups" can never silently apply to Entra.
@@ -1202,6 +1203,7 @@ func (o *Options) entraSignin(ctx context.Context, st *state.State, u *ui.UI) er
 	}
 
 	st.Config["saml-metadata-url"] = res.MetadataURL
+	st.Config["saml-entity-id"] = res.EntityID
 	st.Config["entra-tenant-id"] = res.TenantID
 	// The service principal is the identity an unattended Azure upload signs
 	// in as, so its object ID has to outlive this phase for the Azure

@@ -188,6 +188,7 @@ func TestCheckPermissionsOpaqueToken(t *testing.T) {
 }
 
 func TestApplyFreshProvisioning(t *testing.T) {
+	samlReady := false
 	tok := jwt(t, map[string]any{"scp": "Application.ReadWrite.All"})
 	f := &fake{t: t, routes: map[string]func(*testing.T, *http.Request) *http.Response{
 		"GET /v1.0/applications": func(t *testing.T, r *http.Request) *http.Response {
@@ -205,8 +206,8 @@ func TestApplyFreshProvisioning(t *testing.T) {
 			if tags, _ := b["tags"].([]any); len(tags) != 1 || tags[0] != testMarker {
 				t.Fatalf("creation body must carry the marker in tags, got %v", b["tags"])
 			}
-			if uris, _ := b["identifierUris"].([]any); len(uris) != 1 || uris[0] != "https://guac.example.com/guacamole" {
-				t.Fatalf("entity ID wrong: %v", b["identifierUris"])
+			if _, present := b["identifierUris"]; present {
+				return graphErr(400, "HostNameNotOnVerifiedDomain", "identifierUris must use a verified domain until SAML is configured")
 			}
 			web, _ := b["web"].(map[string]any)
 			if ru, _ := web["redirectUris"].([]any); len(ru) != 1 || ru[0] != "https://guac.example.com/guacamole/" {
@@ -219,6 +220,16 @@ func TestApplyFreshProvisioning(t *testing.T) {
 				t.Fatalf("groups claim must emit display names: %v", b["optionalClaims"])
 			}
 			return jsonResp(201, map[string]string{"id": "obj-1", "appId": "app-1"})
+		},
+		"PATCH /v1.0/applications/obj-1": func(t *testing.T, r *http.Request) *http.Response {
+			if !samlReady {
+				t.Fatal("identifier assigned before service principal was configured for SAML")
+			}
+			b := readBody(t, r)
+			if uris, _ := b["identifierUris"].([]any); len(uris) != 1 || uris[0] != "api://app-1" {
+				t.Fatalf("wrong identifier: %v", b)
+			}
+			return jsonResp(204, nil)
 		},
 		"GET /v1.0/servicePrincipals": func(t *testing.T, r *http.Request) *http.Response {
 			return jsonResp(200, map[string]any{"value": []any{}})
@@ -239,6 +250,7 @@ func TestApplyFreshProvisioning(t *testing.T) {
 			} else if b["preferredSingleSignOnMode"] != "saml" || b["appRoleAssignmentRequired"] != true {
 				t.Fatalf("service principal must be SAML with assignment required: %v", b)
 			}
+			samlReady = true
 			return jsonResp(204, nil)
 		},
 		"POST /v1.0/servicePrincipals/sp-1/addTokenSigningCertificate": func(t *testing.T, r *http.Request) *http.Response {
@@ -296,6 +308,9 @@ func TestApplyFreshProvisioning(t *testing.T) {
 	if !res.App.CreatedApp || !res.App.CreatedSP || res.App.SPObjectID != "sp-1" {
 		t.Fatalf("unexpected applied app: %+v", res.App)
 	}
+	if res.EntityID != "api://app-1" {
+		t.Fatalf("result lost the SAML identifier: %s", res.EntityID)
+	}
 	want := "https://login.microsoftonline.com/tenant-1/federationmetadata/2007-06/federationmetadata.xml?appid=app-1"
 	if res.MetadataURL != want {
 		t.Fatalf("metadata URL:\n got %s\nwant %s", res.MetadataURL, want)
@@ -352,16 +367,34 @@ func TestLostResponseThenResumeDoesNotDuplicate(t *testing.T) {
 	// created, and no second application is ever created (the fake has no
 	// POST /applications route, so an attempt would fail the test).
 	marked := desiredApp()
+	marked["identifierUris"] = []string{}
+	samlReady := false
 	f2 := &fake{t: t, routes: map[string]func(*testing.T, *http.Request) *http.Response{
 		"GET /v1.0/applications": func(t *testing.T, r *http.Request) *http.Response {
 			return jsonResp(200, map[string]any{"value": []any{marked}})
 		},
 		"GET /v1.0/servicePrincipals": func(t *testing.T, r *http.Request) *http.Response {
 			return jsonResp(200, map[string]any{"value": []map[string]any{{
-				"id": "sp-1", "preferredSingleSignOnMode": "saml",
+				"id": "sp-1", "preferredSingleSignOnMode": "",
 				"appRoleAssignmentRequired":          true,
 				"preferredTokenSigningKeyThumbprint": "TT",
 			}}})
+		},
+		"PATCH /v1.0/servicePrincipals/sp-1": func(t *testing.T, r *http.Request) *http.Response {
+			if readBody(t, r)["preferredSingleSignOnMode"] != "saml" {
+				t.Fatal("missing SAML configuration")
+			}
+			samlReady = true
+			return jsonResp(204, nil)
+		},
+		"PATCH /v1.0/applications/obj-1": func(t *testing.T, r *http.Request) *http.Response {
+			if !samlReady {
+				t.Fatal("resume assigned identifier before SAML configuration")
+			}
+			if uris, _ := readBody(t, r)["identifierUris"].([]any); len(uris) != 1 || uris[0] != "api://app-1" {
+				t.Fatal("wrong resumed identifier")
+			}
+			return jsonResp(204, nil)
 		},
 		"GET /v1.0/groups": groupsByFilter(map[string]any{
 			"Guacamole Administrators": map[string]string{"id": "g-a", "displayName": "Guacamole Administrators", "description": testMarker},
@@ -763,6 +796,7 @@ func TestServicePrincipalWaitsForTheApplicationToReplicate(t *testing.T) {
 		"GET /v1.0/organization": func(t *testing.T, r *http.Request) *http.Response {
 			return jsonResp(200, map[string]any{"value": []map[string]string{{"id": "tenant-1"}}})
 		},
+		"PATCH /v1.0/applications/obj-1": func(t *testing.T, r *http.Request) *http.Response { return jsonResp(204, nil) },
 		"POST /v1.0/applications": func(t *testing.T, r *http.Request) *http.Response {
 			return jsonResp(201, map[string]string{"id": "obj-1", "appId": "app-1"})
 		},
@@ -873,6 +907,7 @@ func TestWritesToAFreshServicePrincipalWaitOutReplication(t *testing.T) {
 		"GET /v1.0/organization": func(t *testing.T, r *http.Request) *http.Response {
 			return jsonResp(200, map[string]any{"value": []map[string]string{{"id": "tenant-1"}}})
 		},
+		"PATCH /v1.0/applications/obj-1": func(t *testing.T, r *http.Request) *http.Response { return jsonResp(204, nil) },
 		"POST /v1.0/applications": func(t *testing.T, r *http.Request) *http.Response {
 			return jsonResp(201, map[string]string{"id": "obj-1", "appId": "app-1"})
 		},
@@ -977,5 +1012,40 @@ func TestAssignmentReadDoesNotRetryMissingPreExistingPrincipal(t *testing.T) {
 	_, err := c.assignedPrincipals(context.Background(), "existing", false)
 	if err == nil || calls != 1 {
 		t.Fatalf("missing pre-existing principal was retried: %v (%d requests)", err, calls)
+	}
+}
+
+func TestPlanPreservesExistingSAMLIdentifiers(t *testing.T) {
+	for _, identifier := range []string{EntityID(testCfg.Hostname), "api://app-1", ""} {
+		t.Run(identifier, func(t *testing.T) {
+			app := desiredApp()
+			app["identifierUris"] = []string{}
+			if identifier != "" {
+				app["identifierUris"] = []string{identifier}
+			}
+			f := &fake{t: t, routes: map[string]func(*testing.T, *http.Request) *http.Response{
+				"GET /v1.0/applications": func(*testing.T, *http.Request) *http.Response {
+					return jsonResp(200, map[string]any{"value": []any{app}})
+				},
+				"GET /v1.0/servicePrincipals": func(*testing.T, *http.Request) *http.Response { return jsonResp(200, map[string]any{"value": []any{}}) },
+				"GET /v1.0/groups":            groupsByFilter(nil),
+			}}
+			plan, err := newClient(f, "test-token").Plan(context.Background(), testCfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := identifier
+			if want == "" {
+				want = "api://app-1"
+			}
+			if plan.Config.samlEntityID() != want {
+				t.Fatalf("identifier changed: got %s want %s", plan.Config.samlEntityID(), want)
+			}
+			for _, change := range plan.Changes {
+				if change.Field == "application.identifierUris" && identifier != "" {
+					t.Fatal("working identifier should not be changed")
+				}
+			}
+		})
 	}
 }

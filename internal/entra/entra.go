@@ -175,7 +175,8 @@ func isNotFound(err error) bool {
 	return errors.As(err, &ge) && ge.Status == http.StatusNotFound
 }
 
-// Derived names. The entity ID has no trailing slash (Entra rejects one,
+// Legacy website-based identifier, preserved for existing deployments.
+// New applications use api://<appId>. The identifier has no trailing slash (Entra rejects one,
 // IdentifierUrisEndsWithSlash); the reply URL has one. They differ on purpose.
 func EntityID(hostname string) string { return "https://" + hostname + "/guacamole" }
 func ReplyURL(hostname string) string { return EntityID(hostname) + "/" }

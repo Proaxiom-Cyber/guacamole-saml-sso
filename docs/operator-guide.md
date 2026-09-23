@@ -891,3 +891,19 @@ The Microsoft device code remains visible below the address. Press **B** or
 **Enter** to return to setup. Sign-in continues while this view is open. The link
 view closes when the sign-in challenge is cleared. Links do not enter the session
 log. **C** remains available for terminals that support clipboard requests.
+
+
+### Website domain and Entra tenant domain
+
+The Guacamole website can use a different domain from users' Entra sign-in names.
+For example, the website can be `guacamole.slqaccess.qld.gov.au` while users sign in
+as `user@slq.qld.gov.au`. The website domain does not need to be verified in Entra.
+
+For new applications, the installer uses `api://<application-client-id>` as the
+SAML application identifier. It saves this value in deployment state and supplies
+the same value to Guacamole. The reply URL remains the public website URL with
+`/guacamole/` appended. Existing deployments retain their website-based identifier.
+
+If an older installer fails with `HostNameNotOnVerifiedDomain`, save and exit.
+Install the corrected binary and resume the deployment. Keep the website hostname,
+Entra tenant and working installer app registration unchanged.

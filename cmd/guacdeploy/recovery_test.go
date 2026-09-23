@@ -57,3 +57,18 @@ func TestUnattendedFailureDoesNotPromptOrRetry(t *testing.T) {
 		t.Fatal("unexpected unattended interaction")
 	}
 }
+
+func TestIdentifierDomainErrorIsNotReportedAsDuplicate(t *testing.T) {
+	title, help := recoveryGuidance(errors.New("graph POST /applications failed: Values of identifierUris property must use a verified domain (HostNameNotOnVerifiedDomain)"))
+	if title != "Entra rejected the application identifier" || strings.Contains(help, "already exists") {
+		t.Fatalf("misleading guidance: %s: %s", title, help)
+	}
+	title, _ = recoveryGuidance(errors.New("Another object with the same value for property identifierUris already exists"))
+	if title != "Entra application already exists" {
+		t.Fatalf("duplicate not recognized: %s", title)
+	}
+	title, _ = recoveryGuidance(errors.New("identifierUris: permission denied"))
+	if title == "Entra application already exists" {
+		t.Fatal("unrelated identifier error reported as duplicate")
+	}
+}

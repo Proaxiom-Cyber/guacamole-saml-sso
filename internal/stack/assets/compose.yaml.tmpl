@@ -119,7 +119,7 @@ services:
       SAML_IDP_METADATA_URL: ${SAML_IDP_METADATA_URL:?}
       # Entra ID rejects an entity ID that ends in "/". This must match the
       # identity provider exactly.
-      SAML_ENTITY_ID: "https://${GUAC_HOSTNAME:?}/guacamole"
+      SAML_ENTITY_ID: ${SAML_ENTITY_ID:?}
       SAML_CALLBACK_URL: "https://${GUAC_HOSTNAME}/guacamole/"
       SAML_STRICT: "true"
       SAML_DEBUG: "false"

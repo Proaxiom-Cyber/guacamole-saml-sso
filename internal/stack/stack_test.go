@@ -202,3 +202,34 @@ func TestGenerateSchemaRepairsCorruptCachedSchema(t *testing.T) {
 		t.Fatal("corrupt schema survived regeneration")
 	}
 }
+
+func TestRenderSeparatesSAMLIdentifierFromWebsite(t *testing.T) {
+	for _, identifier := range []string{"", "api://11111111-2222-3333-4444-555555555555"} {
+		t.Run(identifier, func(t *testing.T) {
+			cfg := Config{InstallDir: t.TempDir(), Hostname: "guacamole.slqaccess.qld.gov.au", SAMLEntityID: identifier, SAMLMetadataURL: "https://login.microsoftonline.com/test-tenant/metadata"}
+			if err := Render(cfg); err != nil {
+				t.Fatal(err)
+			}
+			env, err := os.ReadFile(filepath.Join(cfg.InstallDir, ".env"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := identifier
+			if want == "" {
+				want = "https://guacamole.slqaccess.qld.gov.au/guacamole"
+			}
+			for _, value := range []string{"SAML_ENTITY_ID=" + want + "\n", "GUAC_HOSTNAME=guacamole.slqaccess.qld.gov.au\n"} {
+				if !strings.Contains(string(env), value) {
+					t.Fatalf("missing %s", value)
+				}
+			}
+			compose, err := os.ReadFile(filepath.Join(cfg.InstallDir, "compose.yaml"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(compose), "SAML_ENTITY_ID: ${SAML_ENTITY_ID:?}") {
+				t.Fatal("compose ignores explicit identifier")
+			}
+		})
+	}
+}
